@@ -131,6 +131,7 @@ struct SessionSummaryItem: Identifiable, Hashable {
 @MainActor
 final class BridgeClient: ObservableObject {
     static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
+    static let initialCloudflareURL = "https://plate-commercial-acknowledged-honor.trycloudflare.com"
     static let defaultPresetURLs: [(label: String, url: String)] = [
         ("Wi-Fi 局域网直连", "http://192.168.31.190:8765"),
         ("Tailscale 域名", "http://dsh-pc"),
@@ -139,6 +140,7 @@ final class BridgeClient: ObservableObject {
     ]
 
     @AppStorage("ds_server_url") var serverURL: String = "http://192.168.31.190:8765"
+    @AppStorage("ds_public_url") var savedPublicURL: String = ""
     @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
@@ -151,11 +153,26 @@ final class BridgeClient: ObservableObject {
 
     @Published var workspaces: [String] = []
     @Published var aiAccessMode: String = "workspace_only" // "workspace_only" | "workspace_read_all" | "full_access"
-    @Published var selectedModel: String = "deepseek-chat"
+    @Published var selectedModel: String = "deepseek-flash"
     @Published var approvalMode: String = "ask_commands"
     @Published var deepseekBaseURL: String = "https://api.deepseek.com"
     @Published var barkURL: String = ""
     @Published var hasAPIKey: Bool = false
+    @Published var enableTunnel: Bool = true
+    @Published var hasCloudflaredToken: Bool = false
+    @Published var tunnelStatus: String = ""
+
+    var effectivePresetURLs: [(label: String, url: String)] {
+        var list: [(label: String, url: String)] = []
+        let pub = savedPublicURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !pub.isEmpty {
+            list.append(("Cloudflare 外网公网", pub))
+        } else if !Self.initialCloudflareURL.isEmpty {
+            list.append(("Cloudflare 外网公网", Self.initialCloudflareURL))
+        }
+        list.append(contentsOf: Self.defaultPresetURLs)
+        return list
+    }
 
     @Published var sessions: [SessionSummaryItem] = []
     @Published var turns: [ChatTurnItem] = []
@@ -229,7 +246,7 @@ final class BridgeClient: ObservableObject {
         self.authToken = effectiveToken
 
         var candidates: [String] = [rawURL]
-        for item in Self.defaultPresetURLs {
+        for item in effectivePresetURLs {
             if !candidates.contains(item.url) {
                 candidates.append(item.url)
             }
@@ -401,7 +418,48 @@ final class BridgeClient: ObservableObject {
         if let bark = json["bark_url"] as? String {
             barkURL = bark
         }
+        if let pub = json["public_url"] as? String, !pub.isEmpty {
+            savedPublicURL = pub
+        }
+        if let et = json["enable_tunnel"] as? Bool {
+            enableTunnel = et
+        }
+        hasCloudflaredToken = (json["has_cloudflared_token"] as? Bool) ?? false
         hasAPIKey = (json["has_api_key"] as? Bool) ?? false
+    }
+
+    func refreshTunnelStatus() async {
+        do {
+            let data = try await request("/api/tunnel/status")
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                tunnelStatus = (json["status"] as? String) ?? ""
+                if let url = json["live_url"] as? String, !url.isEmpty {
+                    savedPublicURL = url
+                }
+            }
+        } catch {}
+    }
+
+    func restartTunnel(cloudflaredToken: String = "") async {
+        if !cloudflaredToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let payload: [String: Any] = [
+                "cloudflared_token": cloudflaredToken.trimmingCharacters(in: .whitespacesAndNewlines),
+                "enable_tunnel": true,
+            ]
+            if let body = try? JSONSerialization.data(withJSONObject: payload) {
+                _ = try? await request("/api/settings", method: "PUT", body: body)
+            }
+        }
+        do {
+            let data = try await request("/api/tunnel/restart", method: "POST")
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                tunnelStatus = (json["status"] as? String) ?? ""
+                if let url = json["live_url"] as? String, !url.isEmpty {
+                    savedPublicURL = url
+                }
+                Haptics.success()
+            }
+        } catch {}
     }
 
     func saveSettings(apiKey: String) async throws {

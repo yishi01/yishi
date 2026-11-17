@@ -83,10 +83,10 @@ struct RootView: View {
                     .padding(.vertical, 12)
                     .cleanWhiteCard(cornerRadius: 16)
 
-                    // One-Tap Route Presets (LAN Wi-Fi + Tailscale)
+                    // One-Tap Route Presets (Cloudflare Public + LAN Wi-Fi + Tailscale)
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 7) {
-                            ForEach(BridgeClient.defaultPresetURLs, id: \.url) { preset in
+                            ForEach(client.effectivePresetURLs, id: \.url) { preset in
                                 let isPicked = (urlInput == preset.url)
                                 Button {
                                     Haptics.light()

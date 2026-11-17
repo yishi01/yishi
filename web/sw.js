@@ -1,4 +1,4 @@
-const CACHE_NAME = "deepseek-mobile-v0.7.0";
+const CACHE_NAME = "deepseek-mobile-v0.7.2";
 const SHELL_ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
 
 self.addEventListener("install", (event) => {

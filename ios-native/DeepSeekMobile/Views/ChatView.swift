@@ -343,9 +343,10 @@ struct ChatView: View {
                 .glassPressable(scale: 0.94)
 
                 Menu {
-                    Button("deepseek-flash (极速)") { client.selectedModel = "deepseek-flash" }
-                    Button("deepseek-chat (V3)") { client.selectedModel = "deepseek-chat" }
-                    Button("deepseek-reasoner (R1)") { client.selectedModel = "deepseek-reasoner" }
+                    Button("deepseek-flash (DeepSeek-V4.1-Flash)") { client.selectedModel = "deepseek-flash" }
+                    Button("deepseek-v4-pro (DeepSeek-V4-Pro)") { client.selectedModel = "deepseek-v4-pro" }
+                    Button("deepseek-chat") { client.selectedModel = "deepseek-chat" }
+                    Button("deepseek-reasoner") { client.selectedModel = "deepseek-reasoner" }
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "sparkles")

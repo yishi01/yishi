@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.7.0"
+VERSION = "0.7.2"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = Path(os.environ.get("PLUGIN_DATA") or (PROJECT_ROOT / "data"))
 
@@ -47,6 +47,9 @@ class BridgeConfig(BaseModel):
     deepseek_base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-chat"
     deepseek_api_key: str = ""
+    enable_tunnel: bool = True
+    cloudflared_token: str = ""
+    public_url: str = ""
 
     def effective_api_key(self) -> str:
         return (
@@ -81,6 +84,9 @@ class BridgeConfig(BaseModel):
             "deepseek_base_url": self.effective_base_url(),
             "model": self.model or "deepseek-chat",
             "has_api_key": bool(self.effective_api_key()),
+            "enable_tunnel": self.enable_tunnel,
+            "has_cloudflared_token": bool(self.cloudflared_token.strip()),
+            "public_url": self.public_url,
         }
 
 

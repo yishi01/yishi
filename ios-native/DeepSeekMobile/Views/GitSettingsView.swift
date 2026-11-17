@@ -5,6 +5,9 @@ struct GitSettingsView: View {
     @Binding var activeTab: MainTab
     @State private var apiKeyInput: String = ""
     @State private var newWorkspaceInput: String = ""
+    @State private var cfTokenInput: String = ""
+    @State private var isRestartingTunnel: Bool = false
+    @State private var copiedTunnelURL: Bool = false
     @State private var savedToast: Bool = false
 
     var body: some View {
@@ -13,10 +16,13 @@ struct GitSettingsView: View {
                 // 1. Dedicated AI Workspace & Isolation Permission Card
                 aiWorkspaceAndIsolationCard
 
-                // 2. Git Diff Card
+                // 2. Cloudflare Tunnel Card (External Access Without Tailscale)
+                cloudflareTunnelCard
+
+                // 3. Git Diff Card
                 gitReviewCard
 
-                // 3. DeepSeek Model & Approval Policy Card
+                // 4. DeepSeek Model & Approval Policy Card
                 deepseekSettingsCard
             }
             .padding(.horizontal, 14)
@@ -43,7 +49,10 @@ struct GitSettingsView: View {
             .padding(.vertical, 6)
         }
         .onAppear {
-            Task { await client.refreshGitDiff() }
+            Task {
+                await client.refreshGitDiff()
+                await client.refreshTunnelStatus()
+            }
         }
     }
 
@@ -205,7 +214,99 @@ struct GitSettingsView: View {
         }
     }
 
-    // MARK: - 2. Git Diff Card
+    // MARK: - 2. Cloudflare External Tunnel Card
+
+    private var cloudflareTunnelCard: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            HStack(spacing: 8) {
+                Image(systemName: "cloud.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.dsAccent)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("外网公网穿透 (Cloudflare Tunnel)")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(Color.dsPrimary)
+                    Text("无需开启 Tailscale，不冲突小火箭；出门 5G/任意 Wi-Fi 直连")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text("当前外网 HTTPS 地址 (\(client.tunnelStatus.isEmpty ? "就绪" : client.tunnelStatus))")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+
+                Text(client.savedPublicURL.isEmpty ? "尚未获取 (连上电脑 Wi-Fi 后自动同步)" : client.savedPublicURL)
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Color.dsPrimary)
+                    .textSelection(.enabled)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .cleanWhiteCard(cornerRadius: 12)
+            }
+
+            HStack(spacing: 8) {
+                Button {
+                    Haptics.light()
+                    if !client.savedPublicURL.isEmpty {
+                        UIPasteboard.general.string = client.savedPublicURL
+                        copiedTunnelURL = true
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            copiedTunnelURL = false
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: copiedTunnelURL ? "checkmark" : "doc.on.doc")
+                        Text(copiedTunnelURL ? "已复制地址" : "复制外网地址")
+                    }
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(Color.dsPrimary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .cleanWhiteCard(cornerRadius: 999)
+                }
+                .glassPressable(scale: 0.96)
+
+                Button {
+                    Haptics.medium()
+                    Task {
+                        isRestartingTunnel = true
+                        await client.restartTunnel(cloudflaredToken: cfTokenInput)
+                        cfTokenInput = ""
+                        isRestartingTunnel = false
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.clockwise")
+                        Text(isRestartingTunnel ? "重启中..." : "刷新 / 重建隧道")
+                    }
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .background(Capsule().fill(Color.dsPrimary))
+                }
+                .glassPressable(scale: 0.96)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("可选：固定域名 Tunnel Token (\(client.hasCloudflaredToken ? "已绑定" : "默认零配置临时域名"))")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundStyle(.secondary)
+                SecureField("eyJhIjo... (留空即自动免登录穿透)", text: $cfTokenInput)
+                    .font(.system(size: 12, design: .monospaced))
+                    .padding(10)
+                    .cleanWhiteCard(cornerRadius: 12)
+            }
+        }
+        .padding(16)
+        .liquidGlass(cornerRadius: 22, prominent: false)
+    }
+
+    // MARK: - 3. Git Diff Card
 
     private var gitReviewCard: some View {
         VStack(alignment: .leading, spacing: 12) {

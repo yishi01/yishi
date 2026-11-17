@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 
 from bridge.config import VERSION, BridgeConfig, ConfigStore
 from bridge.deepseek_agent import SessionManager
+from bridge.tunnel_manager import TunnelManager
 from bridge.fs_service import (
     FileConflictError,
     WorkspaceSecurityError,
@@ -69,6 +70,9 @@ class SettingsUpdateRequest(BaseModel):
     deepseek_base_url: str | None = None
     model: str | None = None
     deepseek_api_key: str | None = None
+    enable_tunnel: bool | None = None
+    cloudflared_token: str | None = None
+    public_url: str | None = None
 
 
 class AuthorizeWorkspaceRequest(BaseModel):
@@ -149,16 +153,20 @@ class PCUploadBase64Request(BaseModel):
 def create_app(data_dir: Path | None = None) -> FastAPI:
     config_store = ConfigStore(data_dir=data_dir)
     session_manager = SessionManager(config_store)
+    tunnel_manager = TunnelManager(config_store)
     web_dir = PROJECT_ROOT / "web"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        await tunnel_manager.start()
         yield
+        await tunnel_manager.stop()
         await session_manager.shutdown()
 
     app = FastAPI(title="DeepSeek Mobile Bridge", version=VERSION, lifespan=lifespan)
     app.state.config_store = config_store
     app.state.session_manager = session_manager
+    app.state.tunnel_manager = tunnel_manager
 
     app.add_middleware(
         CORSMiddleware,
@@ -218,7 +226,22 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             "version": VERSION,
             "host": config_store.config.host,
             "port": config_store.config.port,
+            "public_url": tunnel_manager.live_url or config_store.config.public_url,
+            "tunnel_status": tunnel_manager.status,
         }
+
+    @app.get("/api/tunnel/status", dependencies=[Depends(require_auth)])
+    def api_tunnel_status() -> dict[str, Any]:
+        return tunnel_manager.info()
+
+    @app.post("/api/tunnel/restart", dependencies=[Depends(require_auth)])
+    async def api_tunnel_restart() -> dict[str, Any]:
+        await tunnel_manager.start()
+        for _ in range(16):
+            if tunnel_manager.live_url or tunnel_manager.status in ("error", "missing_binary", "exited", "disabled"):
+                break
+            await asyncio.sleep(0.5)
+        return tunnel_manager.info()
 
     @app.get("/install.mobileconfig")
     def install_mobileconfig(url: str = Query(default="http://dsh-pc/")) -> Response:
@@ -336,6 +359,12 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             cfg_data["model"] = body.model.strip() or "deepseek-chat"
         if body.deepseek_api_key is not None and body.deepseek_api_key != "":
             cfg_data["deepseek_api_key"] = body.deepseek_api_key.strip()
+        if body.enable_tunnel is not None:
+            cfg_data["enable_tunnel"] = body.enable_tunnel
+        if body.cloudflared_token is not None and body.cloudflared_token != "":
+            cfg_data["cloudflared_token"] = body.cloudflared_token.strip()
+        if body.public_url is not None:
+            cfg_data["public_url"] = body.public_url.strip().rstrip("/")
 
         updated = config_store.save(BridgeConfig(**cfg_data))
         return updated.to_public_dict()
