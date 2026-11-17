@@ -261,7 +261,7 @@ struct GitSettingsView: View {
                     profKeyOverride = ""
                     profTestResult = nil
                     editingProfile = ModelProfileItem(
-                        id: "custom-\(Int(Date().timeIntervalSince1970 % 10000))",
+                        id: "custom-\(Int(Date().timeIntervalSince1970) % 10000)",
                         name: "自定义模型",
                         provider: "openai_compatible",
                         baseURL: "https://api.openai.com/v1",
@@ -925,7 +925,7 @@ struct GitSettingsView: View {
                 )
             },
             onDelete: { id in
-                var list = client.modelProfiles.filter { $0.id != id }
+                let list = client.modelProfiles.filter { $0.id != id }
                 guard !list.isEmpty else { return }
                 let nextActive = (client.activeProfileId == id) ? list[0].id : client.activeProfileId
                 try await client.saveModelProfiles(list, activeId: nextActive)
