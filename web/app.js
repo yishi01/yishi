@@ -10,9 +10,12 @@ const state = {
   activeSessionId: localStorage.getItem(ACTIVE_SESSION_KEY) || "",
   lastSeq: 0,
   ws: null,
+  wsSynced: false,
   reconnectTimer: null,
-  streamingAssistantEl: null,
-  streamingThoughtEl: null,
+  currentTurn: null,
+  scrollRaf: null,
+  resolvingIds: new Set(),
+  sendingPrompt: false,
   currentDir: "",
   openFile: null, // { path, mtime, dirty, editorType, cmView, textarea }
   cmPromise: null,
@@ -25,8 +28,41 @@ function showToast(msg) {
   el.textContent = msg;
   el.classList.remove("hidden");
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add("hidden"), 2400);
+  showToast._t = setTimeout(() => el.classList.add("hidden"), 2600);
 }
+
+async function copyText(text, msg = "已复制") {
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast(msg);
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand("copy");
+      showToast(msg);
+    } catch {
+      prompt("复制文本：", text);
+    } finally {
+      ta.remove();
+    }
+  }
+}
+
+// Delegate copy button clicks inside rendered Markdown code blocks
+document.addEventListener("click", (e) => {
+  const copyBtn = e.target.closest(".md-copy-btn");
+  if (!copyBtn) return;
+  const block = copyBtn.closest(".md-code-block");
+  const codeEl = block?.querySelector("code");
+  if (codeEl) {
+    copyText(codeEl.textContent || "", "代码已复制");
+  }
+});
 
 async function api(path, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -43,7 +79,7 @@ async function api(path, options = {}) {
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    const err = new Error(data.detail || `HTTP ${resp.status}`);
+    const err = new Error(data.detail || `请求失败 (HTTP ${resp.status})`);
     err.status = resp.status;
     throw err;
   }
@@ -61,6 +97,188 @@ function handleUnauthorized() {
 function setConnStatus(mode, label) {
   $("conn-badge").className = `status-dot ${mode}`;
   $("conn-label").textContent = label;
+}
+
+// --- Safe, Zero-Dependency Markdown Renderer ---
+
+function normalizeCleanText(raw) {
+  return String(raw || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, "");
+}
+
+function renderInlineMarkdown(escapedLine, inlineCodes) {
+  // 1. Extract inline code spans `...` first so inner symbols (*, _) are untouched
+  let out = escapedLine.replace(/`([^`\n]+)`/g, (_m, code) => {
+    const idx = inlineCodes.length;
+    inlineCodes.push(`<code class="md-inline-code">${code}</code>`);
+    return `\u0000INLINECODE_${idx}\u0000`;
+  });
+
+  // 2. Links [text](https://...)
+  out = out.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+  );
+
+  // 3. Bold **text** or __text__
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/__([^_]+)__/g, "<strong>$1</strong>");
+
+  // 4. Italic *text* (avoiding math/bullet collisions)
+  out = out.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+
+  // 5. Strikethrough ~~text~~
+  out = out.replace(/~~([^~]+)~~/g, "<del>$1</del>");
+
+  // 6. Restore inline code spans
+  out = out.replace(/\u0000INLINECODE_(\d+)\u0000/g, (_m, i) => inlineCodes[Number(i)] || "");
+  return out;
+}
+
+function renderMarkdown(rawText) {
+  const cleaned = normalizeCleanText(rawText);
+  if (!cleaned.trim()) return "";
+
+  const codeBlocks = [];
+  const inlineCodes = [];
+
+  // Extract fenced code blocks (including unclosed trailing block during streaming)
+  const withCodePlaceholders = cleaned.replace(
+    /```([a-zA-Z0-9_-]*)\n?([\s\S]*?)(?:```|$)/g,
+    (_m, lang, code) => {
+      const idx = codeBlocks.length;
+      const safeLang = escapeHtml((lang || "text").trim());
+      const safeCode = escapeHtml(code.replace(/\n$/, ""));
+      codeBlocks.push(
+        `<div class="md-code-block"><div class="md-code-head"><span>${safeLang}</span><button type="button" class="md-copy-btn">复制</button></div><pre><code>${safeCode}</code></pre></div>`
+      );
+      return `\n\u0000CODEBLOCK_${idx}\u0000\n`;
+    }
+  );
+
+  const lines = withCodePlaceholders.split("\n");
+  const htmlParts = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (!trimmed) {
+      i++;
+      continue;
+    }
+
+    // Code block placeholder
+    const cbMatch = trimmed.match(/^\u0000CODEBLOCK_(\d+)\u0000$/);
+    if (cbMatch) {
+      htmlParts.push(codeBlocks[Number(cbMatch[1])] || "");
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(?:---|\*\*\*|___)\s*$/.test(trimmed)) {
+      htmlParts.push("<hr />");
+      i++;
+      continue;
+    }
+
+    // Heading # .. ######
+    const hMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    if (hMatch) {
+      const level = Math.min(4, hMatch[1].length);
+      const content = renderInlineMarkdown(escapeHtml(hMatch[2].trim()), inlineCodes);
+      htmlParts.push(`<h${level}>${content}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    // Table | a | b |
+    if (
+      trimmed.startsWith("|") &&
+      trimmed.endsWith("|") &&
+      i + 1 < lines.length &&
+      /^\s*\|[\s:-]+\|\s*$/.test(lines[i + 1])
+    ) {
+      const parseRow = (rowStr) =>
+        rowStr
+          .trim()
+          .replace(/^\||\|$/g, "")
+          .split("|")
+          .map((c) => renderInlineMarkdown(escapeHtml(c.trim()), inlineCodes));
+      const headers = parseRow(trimmed);
+      i += 2; // Skip header & separator
+      const rows = [];
+      while (i < lines.length && lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|")) {
+        rows.push(parseRow(lines[i]));
+        i++;
+      }
+      const thead = `<thead><tr>${headers.map((h) => `<th>${h}</th>`).join("")}</tr></thead>`;
+      const tbody = `<tbody>${rows
+        .map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join("")}</tr>`)
+        .join("")}</tbody>`;
+      htmlParts.push(`<div class="md-table-wrap"><table class="md-table">${thead}${tbody}</table></div>`);
+      continue;
+    }
+
+    // Blockquote >
+    if (/^>\s?/.test(trimmed)) {
+      const qLines = [];
+      while (i < lines.length && /^>\s?/.test(lines[i].trim())) {
+        qLines.push(
+          renderInlineMarkdown(escapeHtml(lines[i].trim().replace(/^>\s?/, "")), inlineCodes)
+        );
+        i++;
+      }
+      htmlParts.push(`<blockquote>${qLines.join("<br />")}</blockquote>`);
+      continue;
+    }
+
+    // Unordered list - or * or •
+    if (/^(?:[-*•])\s+/.test(trimmed)) {
+      const items = [];
+      while (i < lines.length && /^(?:[-*•])\s+/.test(lines[i].trim())) {
+        const itemText = lines[i].trim().replace(/^(?:[-*•])\s+/, "");
+        items.push(`<li>${renderInlineMarkdown(escapeHtml(itemText), inlineCodes)}</li>`);
+        i++;
+      }
+      htmlParts.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+
+    // Ordered list 1.
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i].trim())) {
+        const itemText = lines[i].trim().replace(/^\d+\.\s+/, "");
+        items.push(`<li>${renderInlineMarkdown(escapeHtml(itemText), inlineCodes)}</li>`);
+        i++;
+      }
+      htmlParts.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+
+    // Regular paragraph (merge consecutive normal lines)
+    const pLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^\u0000CODEBLOCK_\d+\u0000$/.test(lines[i].trim()) &&
+      !/^(#{1,6}\s+|(?:---|\*\*\*|___)\s*$|>\s?|(?:[-*•])\s+|\d+\.\s+)/.test(lines[i].trim())
+    ) {
+      pLines.push(renderInlineMarkdown(escapeHtml(lines[i]), inlineCodes));
+      i++;
+    }
+    if (pLines.length > 0) {
+      htmlParts.push(`<p>${pLines.join("<br />")}</p>`);
+    } else {
+      i++;
+    }
+  }
+
+  return htmlParts.join("");
 }
 
 // --- Boot & Auth ---
@@ -222,8 +440,8 @@ async function selectSession(sessionId) {
   state.activeSessionId = sessionId;
   localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
   state.lastSeq = 0;
-  state.streamingAssistantEl = null;
-  state.streamingThoughtEl = null;
+  state.currentTurn = null;
+  state.resolvingIds.clear();
   $("chat-messages").innerHTML = "";
   $("pending-box").innerHTML = "";
   $("pending-box").classList.add("hidden");
@@ -252,6 +470,7 @@ function connectSessionSocket(reset = false) {
 
   const ws = new WebSocket(wsUrl);
   state.ws = ws;
+  state.wsSynced = false;
 
   ws.onopen = () => {
     setConnStatus("online", "已连接");
@@ -261,7 +480,9 @@ function connectSessionSocket(reset = false) {
     const msg = JSON.parse(evt.data);
     if (msg.type === "ping") return;
     if (msg.type === "sync_complete") {
+      state.wsSynced = true;
       if (msg.session) updateSessionMeta(msg.session);
+      scrollChatBottom(true);
       return;
     }
     if (typeof msg.seq === "number") {
@@ -290,75 +511,272 @@ document.addEventListener("visibilitychange", () => {
 });
 
 function updateSessionMeta(summary) {
+  if (!summary) return;
   $("header-session-title").textContent = summary.title;
   if (summary.model) syncQuickModelSelect(summary.model);
   const running = summary.status === "running" || summary.status === "waiting_input";
   $("agent-state-pill").textContent =
-    summary.status === "waiting_input" ? "等待你的确认" : running ? "DeepSeek 运行中..." : "空闲";
+    summary.status === "waiting_input"
+      ? "等待你的确认"
+      : running
+        ? "DeepSeek 运行中..."
+        : "空闲";
   $("send-btn").classList.toggle("hidden", running);
   $("cancel-btn").classList.toggle("hidden", !running);
   renderPendingBox(summary);
 }
 
-function scrollChatBottom() {
+function scrollChatBottom(force = false) {
+  if (state.scrollRaf) return;
+  state.scrollRaf = requestAnimationFrame(() => {
+    state.scrollRaf = null;
+    const box = $("chat-messages");
+    if (!box) return;
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
+    if (force || nearBottom) {
+      box.scrollTop = box.scrollHeight;
+    }
+  });
+}
+
+// --- Turn-Scoped Grouped Rendering (Deep Thinking + Tool Calls + Formatted Reply) ---
+
+function ensureCurrentTurn() {
+  if (state.currentTurn) return state.currentTurn;
   const box = $("chat-messages");
-  box.scrollTop = box.scrollHeight;
+  const processWrap = document.createElement("div");
+  processWrap.className = "turn-process-wrap hidden";
+  box.appendChild(processWrap);
+
+  state.currentTurn = {
+    processWrap,
+    // Deep Thinking drawer (collapsed by default)
+    thoughtDetails: null,
+    thoughtBadge: null,
+    thoughtPre: null,
+    thoughtRounds: [""],
+    thoughtRoundIdx: 0,
+    lastEventWasThought: false,
+    // Tool Calls drawer (collapsed by default)
+    toolsDetails: null,
+    toolsBadge: null,
+    toolsBody: null,
+    toolCount: 0,
+    toolItemsById: new Map(),
+    lastToolName: "",
+    // Assistant Markdown Reply
+    assistantEl: null,
+    assistantContentEl: null,
+    textRounds: [""],
+    textRoundIdx: 0,
+    lastEventWasText: false,
+  };
+  return state.currentTurn;
+}
+
+function ensureThoughtDrawer(turn) {
+  if (turn.thoughtDetails) return;
+  turn.processWrap.classList.remove("hidden");
+  const details = document.createElement("details");
+  details.className = "process-group thought-group"; // No `open` attr -> collapsed by default!
+  details.innerHTML = `
+    <summary>
+      <span class="process-summary-left">💭 深度思考</span>
+      <span class="process-badge">思考中...</span>
+    </summary>
+    <div class="process-body">
+      <div class="thought-text"></div>
+    </div>`;
+  turn.processWrap.prepend(details);
+  turn.thoughtDetails = details;
+  turn.thoughtBadge = details.querySelector(".process-badge");
+  turn.thoughtPre = details.querySelector(".thought-text");
+}
+
+function ensureToolsDrawer(turn) {
+  if (turn.toolsDetails) return;
+  turn.processWrap.classList.remove("hidden");
+  const details = document.createElement("details");
+  details.className = "process-group tools-group"; // No `open` attr -> collapsed by default!
+  details.innerHTML = `
+    <summary>
+      <span class="process-summary-left">🧰 工具调用</span>
+      <span class="process-badge">已收纳</span>
+    </summary>
+    <div class="process-body"></div>`;
+  turn.processWrap.appendChild(details);
+  turn.toolsDetails = details;
+  turn.toolsBadge = details.querySelector(".process-badge");
+  turn.toolsBody = details.querySelector(".process-body");
+}
+
+function ensureAssistantBubble(turn) {
+  if (turn.assistantEl) return;
+  const box = $("chat-messages");
+  const div = document.createElement("div");
+  div.className = "msg assistant";
+  const md = document.createElement("div");
+  md.className = "md-content";
+  div.appendChild(md);
+  box.appendChild(div);
+  turn.assistantEl = div;
+  turn.assistantContentEl = md;
+}
+
+function summarizeToolArg(name, args) {
+  if (!args || typeof args !== "object") return "";
+  if (args.path) return String(args.path);
+  if (args.command) return String(args.command).slice(0, 42);
+  if (args.query) return String(args.query);
+  if (args.question) return String(args.question).slice(0, 42);
+  return "";
+}
+
+function finalizeTurnDrawers(turn) {
+  if (!turn) return;
+  if (turn.thoughtBadge) {
+    const totalChars = turn.thoughtRounds.join("").trim().length;
+    turn.thoughtBadge.textContent = `已收纳 · ${totalChars} 字`;
+  }
+  if (turn.toolsBadge) {
+    turn.toolsBadge.textContent = `已收纳 · ${turn.toolCount} 次调用`;
+  }
 }
 
 function renderEvent(ev) {
   const box = $("chat-messages");
   const d = ev.data || {};
 
+  if (d.session) {
+    updateSessionMeta(d.session);
+  }
+
   if (ev.type === "user_message") {
-    state.streamingAssistantEl = null;
-    state.streamingThoughtEl = null;
+    finalizeTurnDrawers(state.currentTurn);
+    state.currentTurn = null;
     const div = document.createElement("div");
     div.className = "msg user";
-    div.textContent = d.text || "";
+    div.textContent = normalizeCleanText(d.text || "");
     box.appendChild(div);
-  } else if (ev.type === "thought_delta") {
-    if (!state.streamingThoughtEl) {
-      const details = document.createElement("details");
-      details.className = "collapsible-card";
-      details.innerHTML = "<summary>💭 DeepSeek 思考过程 (点击展开)</summary><pre></pre>";
-      box.appendChild(details);
-      state.streamingThoughtEl = details.querySelector("pre");
+    scrollChatBottom(true);
+    return;
+  }
+
+  if (ev.type === "thought_delta") {
+    const turn = ensureCurrentTurn();
+    ensureThoughtDrawer(turn);
+    if (!turn.lastEventWasThought && turn.thoughtRounds[turn.thoughtRoundIdx]) {
+      turn.thoughtRoundIdx += 1;
+      turn.thoughtRounds[turn.thoughtRoundIdx] = "";
     }
-    state.streamingThoughtEl.textContent += d.text || "";
-  } else if (ev.type === "text_delta") {
-    if (!state.streamingAssistantEl) {
-      const div = document.createElement("div");
-      div.className = "msg assistant";
-      box.appendChild(div);
-      state.streamingAssistantEl = div;
+    turn.lastEventWasThought = true;
+    turn.lastEventWasText = false;
+
+    if (d.full_text !== undefined) {
+      turn.thoughtRounds[turn.thoughtRoundIdx] = normalizeCleanText(d.full_text);
+    } else {
+      turn.thoughtRounds[turn.thoughtRoundIdx] += normalizeCleanText(d.text || "");
     }
-    state.streamingAssistantEl.textContent += d.text || "";
+    const combinedThought = turn.thoughtRounds.filter(Boolean).join("\n\n---\n\n");
+    turn.thoughtPre.textContent = combinedThought;
+    turn.thoughtBadge.textContent = `已收纳 · ${combinedThought.length} 字`;
   } else if (ev.type === "tool_call") {
-    state.streamingAssistantEl = null;
-    state.streamingThoughtEl = null;
-    const details = document.createElement("details");
-    details.className = "collapsible-card";
-    details.innerHTML = `<summary>🔧 调用工具: ${escapeHtml(d.name || "")}</summary><pre></pre>`;
-    details.querySelector("pre").textContent = JSON.stringify(d.args || {}, null, 2);
-    box.appendChild(details);
+    const turn = ensureCurrentTurn();
+    turn.lastEventWasThought = false;
+    turn.lastEventWasText = false;
+    ensureToolsDrawer(turn);
+
+    turn.toolCount += 1;
+    const toolName = d.name || "tool";
+    turn.lastToolName = toolName;
+    const argPreview = summarizeToolArg(toolName, d.args);
+    turn.toolsBadge.textContent = `已收纳 · ${turn.toolCount} 次 (${toolName})`;
+
+    const item = document.createElement("details");
+    item.className = "tool-subitem"; // Collapsed by default!
+    const callId = d.id || `tc_${turn.toolCount}`;
+    item.innerHTML = `
+      <summary>
+        <span>#${turn.toolCount} 🔧 ${escapeHtml(toolName)}${argPreview ? ` · ${escapeHtml(argPreview)}` : ""}</span>
+        <span class="tool-status-tag">⏳ 执行中</span>
+      </summary>
+      <div class="tool-subitem-body">
+        <div class="muted">参数：</div>
+        <pre class="tool-args-pre"></pre>
+        <div class="tool-result-wrap hidden">
+          <div class="muted" style="margin-top:6px">返回结果：</div>
+          <pre class="tool-res-pre"></pre>
+        </div>
+      </div>`;
+    item.querySelector(".tool-args-pre").textContent = JSON.stringify(d.args || {}, null, 2);
+    turn.toolsBody.appendChild(item);
+    turn.toolItemsById.set(callId, item);
   } else if (ev.type === "tool_result") {
-    const details = document.createElement("details");
-    details.className = "collapsible-card";
-    const statusIcon = d.error ? "❌" : "✅";
-    details.innerHTML = `<summary>${statusIcon} 工具结果: ${escapeHtml(d.name || "")}</summary><pre></pre>`;
-    details.querySelector("pre").textContent = d.error
-      ? `Error: ${d.error}`
-      : typeof d.result === "string"
-        ? d.result
-        : JSON.stringify(d.result, null, 2);
-    box.appendChild(details);
+    const turn = ensureCurrentTurn();
+    turn.lastEventWasThought = false;
+    turn.lastEventWasText = false;
+    ensureToolsDrawer(turn);
+
+    const callId = d.id;
+    let item = callId ? turn.toolItemsById.get(callId) : null;
+    if (!item) {
+      // Fallback if tool_result arrived without prior matching id
+      turn.toolCount += 1;
+      item = document.createElement("details");
+      item.className = "tool-subitem";
+      item.innerHTML = `
+        <summary>
+          <span>#${turn.toolCount} 🔧 ${escapeHtml(d.name || "tool")}</span>
+          <span class="tool-status-tag"></span>
+        </summary>
+        <div class="tool-subitem-body">
+          <div class="tool-result-wrap">
+            <div class="muted">返回结果：</div>
+            <pre class="tool-res-pre"></pre>
+          </div>
+        </div>`;
+      turn.toolsBody.appendChild(item);
+    }
+
+    const statusTag = item.querySelector(".tool-status-tag");
+    if (statusTag) {
+      statusTag.textContent = d.error ? "❌ 失败" : "✅ 完成";
+    }
+    const resWrap = item.querySelector(".tool-result-wrap");
+    const resPre = item.querySelector(".tool-res-pre");
+    if (resWrap && resPre) {
+      resWrap.classList.remove("hidden");
+      resPre.textContent = d.error
+        ? `Error: ${d.error}`
+        : typeof d.result === "string"
+          ? normalizeCleanText(d.result)
+          : JSON.stringify(d.result, null, 2);
+    }
+    turn.toolsBadge.textContent = `已收纳 · ${turn.toolCount} 次 (${turn.lastToolName || d.name || "完成"})`;
+  } else if (ev.type === "text_delta") {
+    const turn = ensureCurrentTurn();
+    ensureAssistantBubble(turn);
+    if (!turn.lastEventWasText && turn.textRounds[turn.textRoundIdx]) {
+      turn.textRoundIdx += 1;
+      turn.textRounds[turn.textRoundIdx] = "";
+    }
+    turn.lastEventWasText = true;
+    turn.lastEventWasThought = false;
+
+    if (d.full_text !== undefined) {
+      turn.textRounds[turn.textRoundIdx] = normalizeCleanText(d.full_text);
+    } else {
+      turn.textRounds[turn.textRoundIdx] += normalizeCleanText(d.text || "");
+    }
+    const combinedMarkdown = turn.textRounds.filter(Boolean).join("\n\n");
+    turn.assistantContentEl.innerHTML = renderMarkdown(combinedMarkdown);
   } else if (
     ev.type === "approval_request" ||
     ev.type === "interaction_request" ||
     ev.type === "approval_resolved" ||
     ev.type === "interaction_resolved"
   ) {
-    refreshActiveSummary();
+    if (state.wsSynced && !d.session) refreshActiveSummary();
   } else if (ev.type === "status") {
     if (d.status === "running") {
       $("agent-state-pill").textContent = "DeepSeek 运行中...";
@@ -366,18 +784,20 @@ function renderEvent(ev) {
       $("cancel-btn").classList.remove("hidden");
     }
   } else if (ev.type === "turn_done") {
-    state.streamingAssistantEl = null;
-    state.streamingThoughtEl = null;
+    finalizeTurnDrawers(state.currentTurn);
+    state.currentTurn = null;
+    state.resolvingIds.clear();
     $("agent-state-pill").textContent = "空闲";
     $("send-btn").classList.remove("hidden");
     $("cancel-btn").classList.add("hidden");
-    refreshActiveSummary();
+    if (state.wsSynced && !d.session) refreshActiveSummary();
   } else if (ev.type === "error") {
-    state.streamingAssistantEl = null;
-    state.streamingThoughtEl = null;
+    finalizeTurnDrawers(state.currentTurn);
+    state.currentTurn = null;
+    state.resolvingIds.clear();
     const div = document.createElement("div");
     div.className = "msg error";
-    div.textContent = `错误: ${d.message || "未知错误"}`;
+    div.textContent = `错误: ${d.message || "网络连接中断，请重试"}`;
     box.appendChild(div);
     $("agent-state-pill").textContent = "错误";
     $("send-btn").classList.remove("hidden");
@@ -393,38 +813,110 @@ async function refreshActiveSummary() {
   } catch {}
 }
 
+// Stable DOM-diffed renderPendingBox so existing buttons are NEVER destroyed mid-tap on iOS
 function renderPendingBox(summary) {
   const box = $("pending-box");
-  box.innerHTML = "";
-  const approvals = summary.pending_approvals || [];
-  const interactions = summary.pending_interactions || [];
+  const approvals = (summary.pending_approvals || []).filter(
+    (r) => !state.resolvingIds.has(r.request_id)
+  );
+  const interactions = (summary.pending_interactions || []).filter(
+    (r) => !state.resolvingIds.has(r.request_id)
+  );
+
   if (approvals.length === 0 && interactions.length === 0) {
+    box.innerHTML = "";
     box.classList.add("hidden");
     return;
   }
   box.classList.remove("hidden");
 
+  // 1. Batch bar when > 1 approval is queued
+  let batchBar = box.querySelector(".batch-bar");
+  if (approvals.length > 1) {
+    if (!batchBar) {
+      batchBar = document.createElement("div");
+      batchBar.className = "batch-bar";
+      box.prepend(batchBar);
+    }
+    batchBar.innerHTML = `
+      <span class="small-text"><strong>待审批 (${approvals.length} 项)</strong></span>
+      <div class="row-gap">
+        <button class="btn primary small" data-batch="allow">全部允许</button>
+        <button class="btn small" data-batch="auto">全部允许并转自动</button>
+        <button class="btn danger small" data-batch="deny">全部拒绝</button>
+      </div>`;
+    batchBar.querySelector('[data-batch="allow"]').addEventListener("click", (e) => {
+      e.currentTarget.disabled = true;
+      submitApproval("all", true);
+    });
+    batchBar.querySelector('[data-batch="auto"]').addEventListener("click", (e) => {
+      e.currentTarget.disabled = true;
+      submitApproval("all", true, "auto");
+    });
+    batchBar.querySelector('[data-batch="deny"]').addEventListener("click", (e) => {
+      e.currentTarget.disabled = true;
+      submitApproval("all", false);
+    });
+  } else if (batchBar) {
+    batchBar.remove();
+  }
+
+  // 2. Remove stale cards no longer in pending lists
+  const activeIds = new Set([
+    ...approvals.map((a) => `app-${a.request_id}`),
+    ...interactions.map((i) => `int-${i.request_id}`),
+  ]);
+  box.querySelectorAll(".pending-item").forEach((el) => {
+    if (!activeIds.has(el.dataset.domId)) {
+      el.remove();
+    }
+  });
+
+  // 3. Append only new approval cards
   for (const req of approvals) {
+    const domId = `app-${req.request_id}`;
+    if (box.querySelector(`[data-dom-id="${domId}"]`)) continue;
+
     const wrap = document.createElement("div");
+    wrap.className = "pending-item";
+    wrap.dataset.domId = domId;
     wrap.innerHTML = `<strong>⚠️ 需要审批: ${escapeHtml(req.tool_name)}</strong>
       <pre style="margin:6px 0;white-space:pre-wrap;font-size:12px;">${escapeHtml(JSON.stringify(req.args || {}, null, 2))}</pre>
-      <div class="row-gap">
+      <div class="row-gap" style="flex-wrap:wrap">
         <button class="btn primary small" data-act="allow">允许执行</button>
+        <button class="btn small" data-act="auto">允许并转自动</button>
         <button class="btn danger small" data-act="deny">拒绝</button>
       </div>`;
-    wrap.querySelector('[data-act="allow"]').addEventListener("click", () =>
-      submitApproval(req.request_id, true)
-    );
-    wrap.querySelector('[data-act="deny"]').addEventListener("click", () =>
-      submitApproval(req.request_id, false)
-    );
+    const btns = wrap.querySelectorAll("button");
+    const lockButtons = (clicked) => {
+      btns.forEach((b) => (b.disabled = true));
+      clicked.textContent = "处理中...";
+    };
+    wrap.querySelector('[data-act="allow"]').addEventListener("click", (e) => {
+      lockButtons(e.currentTarget);
+      submitApproval(req.request_id, true);
+    });
+    wrap.querySelector('[data-act="auto"]').addEventListener("click", (e) => {
+      lockButtons(e.currentTarget);
+      submitApproval(req.request_id, true, "auto");
+    });
+    wrap.querySelector('[data-act="deny"]').addEventListener("click", (e) => {
+      lockButtons(e.currentTarget);
+      submitApproval(req.request_id, false);
+    });
     box.appendChild(wrap);
   }
 
+  // 4. Append only new interaction cards
   for (const inter of interactions) {
-    const wrap = document.createElement("div");
+    const domId = `int-${inter.request_id}`;
+    if (box.querySelector(`[data-dom-id="${domId}"]`)) continue;
+
     const q = (inter.questions || [])[0];
     if (!q) continue;
+    const wrap = document.createElement("div");
+    wrap.className = "pending-item";
+    wrap.dataset.domId = domId;
     wrap.innerHTML = `<strong>❓ ${escapeHtml(q.question)}</strong>`;
     const optsWrap = document.createElement("div");
     optsWrap.className = "row-gap";
@@ -434,9 +926,13 @@ function renderPendingBox(summary) {
       const b = document.createElement("button");
       b.className = "btn small";
       b.textContent = opt.text;
-      b.addEventListener("click", () =>
-        submitInteraction(inter.request_id, [{ selected_option_ids: [opt.id], freeform_response: opt.text }])
-      );
+      b.addEventListener("click", () => {
+        wrap.querySelectorAll("button").forEach((btn) => (btn.disabled = true));
+        b.textContent = "提交中...";
+        submitInteraction(inter.request_id, [
+          { selected_option_ids: [opt.id], freeform_response: opt.text },
+        ]);
+      });
       optsWrap.appendChild(b);
     }
     const freeRow = document.createElement("div");
@@ -444,8 +940,10 @@ function renderPendingBox(summary) {
     freeRow.style.marginTop = "6px";
     freeRow.innerHTML = `<input type="text" placeholder="或输入自定义回答..." style="flex:1" />
       <button class="btn primary small">提交</button>`;
-    freeRow.querySelector("button").addEventListener("click", () => {
+    freeRow.querySelector("button").addEventListener("click", (e) => {
       const val = freeRow.querySelector("input").value.trim();
+      wrap.querySelectorAll("button").forEach((btn) => (btn.disabled = true));
+      e.currentTarget.textContent = "提交中...";
       submitInteraction(inter.request_id, [{ freeform_response: val }]);
     });
     wrap.append(optsWrap, freeRow);
@@ -453,35 +951,75 @@ function renderPendingBox(summary) {
   }
 }
 
-async function submitApproval(requestId, allow) {
-  await api(`/api/sessions/${state.activeSessionId}/approvals/${requestId}`, {
-    method: "POST",
-    body: JSON.stringify({ allow }),
-  });
-  await refreshActiveSummary();
+async function submitApproval(requestId, allow, setApprovalMode = null) {
+  if (requestId !== "all") {
+    state.resolvingIds.add(requestId);
+  }
+  try {
+    const payload = { allow };
+    if (setApprovalMode) payload.set_approval_mode = setApprovalMode;
+    const res = await api(`/api/sessions/${state.activeSessionId}/approvals/${requestId}`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (setApprovalMode === "auto") {
+      showToast("已切换当前会话为自动执行模式");
+    }
+    if (res.session) {
+      updateSessionMeta(res.session);
+    } else {
+      await refreshActiveSummary();
+    }
+  } catch (err) {
+    state.resolvingIds.delete(requestId);
+    await refreshActiveSummary();
+    showToast(err.message);
+  }
 }
 
 async function submitInteraction(requestId, responses) {
-  await api(`/api/sessions/${state.activeSessionId}/interactions/${requestId}`, {
-    method: "POST",
-    body: JSON.stringify({ responses, cancelled: false }),
-  });
-  await refreshActiveSummary();
+  state.resolvingIds.add(requestId);
+  try {
+    const res = await api(`/api/sessions/${state.activeSessionId}/interactions/${requestId}`, {
+      method: "POST",
+      body: JSON.stringify({ responses, cancelled: false }),
+    });
+    if (res.session) {
+      updateSessionMeta(res.session);
+    } else {
+      await refreshActiveSummary();
+    }
+  } catch (err) {
+    state.resolvingIds.delete(requestId);
+    await refreshActiveSummary();
+    showToast(err.message);
+  }
 }
 
 async function sendPrompt() {
+  if (state.sendingPrompt) return;
   const input = $("chat-input");
   const prompt = input.value.trim();
   if (!prompt || !state.activeSessionId) return;
+
+  state.sendingPrompt = true;
+  $("send-btn").disabled = true;
   input.value = "";
   autoGrow(input);
+
   try {
-    await api(`/api/sessions/${state.activeSessionId}/message`, {
+    const res = await api(`/api/sessions/${state.activeSessionId}/message`, {
       method: "POST",
       body: JSON.stringify({ prompt, model: $("quick-model-select").value }),
     });
+    if (res.session) updateSessionMeta(res.session);
   } catch (err) {
+    input.value = prompt;
+    autoGrow(input);
     showToast(err.message);
+  } finally {
+    state.sendingPrompt = false;
+    $("send-btn").disabled = false;
   }
 }
 
@@ -495,7 +1033,8 @@ $("chat-input").addEventListener("keydown", (e) => {
 $("chat-input").addEventListener("input", () => autoGrow($("chat-input")));
 
 $("cancel-btn").addEventListener("click", async () => {
-  await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: "POST" });
+  const res = await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: "POST" });
+  if (res.session) updateSessionMeta(res.session);
   showToast("已请求停止");
 });
 
@@ -685,7 +1224,6 @@ async function loadCodeMirrorModules() {
       import("https://esm.sh/codemirror@6.0.1"),
       import("https://esm.sh/@codemirror/view@6.35.0"),
       import("https://esm.sh/@codemirror/state@6.4.1"),
-      import("https://esm.sh/@codemirror/theme-one-dark@6.1.2"),
       import("https://esm.sh/@codemirror/lang-python@6.1.6"),
       import("https://esm.sh/@codemirror/lang-javascript@6.2.2"),
       import("https://esm.sh/@codemirror/lang-json@6.0.1"),
@@ -719,7 +1257,7 @@ async function openFileInEditor(relPath) {
   const cmMods = await loadCodeMirrorModules();
 
   if (cmMods) {
-    const [cm, viewMod, _stateMod, themeMod, pyMod, jsMod, jsonMod, mdMod] = cmMods;
+    const [cm, viewMod, _stateMod, pyMod, jsMod, jsonMod, mdMod] = cmMods;
     const ext = data.ext || "";
     const langExts = [];
     if (ext === ".py") langExts.push(pyMod.python());
@@ -733,7 +1271,6 @@ async function openFileInEditor(relPath) {
       extensions: [
         cm.basicSetup,
         viewMod.EditorView.lineWrapping,
-        themeMod.oneDark,
         ...langExts,
         viewMod.EditorView.updateListener.of((u) => {
           if (u.docChanged && state.openFile) {

@@ -1,10 +1,11 @@
-"""DeepSeek streaming agent runtime with workspace tools, mobile approvals, and event replay."""
+"""DeepSeek streaming agent runtime with resilient retries, message sanitization, and batch approvals."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import ssl
 import subprocess
 import urllib.parse
 import urllib.request
@@ -22,7 +23,6 @@ from bridge.fs_service import (
     git_status_and_diff,
     list_directory,
     read_file_content,
-    resolve_workspace_path,
     search_workspace,
     write_file_content,
 )
@@ -30,6 +30,7 @@ from bridge.fs_service import (
 WRITE_TOOLS = {"write_file", "edit_file", "run_command"}
 COMMAND_TOOLS = {"run_command"}
 MAX_TOOL_ROUNDS = 24
+RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 SYSTEM_PROMPT = """You are a skilled AI coding assistant running inside the user's Windows workspace via DeepSeek Mobile Bridge.
 You have tools to inspect directories, read files, search code, write/edit files, inspect git status/diff, run shell commands, and ask the user questions.
@@ -180,6 +181,120 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _format_exception(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    cls_name = type(exc).__name__
+    if isinstance(exc, (httpx.TimeoutException, asyncio.TimeoutError)):
+        return f"请求超时 ({cls_name}): {msg or '连接 DeepSeek 服务器超时，请重试'}"
+    if isinstance(exc, (httpx.TransportError, ssl.SSLError, OSError)):
+        return f"网络连接中断 ({cls_name}): {msg or '与 DeepSeek 的连接被重置或代理中断，请重试'}"
+    if msg:
+        return msg
+    return f"运行异常 ({cls_name})"
+
+
+def sanitize_conversation_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Repair any corrupted/interrupted message history so DeepSeek API never rejects it."""
+    cleaned: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = dict(messages[i])
+        role = msg.get("role")
+
+        if role == "user":
+            # If the previous message in `cleaned` is also a `user` message (from a failed turn),
+            # replace the dangling user message with the latest one.
+            if cleaned and cleaned[-1].get("role") == "user":
+                cleaned[-1] = msg
+            else:
+                cleaned.append(msg)
+            i += 1
+            continue
+
+        if role == "assistant":
+            tool_calls = msg.get("tool_calls") or []
+            if not tool_calls:
+                if msg.get("content") or msg.get("reasoning_content"):
+                    cleaned.append(msg)
+                i += 1
+                continue
+
+            # Collect subsequent `tool` messages matching this assistant's tool_calls
+            expected_ids = [tc.get("id") for tc in tool_calls if tc.get("id")]
+            j = i + 1
+            found_tools: dict[str, dict[str, Any]] = {}
+            while j < n and messages[j].get("role") == "tool":
+                tmsg = dict(messages[j])
+                tc_id = tmsg.get("tool_call_id")
+                if tc_id:
+                    found_tools[tc_id] = tmsg
+                j += 1
+
+            cleaned.append(msg)
+            for tc_id in expected_ids:
+                if tc_id in found_tools:
+                    cleaned.append(found_tools[tc_id])
+                else:
+                    cleaned.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": json.dumps(
+                                {"error": "Tool execution was interrupted in a previous turn."},
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+            i = j
+            continue
+
+        # Skip orphan `tool` messages not preceded by an `assistant` with `tool_calls`
+        i += 1
+
+    return cleaned
+
+
+def compact_event_stream(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coalesce contiguous thought_delta / text_delta events and drop transient status events."""
+    compacted: list[dict[str, Any]] = []
+    for ev in events:
+        etype = ev.get("type")
+        if etype == "status":
+            continue
+        data = dict(ev.get("data") or {})
+        if etype == "error" and not str(data.get("message") or "").strip():
+            data["message"] = "网络连接中断 (历史回合未完成)"
+
+        if etype in ("thought_delta", "text_delta"):
+            piece = str(data.get("full_text") or data.get("text") or "")
+            if compacted and compacted[-1].get("type") == etype:
+                prev_data = compacted[-1]["data"]
+                # If `full_text` was already stored, use it if longer; otherwise append `text`
+                if "full_text" in data:
+                    merged = piece
+                else:
+                    merged = str(prev_data.get("full_text") or prev_data.get("text") or "") + piece
+                compacted[-1] = {
+                    "seq": ev["seq"],
+                    "type": etype,
+                    "ts": ev.get("ts") or _utc_now(),
+                    "data": {"text": merged, "full_text": merged},
+                }
+            else:
+                compacted.append(
+                    {
+                        "seq": ev["seq"],
+                        "type": etype,
+                        "ts": ev.get("ts") or _utc_now(),
+                        "data": {"text": piece, "full_text": piece},
+                    }
+                )
+        else:
+            compacted.append({**ev, "data": data})
+    return compacted
+
+
 @dataclass
 class PendingRequest:
     request_id: str
@@ -214,8 +329,8 @@ class DeepSeekSession:
         self.sessions_dir = sessions_dir
         self.created_at = _utc_now()
         self.updated_at = self.created_at
-        self.messages: list[dict[str, Any]] = messages or []
-        self.events: list[dict[str, Any]] = events or []
+        self.messages: list[dict[str, Any]] = sanitize_conversation_messages(messages or [])
+        self.events: list[dict[str, Any]] = compact_event_stream(events or [])
         self.next_seq = (self.events[-1]["seq"] + 1) if self.events else 1
 
         self.status: str = "idle"
@@ -225,7 +340,10 @@ class DeepSeekSession:
 
         self._lock = asyncio.Lock()
         self._active_task: asyncio.Task[None] | None = None
-        self._http_client_factory = lambda: httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=20.0))
+        self._http_client_factory = lambda: httpx.AsyncClient(
+            http2=False,
+            timeout=httpx.Timeout(120.0, connect=15.0, read=90.0),
+        )
 
     @property
     def storage_path(self) -> Path:
@@ -271,31 +389,75 @@ class DeepSeekSession:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "messages": self.messages[-120:],
-            "events": self.events[-2000:],
+            "events": self.events[-600:],
         }
         tmp = self.storage_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.storage_path)
 
-    def emit_event(self, event_type: str, data: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
-        event = {
-            "seq": self.next_seq,
-            "type": event_type,
-            "ts": _utc_now(),
-            "data": data,
-        }
+    def emit_event(
+        self,
+        event_type: str,
+        data: dict[str, Any],
+        *,
+        persist: bool = True,
+        include_session: bool = False,
+    ) -> dict[str, Any]:
+        seq = self.next_seq
         self.next_seq += 1
-        self.updated_at = event["ts"]
-        self.events.append(event)
-        if len(self.events) > 3000:
-            self.events = self.events[-2500:]
+        now = _utc_now()
+        self.updated_at = now
+
+        # Coalesce contiguous thought_delta and text_delta in stored history
+        if event_type in ("thought_delta", "text_delta"):
+            delta_text = str(data.get("text") or "")
+            if self.events and self.events[-1]["type"] == event_type:
+                prev_full = str(self.events[-1]["data"].get("full_text") or self.events[-1]["data"].get("text") or "")
+                full_text = prev_full + delta_text
+                stored_event = {
+                    "seq": seq,
+                    "type": event_type,
+                    "ts": now,
+                    "data": {"text": full_text, "full_text": full_text},
+                }
+                self.events[-1] = stored_event
+            else:
+                full_text = delta_text
+                stored_event = {
+                    "seq": seq,
+                    "type": event_type,
+                    "ts": now,
+                    "data": {"text": full_text, "full_text": full_text},
+                }
+                self.events.append(stored_event)
+
+            wire_event: dict[str, Any] = {
+                "seq": seq,
+                "type": event_type,
+                "ts": now,
+                "data": {"text": delta_text, "full_text": full_text},
+            }
+        else:
+            wire_data = dict(data)
+            if include_session:
+                wire_data["session"] = self.summary()
+            wire_event = {
+                "seq": seq,
+                "type": event_type,
+                "ts": now,
+                "data": wire_data,
+            }
+            if event_type != "status":
+                self.events.append(wire_event)
+                if len(self.events) > 800:
+                    self.events = self.events[-600:]
 
         for queue in list(self.subscribers):
-            queue.put_nowait(event)
+            queue.put_nowait(wire_event)
 
         if persist:
             self.save_to_disk()
-        return event
+        return wire_event
 
     def get_events_after(self, after_seq: int = 0) -> list[dict[str, Any]]:
         if after_seq <= 0:
@@ -335,40 +497,35 @@ class DeepSeekSession:
             return tool_name in WRITE_TOOLS
         return tool_name in COMMAND_TOOLS
 
-    async def _request_approval(self, tool_name: str, args: dict[str, Any]) -> tuple[bool, str]:
-        if not self._needs_approval(tool_name):
-            return True, ""
-
+    def _register_approval(self, tool_name: str, args: dict[str, Any]) -> PendingRequest:
         loop = asyncio.get_running_loop()
         req_id = uuid.uuid4().hex[:10]
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         payload = {"tool_name": tool_name, "args": args}
-        self.pending_approvals[req_id] = PendingRequest(
+        req = PendingRequest(
             request_id=req_id,
             kind="approval",
             payload=payload,
             future=fut,
         )
-        self.status = "waiting_input"
-        self.emit_event("approval_request", {"request_id": req_id, **payload})
-        asyncio.create_task(
-            self._send_bark(
-                f"DeepSeek 审批: {tool_name}",
-                json.dumps(args, ensure_ascii=False),
-            )
-        )
+        self.pending_approvals[req_id] = req
+        return req
+
+    async def _await_approval(self, req: PendingRequest) -> tuple[bool, str]:
         try:
-            decision = await fut
+            decision = await req.future
         finally:
-            self.pending_approvals.pop(req_id, None)
-            if self._active_task and not self._active_task.done():
-                self.status = "running"
+            self.pending_approvals.pop(req.request_id, None)
+            if not self.pending_approvals and not self.pending_interactions:
+                if self._active_task and not self._active_task.done():
+                    self.status = "running"
 
         allow = bool(decision.get("allow", False))
         reason = str(decision.get("reason") or ("Approved on mobile" if allow else "Denied on mobile"))
         self.emit_event(
             "approval_resolved",
-            {"request_id": req_id, "allow": allow, "reason": reason},
+            {"request_id": req.request_id, "allow": allow, "reason": reason},
+            include_session=True,
         )
         return allow, reason
 
@@ -391,34 +548,61 @@ class DeepSeekSession:
             future=fut,
         )
         self.status = "waiting_input"
-        self.emit_event("interaction_request", {"request_id": req_id, **payload})
+        self.emit_event(
+            "interaction_request",
+            {"request_id": req_id, **payload},
+            include_session=True,
+        )
         asyncio.create_task(self._send_bark("DeepSeek 需要你的回答", question))
         try:
             answer = await fut
         finally:
             self.pending_interactions.pop(req_id, None)
-            if self._active_task and not self._active_task.done():
-                self.status = "running"
+            if not self.pending_approvals and not self.pending_interactions:
+                if self._active_task and not self._active_task.done():
+                    self.status = "running"
 
         cancelled = bool(answer.get("cancelled", False))
         self.emit_event(
             "interaction_resolved",
             {"request_id": req_id, "cancelled": cancelled},
+            include_session=True,
         )
         return answer
 
-    async def _execute_tool(self, name: str, raw_args: str) -> str:
+    async def _execute_tool(
+        self,
+        name: str,
+        raw_args: str,
+        pre_req: PendingRequest | None = None,
+    ) -> str:
         try:
             args = json.loads(raw_args) if raw_args.strip() else {}
         except json.JSONDecodeError as exc:
+            if pre_req:
+                self.pending_approvals.pop(pre_req.request_id, None)
             return json.dumps({"error": f"Invalid JSON arguments: {exc}"}, ensure_ascii=False)
 
         if not isinstance(args, dict):
+            if pre_req:
+                self.pending_approvals.pop(pre_req.request_id, None)
             return json.dumps({"error": "Tool arguments must be a JSON object"}, ensure_ascii=False)
 
-        allow, reason = await self._request_approval(name, args)
-        if not allow:
-            return json.dumps({"error": f"Denied by user: {reason}"}, ensure_ascii=False)
+        if pre_req is not None:
+            allow, reason = await self._await_approval(pre_req)
+            if not allow:
+                return json.dumps({"error": f"Denied by user: {reason}"}, ensure_ascii=False)
+        elif self._needs_approval(name):
+            req = self._register_approval(name, args)
+            self.status = "waiting_input"
+            self.emit_event(
+                "approval_request",
+                {"request_id": req.request_id, **req.payload},
+                include_session=True,
+            )
+            allow, reason = await self._await_approval(req)
+            if not allow:
+                return json.dumps({"error": f"Denied by user: {reason}"}, ensure_ascii=False)
 
         root = Path(self.workspace)
         try:
@@ -496,21 +680,32 @@ class DeepSeekSession:
                         env["PATH"] = f"{venv_scripts};{env.get('PATH', '')}"
                         env["VIRTUAL_ENV"] = str(PROJECT_ROOT / ".venv")
                     env["PYTHONIOENCODING"] = "utf-8"
-                    proc = subprocess.run(
-                        ["powershell", "-NoProfile", "-Command", cmd],
-                        cwd=str(root),
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=timeout,
-                    )
-                    return {
-                        "exit_code": proc.returncode,
-                        "stdout": proc.stdout[-12000:],
-                        "stderr": proc.stderr[-6000:],
-                    }
+                    try:
+                        proc = subprocess.run(
+                            ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                            cwd=str(root),
+                            env=env,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            timeout=timeout,
+                        )
+                        return {
+                            "exit_code": proc.returncode,
+                            "stdout": proc.stdout[-12000:],
+                            "stderr": proc.stderr[-6000:],
+                        }
+                    except subprocess.TimeoutExpired as tex:
+                        out = (tex.stdout or "") if isinstance(tex.stdout, str) else ""
+                        err = (tex.stderr or "") if isinstance(tex.stderr, str) else ""
+                        return {
+                            "error": f"Command timed out after {timeout}s",
+                            "exit_code": -1,
+                            "stdout": out[-6000:],
+                            "stderr": err[-4000:],
+                        }
 
                 res = await asyncio.to_thread(_run)
                 return json.dumps(res, ensure_ascii=False)
@@ -525,13 +720,13 @@ class DeepSeekSession:
         except WorkspaceSecurityError as exc:
             return json.dumps({"error": f"Security error: {exc}"}, ensure_ascii=False)
         except Exception as exc:
-            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+            return json.dumps({"error": _format_exception(exc)}, ensure_ascii=False)
 
     def _build_api_messages(self) -> list[dict[str, Any]]:
+        self.messages = sanitize_conversation_messages(self.messages)
         api_msgs: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT.format(workspace=self.workspace)}
         ]
-        # Find last user message index so prior-turn reasoning_content can be omitted cleanly
         last_user_idx = -1
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "user":
@@ -563,92 +758,122 @@ class DeepSeekSession:
             "stream": True,
         }
 
-        content_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tool_calls_acc: dict[int, dict[str, Any]] = {}
+        last_exc: BaseException | None = None
+        for attempt in range(1, 4):
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
+            emitted_any = False
 
-        async with client.stream("POST", url, headers=headers, json=body) as resp:
-            if resp.status_code >= 400:
-                err_raw = await resp.aread()
-                err_text = err_raw.decode("utf-8", errors="replace")
-                try:
-                    err_json = json.loads(err_text)
-                    msg = err_json.get("error", {}).get("message") or err_text
-                except json.JSONDecodeError:
-                    msg = err_text
-                raise RuntimeError(f"DeepSeek API ({resp.status_code}): {msg}")
+            try:
+                async with client.stream("POST", url, headers=headers, json=body) as resp:
+                    if resp.status_code in RETRYABLE_STATUS_CODES and attempt < 3:
+                        await resp.aread()
+                        await asyncio.sleep(0.8 * attempt)
+                        continue
 
-            async for raw_line in resp.aiter_lines():
-                line = raw_line.strip()
-                if not line or not line.startswith("data:"):
+                    if resp.status_code >= 400:
+                        err_raw = await resp.aread()
+                        err_text = err_raw.decode("utf-8", errors="replace").strip()
+                        try:
+                            err_json = json.loads(err_text)
+                            msg = (
+                                err_json.get("error", {}).get("message")
+                                if isinstance(err_json.get("error"), dict)
+                                else err_text
+                            ) or err_text
+                        except json.JSONDecodeError:
+                            msg = err_text
+                        raise RuntimeError(f"DeepSeek API ({resp.status_code}): {msg or '请求被拒绝'}")
+
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if payload_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta") or {}
+
+                        if r_delta := delta.get("reasoning_content"):
+                            emitted_any = True
+                            reasoning_parts.append(r_delta)
+                            self.emit_event("thought_delta", {"text": r_delta}, persist=False)
+
+                        if c_delta := delta.get("content"):
+                            emitted_any = True
+                            content_parts.append(c_delta)
+                            self.emit_event("text_delta", {"text": c_delta}, persist=False)
+
+                        for tc in delta.get("tool_calls") or []:
+                            emitted_any = True
+                            idx = int(tc.get("index", 0))
+                            acc = tool_calls_acc.setdefault(
+                                idx,
+                                {
+                                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                },
+                            )
+                            if tc.get("id"):
+                                acc["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            if fn.get("name"):
+                                acc["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                acc["function"]["arguments"] += fn["arguments"]
+
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "".join(content_parts) if content_parts else None,
+                }
+                if reasoning_parts:
+                    assistant_msg["reasoning_content"] = "".join(reasoning_parts)
+                if tool_calls_acc:
+                    assistant_msg["tool_calls"] = [
+                        tool_calls_acc[k] for k in sorted(tool_calls_acc.keys())
+                    ]
+                return assistant_msg
+
+            except (httpx.TransportError, httpx.TimeoutException, ssl.SSLError, OSError) as exc:
+                last_exc = exc
+                # Retry if stream broke before any tokens or if partial stream had no tool calls yet
+                if attempt < 3 and not tool_calls_acc and not emitted_any:
+                    await asyncio.sleep(0.8 * attempt)
                     continue
-                payload_str = line[5:].strip()
-                if payload_str == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(payload_str)
-                except json.JSONDecodeError:
+                # If partial text/thoughts already streamed, still retry only if we haven't mutated tools
+                if attempt < 2 and not tool_calls_acc:
+                    await asyncio.sleep(1.0)
                     continue
+                raise RuntimeError(_format_exception(exc)) from exc
 
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                delta = choices[0].get("delta") or {}
-
-                if r_delta := delta.get("reasoning_content"):
-                    reasoning_parts.append(r_delta)
-                    self.emit_event("thought_delta", {"text": r_delta}, persist=False)
-
-                if c_delta := delta.get("content"):
-                    content_parts.append(c_delta)
-                    self.emit_event("text_delta", {"text": c_delta}, persist=False)
-
-                for tc in delta.get("tool_calls") or []:
-                    idx = int(tc.get("index", 0))
-                    acc = tool_calls_acc.setdefault(
-                        idx,
-                        {
-                            "id": tc.get("id") or f"call_{uuid.uuid4().hex[:8]}",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        },
-                    )
-                    if tc.get("id"):
-                        acc["id"] = tc["id"]
-                    fn = tc.get("function") or {}
-                    if fn.get("name"):
-                        acc["function"]["name"] += fn["name"]
-                    if fn.get("arguments"):
-                        acc["function"]["arguments"] += fn["arguments"]
-
-        assistant_msg: dict[str, Any] = {
-            "role": "assistant",
-            "content": "".join(content_parts) if content_parts else None,
-        }
-        if reasoning_parts:
-            assistant_msg["reasoning_content"] = "".join(reasoning_parts)
-        if tool_calls_acc:
-            assistant_msg["tool_calls"] = [
-                tool_calls_acc[k] for k in sorted(tool_calls_acc.keys())
-            ]
-        return assistant_msg
+        raise RuntimeError(_format_exception(last_exc or RuntimeError("DeepSeek 请求失败")))
 
     async def send_prompt(self, prompt: str, *, model: str | None = None) -> dict[str, Any]:
         clean = prompt.strip()
         if not clean:
             raise ValueError("Prompt cannot be empty")
         if self._active_task and not self._active_task.done():
-            raise RuntimeError("Session is already executing a turn; stop it first.")
+            raise RuntimeError("当前会话正在执行任务，请先点击「停止」或处理待审批项。")
 
         if model and model.strip():
             self.model = model.strip()
 
-        if self.title == "New Session" and len(self.events) == 0:
+        if self.title in ("New Session", "DeepSeek Session") and len(self.events) == 0:
             self.title = clean[:40] + ("..." if len(clean) > 40 else "")
 
         user_event = self.emit_event("user_message", {"text": clean})
         self.status = "running"
-        self.emit_event("status", {"status": "running"}, persist=False)
+        self.emit_event("status", {"status": "running"}, persist=False, include_session=True)
         self._active_task = asyncio.create_task(self._run_turn(clean))
         return user_event
 
@@ -659,11 +884,12 @@ class DeepSeekSession:
                 api_key = cfg.effective_api_key()
                 if not api_key:
                     raise RuntimeError(
-                        "请先在「设置」Tab 填入你的 DeepSeek API Key（或设置环境变量 DEEPSEEK_API_KEY）。"
+                        "请先在「Diff/设置」Tab 填入你的 DeepSeek API Key（或配置环境变量 DEEPSEEK_API_KEY）。"
                     )
                 base_url = cfg.effective_base_url()
-                model = self.model or cfg.model or "deepseek-chat"
+                model = self.model or cfg.model or "deepseek-flash"
 
+                self.messages = sanitize_conversation_messages(self.messages)
                 self.messages.append({"role": "user", "content": prompt})
 
                 async with self._http_client_factory() as client:
@@ -677,20 +903,54 @@ class DeepSeekSession:
                         if not tool_calls:
                             break
 
+                        # Pre-parse and pre-register all approvals in this batch so the mobile UI
+                        # receives all pending approvals at once (avoiding sequential button flash/lag).
+                        batch_items: list[tuple[dict[str, Any], dict[str, Any], PendingRequest | None]] = []
                         for tc in tool_calls:
-                            tc_id = tc["id"]
                             fn_name = tc["function"]["name"]
                             raw_args = tc["function"]["arguments"]
                             try:
                                 parsed_args = json.loads(raw_args) if raw_args.strip() else {}
+                                if not isinstance(parsed_args, dict):
+                                    parsed_args = {"raw": raw_args}
                             except json.JSONDecodeError:
                                 parsed_args = {"raw": raw_args}
 
                             self.emit_event(
                                 "tool_call",
-                                {"id": tc_id, "name": fn_name, "args": parsed_args},
+                                {"id": tc["id"], "name": fn_name, "args": parsed_args},
+                                persist=False,
                             )
-                            result_str = await self._execute_tool(fn_name, raw_args)
+                            pre_req: PendingRequest | None = None
+                            if self._needs_approval(fn_name):
+                                pre_req = self._register_approval(fn_name, parsed_args)
+                            batch_items.append((tc, parsed_args, pre_req))
+
+                        if self.pending_approvals:
+                            self.status = "waiting_input"
+                            first_req = next(iter(self.pending_approvals.values()))
+                            self.emit_event(
+                                "approval_request",
+                                {
+                                    "request_id": first_req.request_id,
+                                    "batch_count": len(self.pending_approvals),
+                                    **first_req.payload,
+                                },
+                                include_session=True,
+                            )
+                            asyncio.create_task(
+                                self._send_bark(
+                                    f"DeepSeek 待审批 ({len(self.pending_approvals)} 项)",
+                                    json.dumps(first_req.payload.get("args", {}), ensure_ascii=False),
+                                )
+                            )
+
+                        for tc, _parsed_args, pre_req in batch_items:
+                            tc_id = tc["id"]
+                            fn_name = tc["function"]["name"]
+                            raw_args = tc["function"]["arguments"]
+
+                            result_str = await self._execute_tool(fn_name, raw_args, pre_req=pre_req)
                             display_res = (
                                 result_str[:8000] + "\n...[truncated]"
                                 if len(result_str) > 8000
@@ -712,6 +972,7 @@ class DeepSeekSession:
                                     "result": display_res,
                                     "error": err_val,
                                 },
+                                persist=False,
                             )
                             self.messages.append(
                                 {
@@ -722,15 +983,18 @@ class DeepSeekSession:
                             )
 
                 self.status = "idle"
-                self.emit_event("turn_done", {"stop_reason": "done"})
+                self.emit_event("turn_done", {"stop_reason": "done"}, include_session=True)
                 asyncio.create_task(self._send_bark("DeepSeek 任务完成", self.title))
         except asyncio.CancelledError:
             self.status = "idle"
-            self.emit_event("turn_done", {"stop_reason": "cancelled"})
+            self.messages = sanitize_conversation_messages(self.messages)
+            self.emit_event("turn_done", {"stop_reason": "cancelled"}, include_session=True)
         except Exception as exc:
             self.status = "error"
-            self.emit_event("error", {"message": str(exc)})
-            asyncio.create_task(self._send_bark("DeepSeek 执行出错", str(exc)))
+            self.messages = sanitize_conversation_messages(self.messages)
+            err_msg = _format_exception(exc)
+            self.emit_event("error", {"message": err_msg}, include_session=True)
+            asyncio.create_task(self._send_bark("DeepSeek 执行出错", err_msg))
         finally:
             self.save_to_disk()
 
@@ -750,11 +1014,35 @@ class DeepSeekSession:
                 pass
         self.status = "idle"
 
-    def resolve_approval(self, request_id: str, *, allow: bool, reason: str = "") -> bool:
+    def resolve_approval(
+        self,
+        request_id: str,
+        *,
+        allow: bool,
+        reason: str = "",
+        set_approval_mode: str | None = None,
+    ) -> bool:
+        if set_approval_mode in {"ask_commands", "ask_writes", "auto"}:
+            self.approval_mode = set_approval_mode
+
+        if request_id == "all":
+            resolved_any = False
+            for req in list(self.pending_approvals.values()):
+                if not req.future.done():
+                    req.future.set_result({"allow": allow, "reason": reason})
+                    resolved_any = True
+            return resolved_any
+
         req = self.pending_approvals.get(request_id)
         if not req or req.future.done():
             return False
         req.future.set_result({"allow": allow, "reason": reason})
+
+        # If user switched session to auto mode, auto-approve remaining pending items in this batch
+        if allow and self.approval_mode == "auto":
+            for other in list(self.pending_approvals.values()):
+                if not other.future.done():
+                    other.future.set_result({"allow": True, "reason": "Auto-approved"})
         return True
 
     def resolve_interaction(
@@ -787,6 +1075,8 @@ class SessionManager:
             try:
                 raw = json.loads(path.read_text(encoding="utf-8"))
                 sid = raw["session_id"]
+                raw_events = raw.get("events", [])
+                raw_msgs = raw.get("messages", [])
                 sess = DeepSeekSession(
                     session_id=sid,
                     title=raw.get("title", "Session"),
@@ -797,11 +1087,14 @@ class SessionManager:
                     model=raw.get("model") or self.config_store.config.model,
                     config_store=self.config_store,
                     sessions_dir=self.sessions_dir,
-                    messages=raw.get("messages", []),
-                    events=raw.get("events", []),
+                    messages=raw_msgs,
+                    events=raw_events,
                 )
                 sess.created_at = raw.get("created_at", sess.created_at)
                 sess.updated_at = raw.get("updated_at", sess.updated_at)
+                # Persist compacted events and sanitized messages back to disk if shrunk
+                if len(sess.events) < len(raw_events) or len(sess.messages) != len(raw_msgs):
+                    sess.save_to_disk()
                 self.sessions[sid] = sess
             except Exception:
                 continue

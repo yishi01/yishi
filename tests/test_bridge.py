@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from bridge.config import VERSION, BridgeConfig, ConfigStore
+from bridge.deepseek_agent import compact_event_stream, sanitize_conversation_messages
 from bridge.server import create_app
 
 
@@ -288,7 +289,7 @@ def test_deepseek_streaming_and_tool_execution(bridge_env):
         time.sleep(0.05)
 
     types_seen = [e["type"] for e in ev_res["events"]]
-    assert "thought_delta" in types_seen
+    assert "thought_delta" in types_seen, f"Events were: {ev_res['events']}"
     assert "tool_call" in types_seen
     assert "tool_result" in types_seen
     assert "text_delta" in types_seen
@@ -476,3 +477,176 @@ def test_websocket_cursor_replay_pwa_and_version_consistency(bridge_env):
     referenced_ids = set(re.findall(r'\$\("([^"]+)"\)', app_js))
     missing_ids = referenced_ids - html_ids
     assert not missing_ids, f"Missing DOM IDs in index.html: {missing_ids}"
+
+
+def test_transient_network_retry_and_non_empty_error(bridge_env):
+    client, workspace, _ = bridge_env
+    ws = str(workspace.resolve())
+
+    sid = client.post(
+        "/api/sessions",
+        json={"workspace": ws, "title": "Retry Test"},
+        headers=_headers(),
+    ).json()["session_id"]
+    sess = client.app.state.session_manager.get_session(sid)
+
+    attempts = 0
+
+    def flaky_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Exact empty-string ReadError that previously caused '未知错误'
+            raise httpx.ReadError("")
+        chunks = [{"choices": [{"delta": {"content": "Recovered after retry!"}}]}]
+        sse = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=sse)
+
+    sess._http_client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(flaky_handler)
+    )
+
+    client.post(f"/api/sessions/{sid}/message", json={"prompt": "test retry"}, headers=_headers())
+    for _ in range(50):
+        ev_res = client.get(f"/api/sessions/{sid}/events", headers=_headers()).json()
+        if any(e["type"] == "turn_done" for e in ev_res["events"]):
+            break
+        time.sleep(0.05)
+
+    assert attempts == 2
+    assert any(
+        e["type"] == "text_delta" and "Recovered after retry!" in e["data"].get("full_text", "")
+        for e in ev_res["events"]
+    )
+
+
+def test_message_sanitization_and_event_coalescing(bridge_env):
+    client, workspace, _ = bridge_env
+    ws = str(workspace.resolve())
+
+    # 1. Verify broken history (duplicate user + unclosed tool_calls) is repaired
+    broken = [
+        {"role": "user", "content": "first failed attempt"},
+        {"role": "user", "content": "second attempt"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "tc_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "tc_2", "type": "function", "function": {"name": "list_directory", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "tc_1", "content": '{"ok": true}'},
+        # tc_2 is missing because previous turn crashed mid-batch!
+        {"role": "user", "content": "new question"},
+    ]
+    repaired = sanitize_conversation_messages(broken)
+    assert [m["role"] for m in repaired] == ["user", "assistant", "tool", "tool", "user"]
+    assert repaired[0]["content"] == "second attempt"
+    assert repaired[3]["tool_call_id"] == "tc_2"
+
+    # 2. Verify 50 streaming deltas coalesce into 1 stored event
+    sid = client.post(
+        "/api/sessions",
+        json={"workspace": ws, "title": "Coalesce Test"},
+        headers=_headers(),
+    ).json()["session_id"]
+    sess = client.app.state.session_manager.get_session(sid)
+    for i in range(50):
+        sess.emit_event("thought_delta", {"text": f"t{i} "}, persist=False)
+    for i in range(50):
+        sess.emit_event("text_delta", {"text": f"w{i} "}, persist=False)
+
+    assert len(sess.events) == 2
+    assert sess.events[0]["type"] == "thought_delta"
+    assert sess.events[0]["data"]["full_text"].startswith("t0 t1 ")
+    assert sess.events[1]["type"] == "text_delta"
+    assert sess.events[1]["data"]["full_text"].startswith("w0 w1 ")
+
+
+def test_batch_multi_tool_approvals(bridge_env):
+    client, workspace, _ = bridge_env
+    ws = str(workspace.resolve())
+
+    sid = client.post(
+        "/api/sessions",
+        json={"workspace": ws, "title": "Batch Approval Test", "approval_mode": "ask_commands"},
+        headers=_headers(),
+    ).json()["session_id"]
+    sess = client.app.state.session_manager.get_session(sid)
+
+    step = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal step
+        step += 1
+        if step == 1:
+            chunks = [
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "cmd_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "run_command",
+                                            "arguments": '{"command": "Write-Output one"}',
+                                        },
+                                    },
+                                    {
+                                        "index": 1,
+                                        "id": "cmd_2",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "run_command",
+                                            "arguments": '{"command": "Write-Output two"}',
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ]
+        else:
+            chunks = [{"choices": [{"delta": {"content": "Both commands ran."}}]}]
+        sse = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=sse)
+
+    sess._http_client_factory = lambda: httpx.AsyncClient(
+        transport=httpx.MockTransport(mock_handler)
+    )
+
+    client.post(f"/api/sessions/{sid}/message", json={"prompt": "Run two commands"}, headers=_headers())
+
+    # Both approvals should be registered upfront in the batch
+    pending = []
+    for _ in range(40):
+        s_info = client.get(f"/api/sessions/{sid}/events", headers=_headers()).json()["session"]
+        pending = s_info["pending_approvals"]
+        if len(pending) == 2:
+            break
+        time.sleep(0.05)
+    assert len(pending) == 2
+
+    # Approve all in one click
+    res = client.post(
+        f"/api/sessions/{sid}/approvals/all",
+        json={"allow": True},
+        headers=_headers(),
+    )
+    assert res.status_code == 200
+
+    for _ in range(60):
+        ev_res = client.get(f"/api/sessions/{sid}/events", headers=_headers()).json()
+        if any(e["type"] == "turn_done" for e in ev_res["events"]):
+            break
+        time.sleep(0.05)
+
+    assert any(
+        e["type"] == "text_delta" and "Both commands ran." in e["data"].get("full_text", "")
+        for e in ev_res["events"]
+    )

@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.3.0"
+VERSION = "0.6.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = Path(os.environ.get("PLUGIN_DATA") or (PROJECT_ROOT / "data"))
 

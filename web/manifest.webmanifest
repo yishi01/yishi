@@ -1,11 +1,11 @@
 {
-  "name": "Antigravity Mobile",
-  "short_name": "AGY Mobile",
-  "description": "iOS Mobile Bridge for Antigravity Agent, Workspace Files & Git Diff",
+  "name": "DeepSeek Mobile Bridge",
+  "short_name": "DeepSeek Go",
+  "description": "iOS Mobile Bridge for DeepSeek Agent, Workspace Files & Git Diff",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#0b1120",
-  "theme_color": "#0b1120",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
   "orientation": "portrait-primary",
   "icons": [
     {

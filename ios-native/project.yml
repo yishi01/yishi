@@ -1,0 +1,67 @@
+name: DeepSeekMobile
+options:
+  bundleIdPrefix: com.agy.deepseek
+  deploymentTarget:
+    iOS: "16.2"
+  xcodeVersion: "15.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    TARGETED_DEVICE_FAMILY: "1"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.2"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+
+targets:
+  DeepSeekMobile:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.2"
+    sources:
+      - path: DeepSeekMobile
+    info:
+      path: DeepSeekMobile/Info.plist
+      properties:
+        CFBundleDisplayName: DeepSeek Go
+        CFBundleShortVersionString: "0.6.0"
+        CFBundleVersion: "6"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSSupportsLiveActivities: true
+        UIBackgroundModes:
+          - audio
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.agy.deepseek.mobile
+        INFOPLIST_FILE: DeepSeekMobile/Info.plist
+    dependencies:
+      - target: DeepSeekIslandExtension
+        embed: true
+
+  DeepSeekIslandExtension:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "16.2"
+    sources:
+      - path: DeepSeekIslandExtension
+      - path: DeepSeekMobile/Shared
+    info:
+      path: DeepSeekIslandExtension/Info.plist
+      properties:
+        CFBundleDisplayName: DeepSeek Island
+        CFBundleShortVersionString: "0.6.0"
+        CFBundleVersion: "6"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.agy.deepseek.mobile.island
+        INFOPLIST_FILE: DeepSeekIslandExtension/Info.plist

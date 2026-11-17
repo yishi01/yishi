@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -70,6 +71,7 @@ class SendMessageRequest(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     allow: bool
     reason: str = ""
+    set_approval_mode: str | None = None
 
 
 class InteractionDecisionRequest(BaseModel):
@@ -108,9 +110,24 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         yield
         await session_manager.shutdown()
 
-    app = FastAPI(title="DeepSeek Mobile Bridge", version="0.3.0", lifespan=lifespan)
+    app = FastAPI(title="DeepSeek Mobile Bridge", version=VERSION, lifespan=lifespan)
     app.state.config_store = config_store
     app.state.session_manager = session_manager
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.middleware("http")
+    async def no_cache_static(request, call_next):
+        response = await call_next(request)
+        if request.url.path in ("/", "/index.html", "/app.js", "/styles.css", "/sw.js"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
 
     def _is_valid_token(candidate: str | None) -> bool:
         expected = config_store.config.auth_token
@@ -371,10 +388,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             sess = session_manager.get_session(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        ok = sess.resolve_approval(request_id, allow=body.allow, reason=body.reason)
+        ok = sess.resolve_approval(
+            request_id,
+            allow=body.allow,
+            reason=body.reason,
+            set_approval_mode=body.set_approval_mode,
+        )
         if not ok:
             raise HTTPException(status_code=404, detail="Pending approval not found or already resolved")
-        return {"ok": True}
+        return {"ok": True, "session": sess.summary()}
 
     @app.post("/api/sessions/{session_id}/interactions/{request_id}", dependencies=[Depends(require_auth)])
     def api_resolve_interaction(
@@ -393,7 +415,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         )
         if not ok:
             raise HTTPException(status_code=404, detail="Pending interaction not found or already resolved")
-        return {"ok": True}
+        return {"ok": True, "session": sess.summary()}
 
     @app.websocket("/ws/sessions/{session_id}")
     async def ws_session(
