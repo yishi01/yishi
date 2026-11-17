@@ -131,8 +131,14 @@ struct SessionSummaryItem: Identifiable, Hashable {
 @MainActor
 final class BridgeClient: ObservableObject {
     static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
+    static let defaultPresetURLs: [(label: String, url: String)] = [
+        ("Wi-Fi 局域网直连", "http://192.168.31.190:8765"),
+        ("Tailscale 域名", "http://dsh-pc"),
+        ("Tailscale 直连 IP", "http://100.88.121.40:8765"),
+        ("Tailscale HTTPS", "https://dsh-pc.tail1e24af.ts.net"),
+    ]
 
-    @AppStorage("ds_server_url") var serverURL: String = "http://dsh-pc"
+    @AppStorage("ds_server_url") var serverURL: String = "http://192.168.31.190:8765"
     @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
@@ -141,6 +147,7 @@ final class BridgeClient: ObservableObject {
     @Published var isConnecting: Bool = false
     @Published var isConnected: Bool = false
     @Published var authError: String?
+    @Published var probeDiagnostics: [String] = []
 
     @Published var workspaces: [String] = []
     @Published var aiAccessMode: String = "workspace_only" // "workspace_only" | "workspace_read_all" | "full_access"
@@ -177,10 +184,24 @@ final class BridgeClient: ObservableObject {
     private var lastSeq: Int = 0
     private var webSocketTask: URLSessionWebSocketTask?
     private var wsSynced: Bool = false
+    private var connectAttemptId: UUID = UUID()
+
+    private lazy var probeSession: URLSession = {
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForRequest = 3.5
+        cfg.timeoutIntervalForResource = 4.5
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: cfg)
+    }()
 
     var normalizedBaseURL: String {
-        var s = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty { s = "http://dsh-pc" }
+        Self.normalizeURL(serverURL)
+    }
+
+    static func normalizeURL(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { s = "http://192.168.31.190:8765" }
         if !s.lowercased().hasPrefix("http://") && !s.lowercased().hasPrefix("https://") {
             s = "http://" + s
         }
@@ -196,51 +217,113 @@ final class BridgeClient: ObservableObject {
     }
 
     func verifyAndLogin(url: String, token: String) async {
-        guard !isConnecting else { return }
+        let attemptId = UUID()
+        connectAttemptId = attemptId
         isConnecting = true
-        defer { isConnecting = false }
+        authError = nil
+        probeDiagnostics = []
 
-        var rawURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        if rawURL.isEmpty { rawURL = "http://dsh-pc" }
-        if !rawURL.lowercased().hasPrefix("http://") && !rawURL.lowercased().hasPrefix("https://") {
-            rawURL = "http://" + rawURL
-        }
-        while rawURL.hasSuffix("/") { rawURL.removeLast() }
-
+        let rawURL = Self.normalizeURL(url)
         let rawTok = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.authToken = rawTok.isEmpty ? Self.defaultToken : rawTok
-        self.authError = nil
+        let effectiveToken = rawTok.isEmpty ? Self.defaultToken : rawTok
+        self.authToken = effectiveToken
 
         var candidates: [String] = [rawURL]
-        for fallback in ["http://dsh-pc", "https://dsh-pc.tail1e24af.ts.net", "http://100.88.121.40:8765"] {
-            if !candidates.contains(fallback) {
-                candidates.append(fallback)
+        for item in Self.defaultPresetURLs {
+            if !candidates.contains(item.url) {
+                candidates.append(item.url)
             }
         }
 
-        var lastErr: Error?
-        for candidate in candidates {
-            self.serverURL = candidate
-            do {
-                let body = try JSONSerialization.data(withJSONObject: ["token": self.authToken])
-                let data = try await request("/api/auth/verify", method: "POST", body: body, useAuth: false, timeout: 8)
-                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                   let settings = json["settings"] as? [String: Any] {
-                    applySettings(settings)
+        guard let body = try? JSONSerialization.data(withJSONObject: ["token": effectiveToken]) else {
+            if connectAttemptId == attemptId {
+                isConnecting = false
+                authError = "请求参数构造失败"
+            }
+            return
+        }
+
+        let session = probeSession
+
+        enum ProbeOutcome: Sendable {
+            case success(url: String, data: Data)
+            case failure(url: String, reason: String)
+        }
+
+        var winningURL: String?
+        var winningData: Data?
+        var failures: [(String, String)] = []
+
+        await withTaskGroup(of: ProbeOutcome.self) { group in
+            for candidate in candidates {
+                group.addTask {
+                    guard let endpoint = URL(string: candidate + "/api/auth/verify") else {
+                        return .failure(url: candidate, reason: "无效地址")
+                    }
+                    var req = URLRequest(url: endpoint)
+                    req.httpMethod = "POST"
+                    req.timeoutInterval = 3.5
+                    req.httpBody = body
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    do {
+                        let (data, resp) = try await session.data(for: req)
+                        if let http = resp as? HTTPURLResponse {
+                            if http.statusCode == 200 {
+                                return .success(url: candidate, data: data)
+                            } else if http.statusCode == 401 {
+                                return .failure(url: candidate, reason: "Auth Token 错误 (401)")
+                            } else {
+                                return .failure(url: candidate, reason: "HTTP \(http.statusCode)")
+                            }
+                        }
+                        return .failure(url: candidate, reason: "响应无效")
+                    } catch {
+                        return .failure(url: candidate, reason: error.localizedDescription)
+                    }
                 }
-                isAuthenticated = true
-                Haptics.success()
-                await loadSessions()
-                await loadPCDrives()
-                await loadPCDirectory(activeWorkspace)
-                await refreshGitDiff()
-                return
-            } catch {
-                lastErr = error
+            }
+
+            for await outcome in group {
+                switch outcome {
+                case .success(let okURL, let okData):
+                    winningURL = okURL
+                    winningData = okData
+                    group.cancelAll()
+                case .failure(let badURL, let reason):
+                    failures.append((badURL, reason))
+                }
+                if winningURL != nil {
+                    break
+                }
             }
         }
-        authError = "连接失败: \(lastErr?.localizedDescription ?? "请确认手机已开启 Tailscale")"
-        isAuthenticated = false
+
+        // If user clicked Connect again while this attempt was running, abandon stale UI updates
+        guard connectAttemptId == attemptId else { return }
+
+        if let okURL = winningURL, let data = winningData {
+            self.serverURL = okURL
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let settings = json["settings"] as? [String: Any] {
+                applySettings(settings)
+            }
+            isAuthenticated = true
+            isConnecting = false
+            Haptics.success()
+            await loadSessions()
+            await loadPCDrives()
+            await loadPCDirectory(activeWorkspace)
+            await refreshGitDiff()
+        } else {
+            isConnecting = false
+            isAuthenticated = false
+            probeDiagnostics = failures.map { "\($0.0) → \($0.1)" }
+            if failures.contains(where: { $0.1.contains("401") }) {
+                authError = "Auth Token 不匹配，请核对电脑端控制台打印的 Token。"
+            } else {
+                authError = "所有链路均未连上电脑：若在同一 Wi-Fi 请允许「本地网络」权限；若使用远程连接请开启 iPhone 端 Tailscale。"
+            }
+        }
     }
 
     func logout() {

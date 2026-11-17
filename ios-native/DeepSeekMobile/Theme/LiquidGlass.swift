@@ -2,12 +2,9 @@ import SwiftUI
 import UIKit
 
 // MARK: - iOS Liquid Glass Design System
-// Implements Apple's Liquid Glass optical material guidelines:
-// 1. Multi-layer translucent refraction (.ultraThinMaterial + translucent lens tint)
-// 2. Top-edge curved caustic inner highlight + dual-angle refractive specular rim
-// 3. Ambient pastel light backdrop so glass layers genuinely refract underlying light & scroll content
-// 4. All decorative glass & backdrop layers explicitly disable hit-testing (.allowsHitTesting(false))
-//    so interactive controls inside glass containers always respond immediately.
+// - Adopts Apple's native iOS 26+ `.glassEffect(.regular.tint(...), in:)` optical refraction when available.
+// - Falls back cleanly on iOS 16-25 to a 4-layer optical glass simulation (.ultraThinMaterial + caustic highlight + dual specular rim).
+// - All decorative backdrop and highlight layers disable hit-testing so buttons and inputs inside glass cards never block taps.
 
 enum Haptics {
     static func light() {
@@ -33,12 +30,11 @@ struct LiquidGlassBackdropView: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                // Base luminous porcelain white canvas
                 LinearGradient(
                     colors: [
-                        Color(red: 0.965, green: 0.976, blue: 0.996),
-                        Color(red: 0.988, green: 0.990, blue: 0.998),
-                        Color(red: 0.955, green: 0.968, blue: 0.992),
+                        Color(red: 0.962, green: 0.975, blue: 0.996),
+                        Color(red: 0.988, green: 0.991, blue: 0.999),
+                        Color(red: 0.950, green: 0.966, blue: 0.994),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
@@ -49,8 +45,40 @@ struct LiquidGlassBackdropView: View {
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.42),
-                                Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.0),
+                                Color(red: 0.62, green: 0.78, blue: 1.0).opacity(0.46),
+                                Color(red: 0.62, green: 0.78, blue: 1.0).opacity(0.0),
+                            ],
+                            center: .center,
+                            startRadius: 10,
+                            endRadius: 210
+                        )
+                    )
+                    .frame(width: 380, height: 380)
+                    .position(x: geo.size.width * 0.14, y: geo.size.height * 0.12)
+
+                // Center-right soft periwinkle/lavender refraction bloom
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 0.78, green: 0.74, blue: 1.0).opacity(0.36),
+                                Color(red: 0.78, green: 0.74, blue: 1.0).opacity(0.0),
+                            ],
+                            center: .center,
+                            startRadius: 10,
+                            endRadius: 195
+                        )
+                    )
+                    .frame(width: 350, height: 350)
+                    .position(x: geo.size.width * 0.88, y: geo.size.height * 0.45)
+
+                // Bottom-left cool aqua refraction bloom
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 0.66, green: 0.87, blue: 0.99).opacity(0.42),
+                                Color(red: 0.66, green: 0.87, blue: 0.99).opacity(0.0),
                             ],
                             center: .center,
                             startRadius: 10,
@@ -58,39 +86,7 @@ struct LiquidGlassBackdropView: View {
                         )
                     )
                     .frame(width: 360, height: 360)
-                    .position(x: geo.size.width * 0.15, y: geo.size.height * 0.12)
-
-                // Center-right soft periwinkle/lavender refraction bloom
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.34),
-                                Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.0),
-                            ],
-                            center: .center,
-                            startRadius: 10,
-                            endRadius: 190
-                        )
-                    )
-                    .frame(width: 340, height: 340)
-                    .position(x: geo.size.width * 0.88, y: geo.size.height * 0.46)
-
-                // Bottom-left cool aqua refraction bloom (illuminates floating composer & tab bar)
-                Circle()
-                    .fill(
-                        RadialGradient(
-                            colors: [
-                                Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.38),
-                                Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.0),
-                            ],
-                            center: .center,
-                            startRadius: 10,
-                            endRadius: 190
-                        )
-                    )
-                    .frame(width: 350, height: 350)
-                    .position(x: geo.size.width * 0.25, y: geo.size.height * 0.88)
+                    .position(x: geo.size.width * 0.24, y: geo.size.height * 0.88)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
@@ -104,18 +100,39 @@ struct LiquidGlassBackdropView: View {
 
 struct LiquidGlassCapsuleModifier: ViewModifier {
     var cornerRadius: CGFloat = 24
-    var tintOpacity: Double = 0.58
+    var tintOpacity: Double = 0.54
     var prominent: Bool = false
 
+    @ViewBuilder
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        #if compiler(>=6.2)
+        if #available(iOS 26.0, *) {
+            content
+                .glassEffect(
+                    .regular.tint(Color.white.opacity(prominent ? 0.32 : 0.44)),
+                    in: shape
+                )
+                .shadow(
+                    color: Color(red: 0.15, green: 0.28, blue: 0.58).opacity(prominent ? 0.10 : 0.06),
+                    radius: prominent ? 18 : 12,
+                    x: 0,
+                    y: prominent ? 7 : 4
+                )
+        } else {
+            fallbackGlassBody(content: content, shape: shape)
+        }
+        #else
+        fallbackGlassBody(content: content, shape: shape)
+        #endif
+    }
+
+    private func fallbackGlassBody(content: Content, shape: RoundedRectangle) -> some View {
         content
             .background(
                 ZStack {
-                    // Layer 1: System real-time backdrop blur material
                     shape.fill(prominent ? .thinMaterial : .ultraThinMaterial)
 
-                    // Layer 2: Translucent optical glass body gradient (not opaque white)
                     shape.fill(
                         LinearGradient(
                             colors: [
@@ -128,7 +145,6 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                         )
                     )
 
-                    // Layer 3: Top-edge curved lens caustic highlight
                     shape.fill(
                         LinearGradient(
                             stops: [
@@ -144,7 +160,6 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                 .allowsHitTesting(false)
             )
             .overlay(
-                // Layer 4: Dual-angle specular refractive rim border
                 shape.strokeBorder(
                     LinearGradient(
                         stops: [
@@ -190,17 +205,14 @@ struct LiquidGlassPressButtonStyle: ButtonStyle {
 }
 
 extension View {
-    /// Primary floating Liquid Glass bar / capsule (navigation bar, composer, tab bar, modals)
     func liquidGlass(cornerRadius: CGFloat = 24, prominent: Bool = true) -> some View {
         modifier(LiquidGlassCapsuleModifier(cornerRadius: cornerRadius, tintOpacity: 0.52, prominent: prominent))
     }
 
-    /// Translucent Liquid Glass card / pill (replaces old opaque white card with real glass refraction)
     func cleanWhiteCard(cornerRadius: CGFloat = 18) -> some View {
         modifier(LiquidGlassCapsuleModifier(cornerRadius: cornerRadius, tintOpacity: 0.60, prominent: false))
     }
 
-    /// Applies moderate spring scale & highlight feedback when tapped
     func glassPressable(scale: CGFloat = 0.96) -> some View {
         buttonStyle(LiquidGlassPressButtonStyle(scaleAmount: scale))
     }

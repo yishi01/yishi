@@ -18,7 +18,7 @@ struct RootView: View {
     @EnvironmentObject var client: BridgeClient
     @State private var activeTab: MainTab = .chat
     @State private var showSessionDrawer: Bool = false
-    @State private var urlInput: String = "http://dsh-pc"
+    @State private var urlInput: String = "http://192.168.31.190:8765"
     @State private var tokenInput: String = BridgeClient.defaultToken
     @Namespace private var tabGlassNamespace
 
@@ -34,110 +34,155 @@ struct RootView: View {
             }
         }
         .onAppear {
-            urlInput = client.serverURL.isEmpty ? "http://dsh-pc" : client.serverURL
+            urlInput = client.serverURL.isEmpty ? "http://192.168.31.190:8765" : client.serverURL
             tokenInput = client.authToken.isEmpty ? BridgeClient.defaultToken : client.authToken
+        }
+        .onChange(of: client.serverURL) { newVal in
+            if !newVal.isEmpty {
+                urlInput = newVal
+            }
         }
     }
 
     private var authGateView: some View {
-        VStack(spacing: 20) {
-            Spacer()
+        ScrollView {
+            VStack(spacing: 18) {
+                Spacer(minLength: 42)
 
-            // Official DSH Logo with Liquid Glass Frame
-            Image("DSHLogo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 82, height: 82)
-                .shadow(color: Color(red: 0.15, green: 0.28, blue: 0.58).opacity(0.16), radius: 18, x: 0, y: 8)
+                // Official DSH Logo
+                Image("DSHLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 78, height: 78)
+                    .shadow(color: Color(red: 0.15, green: 0.28, blue: 0.58).opacity(0.16), radius: 18, x: 0, y: 8)
 
-            VStack(spacing: 6) {
-                Text("DeepSeek Go")
-                    .font(.system(size: 26, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color.dsPrimary)
+                VStack(spacing: 5) {
+                    Text("DeepSeek Go")
+                        .font(.system(size: 26, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.dsPrimary)
 
-                Text("连接电脑端 DSH 本地工作区与 DeepSeek Agent")
-                    .font(.system(size: 13.5))
-                    .foregroundStyle(.secondary)
-            }
-
-            VStack(spacing: 13) {
-                HStack(spacing: 10) {
-                    Image(systemName: "network")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(Color.dsAccent)
-                        .frame(width: 22)
-                    TextField("服务器地址 (如 http://dsh-pc)", text: $urlInput)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.system(size: 15))
+                    Text("连接电脑端 DSH 全盘工作区与 DeepSeek Agent")
+                        .font(.system(size: 13.5))
+                        .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 13)
-                .cleanWhiteCard(cornerRadius: 16)
 
-                HStack(spacing: 10) {
-                    Image(systemName: "key.fill")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Color.dsAccent)
-                        .frame(width: 22)
-                    TextField("粘贴电脑端 Auth Token", text: $tokenInput)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .font(.system(size: 14, design: .monospaced))
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 13)
-                .cleanWhiteCard(cornerRadius: 16)
-
-                Button {
-                    Haptics.medium()
-                    Task {
-                        await client.verifyAndLogin(url: urlInput, token: tokenInput)
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "network")
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(Color.dsAccent)
+                            .frame(width: 22)
+                        TextField("服务器地址 (如 http://192.168.31.190:8765)", text: $urlInput)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                            .submitLabel(.next)
+                            .font(.system(size: 14.5))
                     }
-                } label: {
-                    HStack(spacing: 8) {
-                        if client.isConnecting {
-                            ProgressView()
-                                .tint(.white)
-                            Text("正在连接工作区...")
-                                .font(.system(size: 16, weight: .semibold))
-                        } else {
-                            Text("连接工作区")
-                                .font(.system(size: 16, weight: .semibold))
-                            Image(systemName: "arrow.right")
-                                .font(.system(size: 14, weight: .bold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .cleanWhiteCard(cornerRadius: 16)
+
+                    // One-Tap Route Presets (LAN Wi-Fi + Tailscale)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 7) {
+                            ForEach(BridgeClient.defaultPresetURLs, id: \.url) { preset in
+                                let isPicked = (urlInput == preset.url)
+                                Button {
+                                    Haptics.light()
+                                    urlInput = preset.url
+                                } label: {
+                                    Text(preset.label)
+                                        .font(.system(size: 11.5, weight: isPicked ? .semibold : .medium))
+                                        .foregroundStyle(isPicked ? Color.dsAccent : Color.dsPrimary)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5.5)
+                                        .cleanWhiteCard(cornerRadius: 999)
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
-                    .foregroundStyle(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(
-                        Capsule()
-                            .fill(Color.dsPrimary)
-                            .shadow(color: Color.dsPrimary.opacity(0.22), radius: 12, x: 0, y: 6)
-                    )
-                    .contentShape(Capsule())
+
+                    HStack(spacing: 10) {
+                        Image(systemName: "key.fill")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.dsAccent)
+                            .frame(width: 22)
+                        TextField("粘贴电脑端 Auth Token", text: $tokenInput)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .submitLabel(.go)
+                            .onSubmit {
+                                Task { await client.verifyAndLogin(url: urlInput, token: tokenInput) }
+                            }
+                            .font(.system(size: 13.5, design: .monospaced))
+                    }
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 12)
+                    .cleanWhiteCard(cornerRadius: 16)
+
+                    Button {
+                        Haptics.medium()
+                        Task {
+                            await client.verifyAndLogin(url: urlInput, token: tokenInput)
+                        }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if client.isConnecting {
+                                ProgressView()
+                                    .tint(.white)
+                                Text("正在并发探测所有线路...")
+                                    .font(.system(size: 15.5, weight: .semibold))
+                            } else {
+                                Text("连接工作区 (自动极速选路)")
+                                    .font(.system(size: 15.5, weight: .semibold))
+                                Image(systemName: "arrow.right")
+                                    .font(.system(size: 14, weight: .bold))
+                            }
+                        }
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(
+                            Capsule()
+                                .fill(Color.dsPrimary)
+                                .shadow(color: Color.dsPrimary.opacity(0.22), radius: 12, x: 0, y: 6)
+                        )
+                        .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 4)
                 }
-                .buttonStyle(.plain)
-                .disabled(client.isConnecting)
-                .padding(.top, 4)
-            }
-            .padding(20)
-            .liquidGlass(cornerRadius: 28, prominent: true)
-            .padding(.horizontal, 22)
+                .padding(18)
+                .liquidGlass(cornerRadius: 28, prominent: true)
+                .padding(.horizontal, 18)
 
-            if let err = client.authError {
-                Text(err)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.red)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .cleanWhiteCard(cornerRadius: 12)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
-            }
+                if let err = client.authError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(err)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(.red)
 
-            Spacer()
+                        if !client.probeDiagnostics.isEmpty {
+                            Divider().opacity(0.4)
+                            ForEach(client.probeDiagnostics, id: \.self) { line in
+                                Text(line)
+                                    .font(.system(size: 10.5, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(14)
+                    .cleanWhiteCard(cornerRadius: 16)
+                    .padding(.horizontal, 18)
+                }
+
+                Spacer(minLength: 24)
+            }
         }
+        .scrollDismissesKeyboard(.interactively)
     }
 
     private var mainAuthenticatedView: some View {

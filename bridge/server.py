@@ -14,10 +14,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-# Ensure project root is importable when launched from sidecar cwd
+# Ensure project root and local .venv site-packages are importable even when launched via system Python (which has Windows Firewall allow rule)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+_venv_site = PROJECT_ROOT / ".venv" / "Lib" / "site-packages"
+if _venv_site.exists() and str(_venv_site) not in sys.path:
+    sys.path.insert(0, str(_venv_site))
 
 import uvicorn
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect

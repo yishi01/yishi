@@ -27,11 +27,12 @@ targets:
       properties:
         CFBundleDisplayName: DeepSeek Go
         CFBundleIconName: AppIcon
-        CFBundleShortVersionString: "0.7.0"
-        CFBundleVersion: "8"
+        CFBundleShortVersionString: "0.7.1"
+        CFBundleVersion: "9"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: "用于通过同一 Wi-Fi 局域网直连电脑端 DeepSeek 工作区与全盘文件服务"
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:
@@ -61,8 +62,8 @@ targets:
       path: DeepSeekIslandExtension/Info.plist
       properties:
         CFBundleDisplayName: DeepSeek Island
-        CFBundleShortVersionString: "0.7.0"
-        CFBundleVersion: "8"
+        CFBundleShortVersionString: "0.7.1"
+        CFBundleVersion: "9"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
