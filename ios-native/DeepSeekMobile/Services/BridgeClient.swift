@@ -130,12 +130,15 @@ struct SessionSummaryItem: Identifiable, Hashable {
 
 @MainActor
 final class BridgeClient: ObservableObject {
+    static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
+
     @AppStorage("ds_server_url") var serverURL: String = "http://dsh-pc"
-    @AppStorage("ds_auth_token") var authToken: String = ""
+    @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
 
     @Published var isAuthenticated: Bool = false
+    @Published var isConnecting: Bool = false
     @Published var isConnected: Bool = false
     @Published var authError: String?
 
@@ -178,54 +181,71 @@ final class BridgeClient: ObservableObject {
     var normalizedBaseURL: String {
         var s = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { s = "http://dsh-pc" }
+        if !s.lowercased().hasPrefix("http://") && !s.lowercased().hasPrefix("https://") {
+            s = "http://" + s
+        }
         while s.hasSuffix("/") { s.removeLast() }
         return s
     }
 
     func bootstrap() async {
-        guard !authToken.isEmpty else {
-            isAuthenticated = false
-            return
+        if authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            authToken = Self.defaultToken
         }
-        do {
-            try await fetchSettings()
-            isAuthenticated = true
-            await loadSessions()
-            await loadPCDrives()
-            await loadPCDirectory(activeWorkspace)
-            await refreshGitDiff()
-        } catch {
-            isAuthenticated = false
-        }
+        await verifyAndLogin(url: serverURL, token: authToken)
     }
 
     func verifyAndLogin(url: String, token: String) async {
-        self.serverURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.authToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        self.authError = nil
-        do {
-            let body = try JSONSerialization.data(withJSONObject: ["token": self.authToken])
-            let data = try await request("/api/auth/verify", method: "POST", body: body, useAuth: false)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let settings = json["settings"] as? [String: Any] {
-                applySettings(settings)
-            }
-            isAuthenticated = true
-            Haptics.success()
-            await loadSessions()
-            await loadPCDrives()
-            await loadPCDirectory(activeWorkspace)
-            await refreshGitDiff()
-        } catch {
-            authError = error.localizedDescription
-            isAuthenticated = false
+        guard !isConnecting else { return }
+        isConnecting = true
+        defer { isConnecting = false }
+
+        var rawURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if rawURL.isEmpty { rawURL = "http://dsh-pc" }
+        if !rawURL.lowercased().hasPrefix("http://") && !rawURL.lowercased().hasPrefix("https://") {
+            rawURL = "http://" + rawURL
         }
+        while rawURL.hasSuffix("/") { rawURL.removeLast() }
+
+        let rawTok = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.authToken = rawTok.isEmpty ? Self.defaultToken : rawTok
+        self.authError = nil
+
+        var candidates: [String] = [rawURL]
+        for fallback in ["http://dsh-pc", "https://dsh-pc.tail1e24af.ts.net", "http://100.88.121.40:8765"] {
+            if !candidates.contains(fallback) {
+                candidates.append(fallback)
+            }
+        }
+
+        var lastErr: Error?
+        for candidate in candidates {
+            self.serverURL = candidate
+            do {
+                let body = try JSONSerialization.data(withJSONObject: ["token": self.authToken])
+                let data = try await request("/api/auth/verify", method: "POST", body: body, useAuth: false, timeout: 8)
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let settings = json["settings"] as? [String: Any] {
+                    applySettings(settings)
+                }
+                isAuthenticated = true
+                Haptics.success()
+                await loadSessions()
+                await loadPCDrives()
+                await loadPCDirectory(activeWorkspace)
+                await refreshGitDiff()
+                return
+            } catch {
+                lastErr = error
+            }
+        }
+        authError = "连接失败: \(lastErr?.localizedDescription ?? "请确认手机已开启 Tailscale")"
+        isAuthenticated = false
     }
 
     func logout() {
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
-        authToken = ""
         isAuthenticated = false
         isConnected = false
     }
@@ -236,14 +256,15 @@ final class BridgeClient: ObservableObject {
         _ path: String,
         method: String = "GET",
         body: Data? = nil,
-        useAuth: Bool = true
+        useAuth: Bool = true,
+        timeout: TimeInterval = 25
     ) async throws -> Data {
         guard let url = URL(string: normalizedBaseURL + path) else {
             throw URLError(.badURL)
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
-        req.timeoutInterval = 35
+        req.timeoutInterval = timeout
         if useAuth && !authToken.isEmpty {
             req.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         }

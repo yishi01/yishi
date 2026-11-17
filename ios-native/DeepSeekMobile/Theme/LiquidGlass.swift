@@ -6,8 +6,8 @@ import UIKit
 // 1. Multi-layer translucent refraction (.ultraThinMaterial + translucent lens tint)
 // 2. Top-edge curved caustic inner highlight + dual-angle refractive specular rim
 // 3. Ambient pastel light backdrop so glass layers genuinely refract underlying light & scroll content
-// 4. Native iOS 26 .glassEffect(_:in:) adoption when compiled with Xcode 26+ SDK
-// 5. Balanced, moderate spring physics (interactive press scale + matchedGeometryEffect morphing)
+// 4. All decorative glass & backdrop layers explicitly disable hit-testing (.allowsHitTesting(false))
+//    so interactive controls inside glass containers always respond immediately.
 
 enum Haptics {
     static func light() {
@@ -30,75 +30,73 @@ enum Haptics {
 // MARK: - Ambient Light Backdrop (White-Dominant with Soft Refractive Light Orbs)
 
 struct LiquidGlassBackdropView: View {
-    @State private var animatePhase: Bool = false
-
     var body: some View {
-        ZStack {
-            // Base luminous porcelain white canvas
-            LinearGradient(
-                colors: [
-                    Color(red: 0.965, green: 0.976, blue: 0.996),
-                    Color(red: 0.988, green: 0.990, blue: 0.998),
-                    Color(red: 0.955, green: 0.968, blue: 0.992),
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-
-            // Top-left icy sapphire refraction bloom
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.42),
-                            Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.0),
-                        ],
-                        center: .center,
-                        startRadius: 10,
-                        endRadius: 220
-                    )
+        GeometryReader { geo in
+            ZStack {
+                // Base luminous porcelain white canvas
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.965, green: 0.976, blue: 0.996),
+                        Color(red: 0.988, green: 0.990, blue: 0.998),
+                        Color(red: 0.955, green: 0.968, blue: 0.992),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
                 )
-                .frame(width: 420, height: 420)
-                .offset(x: animatePhase ? -95 : -125, y: animatePhase ? -230 : -260)
 
-            // Center-right soft periwinkle/lavender refraction bloom
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.34),
-                            Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.0),
-                        ],
-                        center: .center,
-                        startRadius: 10,
-                        endRadius: 200
+                // Top-left icy sapphire refraction bloom
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.42),
+                                Color(red: 0.68, green: 0.80, blue: 1.0).opacity(0.0),
+                            ],
+                            center: .center,
+                            startRadius: 10,
+                            endRadius: 200
+                        )
                     )
-                )
-                .frame(width: 380, height: 380)
-                .offset(x: animatePhase ? 130 : 105, y: animatePhase ? -20 : 25)
+                    .frame(width: 360, height: 360)
+                    .position(x: geo.size.width * 0.15, y: geo.size.height * 0.12)
 
-            // Bottom-left cool aqua refraction bloom (illuminates floating composer & tab bar)
-            Circle()
-                .fill(
-                    RadialGradient(
-                        colors: [
-                            Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.38),
-                            Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.0),
-                        ],
-                        center: .center,
-                        startRadius: 10,
-                        endRadius: 210
+                // Center-right soft periwinkle/lavender refraction bloom
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.34),
+                                Color(red: 0.80, green: 0.76, blue: 1.0).opacity(0.0),
+                            ],
+                            center: .center,
+                            startRadius: 10,
+                            endRadius: 190
+                        )
                     )
-                )
-                .frame(width: 400, height: 400)
-                .offset(x: animatePhase ? -60 : -90, y: animatePhase ? 290 : 260)
+                    .frame(width: 340, height: 340)
+                    .position(x: geo.size.width * 0.88, y: geo.size.height * 0.46)
+
+                // Bottom-left cool aqua refraction bloom (illuminates floating composer & tab bar)
+                Circle()
+                    .fill(
+                        RadialGradient(
+                            colors: [
+                                Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.38),
+                                Color(red: 0.70, green: 0.88, blue: 0.99).opacity(0.0),
+                            ],
+                            center: .center,
+                            startRadius: 10,
+                            endRadius: 190
+                        )
+                    )
+                    .frame(width: 350, height: 350)
+                    .position(x: geo.size.width * 0.25, y: geo.size.height * 0.88)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
         }
         .ignoresSafeArea()
-        .onAppear {
-            withAnimation(.easeInOut(duration: 9.0).repeatForever(autoreverses: true)) {
-                animatePhase = true
-            }
-        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -112,7 +110,7 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         content
-            .background {
+            .background(
                 ZStack {
                     // Layer 1: System real-time backdrop blur material
                     shape.fill(prominent ? .thinMaterial : .ultraThinMaterial)
@@ -143,8 +141,9 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                         )
                     )
                 }
-            }
-            .overlay {
+                .allowsHitTesting(false)
+            )
+            .overlay(
                 // Layer 4: Dual-angle specular refractive rim border
                 shape.strokeBorder(
                     LinearGradient(
@@ -159,7 +158,8 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                     ),
                     lineWidth: prominent ? 1.35 : 1.15
                 )
-            }
+                .allowsHitTesting(false)
+            )
             .shadow(
                 color: Color(red: 0.15, green: 0.28, blue: 0.58).opacity(prominent ? 0.11 : 0.075),
                 radius: prominent ? 20 : 14,
@@ -182,6 +182,7 @@ struct LiquidGlassPressButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed ? scaleAmount : 1.0)
             .brightness(configuration.isPressed ? 0.03 : 0.0)
             .animation(.spring(response: 0.26, dampingFraction: 0.76), value: configuration.isPressed)

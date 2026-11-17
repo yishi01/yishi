@@ -19,7 +19,7 @@ struct RootView: View {
     @State private var activeTab: MainTab = .chat
     @State private var showSessionDrawer: Bool = false
     @State private var urlInput: String = "http://dsh-pc"
-    @State private var tokenInput: String = ""
+    @State private var tokenInput: String = BridgeClient.defaultToken
     @Namespace private var tabGlassNamespace
 
     var body: some View {
@@ -29,16 +29,13 @@ struct RootView: View {
 
             if !client.isAuthenticated {
                 authGateView
-                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
             } else {
                 mainAuthenticatedView
-                    .transition(.opacity)
             }
         }
-        .animation(.spring(response: 0.38, dampingFraction: 0.82), value: client.isAuthenticated)
         .onAppear {
-            urlInput = client.serverURL
-            tokenInput = client.authToken
+            urlInput = client.serverURL.isEmpty ? "http://dsh-pc" : client.serverURL
+            tokenInput = client.authToken.isEmpty ? BridgeClient.defaultToken : client.authToken
         }
     }
 
@@ -83,10 +80,10 @@ struct RootView: View {
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(Color.dsAccent)
                         .frame(width: 22)
-                    SecureField("粘贴电脑端 Auth Token", text: $tokenInput)
+                    TextField("粘贴电脑端 Auth Token", text: $tokenInput)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .font(.system(size: 15))
+                        .font(.system(size: 14, design: .monospaced))
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 13)
@@ -99,34 +96,30 @@ struct RootView: View {
                     }
                 } label: {
                     HStack(spacing: 8) {
-                        Text("连接工作区")
-                            .font(.system(size: 16, weight: .semibold))
-                        Image(systemName: "arrow.right")
-                            .font(.system(size: 14, weight: .bold))
+                        if client.isConnecting {
+                            ProgressView()
+                                .tint(.white)
+                            Text("正在连接工作区...")
+                                .font(.system(size: 16, weight: .semibold))
+                        } else {
+                            Text("连接工作区")
+                                .font(.system(size: 16, weight: .semibold))
+                            Image(systemName: "arrow.right")
+                                .font(.system(size: 14, weight: .bold))
+                        }
                     }
                     .foregroundStyle(.white)
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
                     .background(
                         Capsule()
-                            .fill(
-                                LinearGradient(
-                                    colors: [
-                                        Color(red: 0.12, green: 0.16, blue: 0.24),
-                                        Color.dsPrimary,
-                                    ],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
-                            )
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(Color.white.opacity(0.25), lineWidth: 1)
-                            )
+                            .fill(Color.dsPrimary)
                             .shadow(color: Color.dsPrimary.opacity(0.22), radius: 12, x: 0, y: 6)
                     )
+                    .contentShape(Capsule())
                 }
-                .glassPressable(scale: 0.97)
+                .buttonStyle(.plain)
+                .disabled(client.isConnecting)
                 .padding(.top, 4)
             }
             .padding(20)
