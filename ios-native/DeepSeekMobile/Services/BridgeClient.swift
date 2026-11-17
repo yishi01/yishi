@@ -5,10 +5,9 @@ import SwiftUI
 @MainActor
 final class BridgeClient: ObservableObject {
     static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
-    static let initialCloudflareURL = "https://patterns-traveller-replied-parallel.trycloudflare.com"
+    static let initialCloudflareURL = "https://shuttle-hepatitis-attending-documentary.trycloudflare.com"
     static let defaultPresetURLs: [(label: String, url: String)] = [
         ("Wi-Fi 局域网直连", "http://192.168.31.190:8765"),
-        ("Tailscale 域名", "http://dsh-pc"),
         ("Tailscale 直连 IP", "http://100.88.121.40:8765"),
         ("Tailscale HTTPS", "https://dsh-pc.tail1e24af.ts.net"),
     ]
@@ -18,6 +17,8 @@ final class BridgeClient: ObservableObject {
     @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
+    @AppStorage("ds_has_paired_once") var hasPairedOnce: Bool = false
+    @AppStorage("ds_last_bundled_build") var lastBundledBuild: String = ""
 
     @Published var isAuthenticated: Bool = false
     @Published var isConnecting: Bool = false
@@ -102,21 +103,32 @@ final class BridgeClient: ObservableObject {
 
     var effectivePresetURLs: [(label: String, url: String)] {
         var list: [(label: String, url: String)] = []
-        let pub = savedPublicURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !pub.isEmpty {
-            list.append(("Cloudflare 外网公网", pub))
-        } else if !Self.initialCloudflareURL.isEmpty {
-            list.append(("Cloudflare 外网公网", Self.initialCloudflareURL))
+        var seen = Set<String>()
+
+        func appendUnique(_ label: String, _ raw: String) {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let norm = Self.normalizeURL(trimmed)
+            if !seen.contains(norm) {
+                seen.insert(norm)
+                list.append((label, norm))
+            }
         }
-        list.append(contentsOf: Self.defaultPresetURLs)
+
+        // Always probe both bundled live Cloudflare URL and any cached public URL
+        appendUnique("Cloudflare 外网(内置最新)", Self.initialCloudflareURL)
+        appendUnique("Cloudflare 外网(缓存)", savedPublicURL)
+        for item in Self.defaultPresetURLs {
+            appendUnique(item.label, item.url)
+        }
         return list
     }
 
     private lazy var probeSession: URLSession = {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.waitsForConnectivity = false
-        cfg.timeoutIntervalForRequest = 3.5
-        cfg.timeoutIntervalForResource = 4.5
+        cfg.timeoutIntervalForRequest = 8.5
+        cfg.timeoutIntervalForResource = 9.5
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: cfg)
     }()
@@ -197,10 +209,25 @@ final class BridgeClient: ObservableObject {
         if authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             authToken = Self.defaultToken
         }
-        await verifyAndLogin(url: serverURL, token: authToken)
+        // Clear stale temporary trycloudflare.com URLs cached from older app builds
+        let curBuild = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
+        if !curBuild.isEmpty && lastBundledBuild != curBuild {
+            lastBundledBuild = curBuild
+            if savedPublicURL.contains("trycloudflare.com") {
+                savedPublicURL = Self.initialCloudflareURL
+            }
+            if serverURL.contains("trycloudflare.com") {
+                serverURL = Self.initialCloudflareURL
+            }
+            AppLogger.shared.info("Lifecycle", "检测到版本更新 Build \(curBuild)，已刷新预设外网隧道地址")
+        }
+        if hasPairedOnce && !authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            isAuthenticated = true
+        }
+        await verifyAndLogin(url: serverURL, token: authToken, silentIfPaired: hasPairedOnce)
     }
 
-    func verifyAndLogin(url: String, token: String) async {
+    func verifyAndLogin(url: String, token: String, silentIfPaired: Bool = false) async {
         let attemptId = UUID()
         connectAttemptId = attemptId
         isConnecting = true
@@ -247,7 +274,7 @@ final class BridgeClient: ObservableObject {
                     }
                     var req = URLRequest(url: endpoint)
                     req.httpMethod = "POST"
-                    req.timeoutInterval = 3.5
+                    req.timeoutInterval = 8.5
                     req.httpBody = body
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     let t0 = Date()
@@ -289,6 +316,7 @@ final class BridgeClient: ObservableObject {
         if let okURL = winningURL, let data = winningData {
             self.serverURL = okURL
             self.lastRouteLatencyMs = winningLatency
+            self.hasPairedOnce = true
             AppLogger.shared.info("Auth", "并发路由测速成功 -> \(okURL) (\(Int(winningLatency ?? 0))ms)")
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let settings = json["settings"] as? [String: Any] {
@@ -304,13 +332,16 @@ final class BridgeClient: ObservableObject {
             await refreshGitDiff()
         } else {
             isConnecting = false
-            isAuthenticated = false
             probeDiagnostics = failures.map { "\($0.0) → \($0.1)" }
             AppLogger.shared.error("Auth", "全部链路连接失败: \(probeDiagnostics.joined(separator: "; "))")
-            if failures.contains(where: { $0.1.contains("401") }) {
+            let isAuth401 = failures.contains(where: { $0.1.contains("401") })
+            if isAuth401 {
+                hasPairedOnce = false
+                isAuthenticated = false
                 authError = "Auth Token 不匹配，请核对电脑端控制台打印的 Token。"
             } else {
-                authError = "所有链路均未连上电脑：在同一 Wi-Fi 请允许「本地网络」权限；外网可使用 Cloudflare 公网地址或 Tailscale。"
+                isAuthenticated = silentIfPaired
+                authError = "所有链路均未连上电脑，请点击刷新重连，或检查电脑端 bridge 服务是否启动。"
             }
         }
     }
@@ -323,6 +354,7 @@ final class BridgeClient: ObservableObject {
         wsReconnectTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
+        hasPairedOnce = false
         isAuthenticated = false
         isConnected = false
         AppLogger.shared.warn("Auth", "已断开并退出登录")
@@ -355,7 +387,7 @@ final class BridgeClient: ObservableObject {
                     group.addTask {
                         guard let u = URL(string: cand + "/api/health") else { return nil }
                         var req = URLRequest(url: u)
-                        req.timeoutInterval = 3.0
+                        req.timeoutInterval = 8.0
                         let t0 = Date()
                         if let (_, resp) = try? await session.data(for: req),
                            let http = resp as? HTTPURLResponse,
@@ -390,11 +422,19 @@ final class BridgeClient: ObservableObject {
     }
 
     func recoverRouteAndSocket(reason: String) async {
-        _ = await attemptRouteFailover()
-        if isAuthenticated {
-            connectWebSocket(reset: false)
+        let best = await attemptRouteFailover()
+        if isAuthenticated && best != nil {
+            if sessions.isEmpty {
+                try? await fetchSettings()
+                await loadSessions()
+                await loadPCDrives()
+                await loadPCDirectory(activeWorkspace)
+                await loadPlugins()
+            } else {
+                connectWebSocket(reset: false)
+            }
         }
-        AppLogger.shared.info("Stability", "触发连接自愈 (\(reason))")
+        AppLogger.shared.info("Stability", "触发连接自愈 (\(reason)) -> \(best ?? "未就绪")")
     }
 
     private func isTransientHTTPError(_ error: Error) -> Bool {

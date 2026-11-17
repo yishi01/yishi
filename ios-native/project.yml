@@ -27,8 +27,8 @@ targets:
       properties:
         CFBundleDisplayName: DeepSeek Go
         CFBundleIconName: AppIcon
-        CFBundleShortVersionString: "0.8.0"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "0.8.1"
+        CFBundleVersion: "12"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
@@ -67,8 +67,8 @@ targets:
       path: DeepSeekIslandExtension/Info.plist
       properties:
         CFBundleDisplayName: DeepSeek Island
-        CFBundleShortVersionString: "0.8.0"
-        CFBundleVersion: "11"
+        CFBundleShortVersionString: "0.8.1"
+        CFBundleVersion: "12"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:

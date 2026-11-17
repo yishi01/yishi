@@ -277,6 +277,28 @@ struct RootView: View {
                 }
                 .allowsHitTesting(false)
                 .transition(.move(edge: .top).combined(with: .opacity))
+            } else if !client.isConnected {
+                VStack {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.mini)
+                        Text(client.isConnecting ? "正在并发探测最优连接线路..." : "连接中断，可切换网络或点此重连")
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(Color.dsPrimary)
+                        Button("重连") {
+                            Haptics.light()
+                            Task {
+                                await client.verifyAndLogin(url: client.serverURL, token: client.authToken, silentIfPaired: true)
+                            }
+                        }
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(Color.dsAccent)
+                    }
+                    .padding(.horizontal, 13)
+                    .padding(.vertical, 7)
+                    .liquidGlass(cornerRadius: 999, prominent: true)
+                    .padding(.top, 54)
+                    Spacer()
+                }
             }
         }
         .sheet(isPresented: $showSessionDrawer) {

@@ -495,12 +495,17 @@ async function selectSession(sessionId) {
   connectSessionSocket(true);
 }
 
+let _wsHeartbeatTimer = null;
+let _wsLastActivityAt = 0;
+let _wsBackoffAttempt = 0;
+
 function connectSessionSocket(reset = false) {
   if (state.ws) {
     state.ws.onclose = null;
     state.ws.close();
   }
   clearTimeout(state.reconnectTimer);
+  clearInterval(_wsHeartbeatTimer);
   if (!state.activeSessionId || !state.token) return;
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -511,16 +516,31 @@ function connectSessionSocket(reset = false) {
   const ws = new WebSocket(wsUrl);
   state.ws = ws;
   state.wsSynced = false;
+  _wsLastActivityAt = Date.now();
 
   ws.onopen = () => {
+    _wsLastActivityAt = Date.now();
     setConnStatus("online", "已连接");
+    _wsHeartbeatTimer = setInterval(() => {
+      if (state.ws !== ws) return;
+      if (Date.now() - _wsLastActivityAt > 35000) {
+        setConnStatus("reconnecting", "心跳超时，重连中...");
+        try { ws.close(); } catch {}
+        return;
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send("ping"); } catch {}
+      }
+    }, 12000);
   };
 
   ws.onmessage = (evt) => {
+    _wsLastActivityAt = Date.now();
     const msg = JSON.parse(evt.data);
-    if (msg.type === "ping") return;
+    if (msg.type === "ping" || msg.type === "pong") return;
     if (msg.type === "sync_complete") {
       state.wsSynced = true;
+      _wsBackoffAttempt = 0;
       if (msg.session) updateSessionMeta(msg.session);
       scrollChatBottom(true);
       return;
@@ -533,18 +553,22 @@ function connectSessionSocket(reset = false) {
   };
 
   ws.onclose = () => {
+    clearInterval(_wsHeartbeatTimer);
+    if (state.ws !== ws) return;
+    _wsBackoffAttempt = Math.min(_wsBackoffAttempt + 1, 6);
+    const delay = Math.min(15000, Math.round(1000 * Math.pow(1.6, _wsBackoffAttempt - 1) + Math.random() * 400));
     setConnStatus("reconnecting", "重连中...");
-    state.reconnectTimer = setTimeout(() => connectSessionSocket(false), 2000);
+    state.reconnectTimer = setTimeout(() => connectSessionSocket(false), delay);
   };
 
   ws.onerror = () => {
-    ws.close();
+    try { ws.close(); } catch {}
   };
 }
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && state.token && state.activeSessionId) {
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN || (Date.now() - _wsLastActivityAt > 30000)) {
       connectSessionSocket(false);
     }
   }

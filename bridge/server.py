@@ -283,9 +283,53 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
 
         loop.set_exception_handler(_quiet_win_socket_handler)
         await tunnel_manager.start()
-        yield
-        await tunnel_manager.stop()
-        await session_manager.shutdown()
+
+        probe_task: asyncio.Task[None] | None = None
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            async def _self_health_probe() -> None:
+                await asyncio.sleep(15.0)
+                consecutive_failures = 0
+                port = int(config_store.config.port)
+                while True:
+                    await asyncio.sleep(25.0)
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection("127.0.0.1", port), timeout=4.0
+                        )
+                        writer.write(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+                        await writer.drain()
+                        head = await asyncio.wait_for(reader.read(64), timeout=4.0)
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                        if b"200" in head:
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                    except asyncio.CancelledError:
+                        return
+                    except Exception:
+                        consecutive_failures += 1
+
+                    if consecutive_failures >= 3:
+                        logging.critical("Self-health probe failed 3 times on 127.0.0.1:%s; exiting for watchdog respawn", port)
+                        os._exit(75)
+
+            probe_task = asyncio.create_task(_self_health_probe())
+
+        try:
+            yield
+        finally:
+            if probe_task and not probe_task.done():
+                probe_task.cancel()
+                try:
+                    await probe_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            await tunnel_manager.stop()
+            await session_manager.shutdown()
 
     app = FastAPI(title="DeepSeek Mobile Bridge", version=VERSION, lifespan=lifespan)
     app.state.config_store = config_store
@@ -345,6 +389,19 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Workspace directory not found")
         return candidate
 
+    def _discover_local_ipv4s() -> list[str]:
+        found: list[str] = []
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = str(info[4][0])
+                if ip.startswith("127.") or ip.startswith("169.254.") or ip.startswith("198.18."):
+                    continue
+                if ip not in found:
+                    found.append(ip)
+        except OSError:
+            pass
+        return found
+
     @app.get("/health")
     @app.get("/api/health")
     def health() -> dict[str, Any]:
@@ -355,6 +412,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             "port": config_store.config.port,
             "public_url": tunnel_manager.live_url or config_store.config.public_url,
             "tunnel_status": tunnel_manager.status,
+            "lan_ips": _discover_local_ipv4s(),
         }
 
     @app.get("/api/tunnel/status", dependencies=[Depends(require_auth)])
@@ -1274,23 +1332,26 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         async def _safe_send(payload: dict[str, Any]) -> bool:
             try:
                 async with send_lock:
-                    await websocket.send_json(payload)
+                    await asyncio.wait_for(websocket.send_json(payload), timeout=10.0)
                 return True
-            except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
+            except (asyncio.TimeoutError, WebSocketDisconnect, ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
                 return False
 
         async def _sender_loop(start_seq: int) -> None:
             last_sent = start_seq
-            while True:
-                try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=12.0)
-                    if ev["seq"] > last_sent:
-                        if not await _safe_send(ev):
+            try:
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(queue.get(), timeout=12.0)
+                        if ev["seq"] > last_sent:
+                            if not await _safe_send(ev):
+                                return
+                            last_sent = ev["seq"]
+                    except asyncio.TimeoutError:
+                        if not await _safe_send({"type": "ping", "ts": asyncio.get_running_loop().time()}):
                             return
-                        last_sent = ev["seq"]
-                except asyncio.TimeoutError:
-                    if not await _safe_send({"type": "ping", "ts": asyncio.get_running_loop().time()}):
-                        return
+            except asyncio.CancelledError:
+                return
 
         async def _receiver_loop() -> None:
             nonlocal disconnect_reason
@@ -1379,19 +1440,31 @@ def _is_port_in_use(host: str, port: int) -> bool:
 
 
 def main() -> None:
+    from logging.handlers import RotatingFileHandler
+
     store = ConfigStore()
     cfg = store.config
     log_path = store.data_dir / "bridge.log"
     pid_path = store.data_dir / "bridge.pid"
 
+    # Keep local LAN & Tailscale traffic out of desktop HTTP proxies
+    cur_no_proxy = os.environ.get("NO_PROXY", "")
+    extra_bypass = "localhost,127.0.0.1,::1,192.168.*,10.*,100.*"
+    if not cur_no_proxy:
+        os.environ["NO_PROXY"] = extra_bypass
+    elif "192.168.*" not in cur_no_proxy:
+        os.environ["NO_PROXY"] = f"{cur_no_proxy},192.168.*,10.*,100.*"
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
+            RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     if _is_port_in_use(cfg.host, cfg.port):
         existing_pid = pid_path.read_text(encoding="utf-8").strip() if pid_path.exists() else "unknown"
@@ -1405,7 +1478,7 @@ def main() -> None:
 
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     print("=" * 60)
-    print(f"DeepSeek Mobile Bridge v{VERSION} (iOS Liquid Glass & Full PC File Manager)")
+    print(f"DeepSeek Mobile Bridge v{VERSION} (SelectorEventLoop Resilient Edition)")
     print(f"Listening: http://{cfg.host}:{cfg.port} (Health: /api/health)")
     print(f"Workspaces: {', '.join(cfg.workspaces)} (AI Mode: {cfg.ai_access_mode})")
     print(f"Model: {cfg.model} ({cfg.effective_base_url()})")
@@ -1414,7 +1487,20 @@ def main() -> None:
     print(f"Log Path: {log_path}")
     print("=" * 60)
     try:
-        uvicorn.run(create_app(), host=cfg.host, port=cfg.port, log_level="info")
+        uv_cfg = uvicorn.Config(
+            create_app(),
+            host=cfg.host,
+            port=cfg.port,
+            log_level="info",
+            timeout_keep_alive=30,
+        )
+        server = uvicorn.Server(uv_cfg)
+        if os.name == "nt":
+            # Use SelectorEventLoop on Windows to avoid ProactorEventLoop [WinError 64] accept burnout
+            with asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner:
+                runner.run(server.serve())
+        else:
+            server.run()
     except Exception:
         logging.exception("Fatal bridge server error")
         raise
