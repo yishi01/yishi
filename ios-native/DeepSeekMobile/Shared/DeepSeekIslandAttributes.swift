@@ -1,9 +1,7 @@
 import ActivityKit
 import Foundation
 
-/// Minimalist Doubao-style Dynamic Island state:
-/// Shows ONLY the high-level phase (Deep Thinking / Tool Call / Waiting Approval / Completed)
-/// without exposing verbose thoughts or tool arguments on the island.
+/// Minimalist Doubao-style Dynamic Island state + interactive Review Confirmation popup on waitingApproval.
 public enum DeepSeekIslandPhase: String, Codable, Hashable {
     case thinking = "thinking"
     case callingTool = "calling_tool"
@@ -25,7 +23,7 @@ public enum DeepSeekIslandPhase: String, Codable, Hashable {
         switch self {
         case .thinking: return "正在深度思考..."
         case .callingTool: return "正在使用工具调用..."
-        case .waitingApproval: return "等待你的操作确认"
+        case .waitingApproval: return "需要审查与操作确认"
         case .answering: return "正在生成回复..."
         case .completed: return "输出已完成"
         }
@@ -35,7 +33,7 @@ public enum DeepSeekIslandPhase: String, Codable, Hashable {
         switch self {
         case .thinking: return "sparkles"
         case .callingTool: return "wrench.and.screwdriver.fill"
-        case .waitingApproval: return "bell.badge.fill"
+        case .waitingApproval: return "shield.lefthalf.filled.badge.checkmark"
         case .answering: return "waveform"
         case .completed: return "checkmark.circle.fill"
         }
@@ -46,10 +44,28 @@ public struct DeepSeekIslandAttributes: ActivityAttributes {
     public struct ContentState: Codable, Hashable {
         public var phase: DeepSeekIslandPhase
         public var toolCount: Int
+        public var pendingApprovalId: String
+        public var pendingToolName: String
+        public var pendingSummary: String
+        public var pendingRiskLevel: String
+        public var queuedCount: Int
 
-        public init(phase: DeepSeekIslandPhase, toolCount: Int = 0) {
+        public init(
+            phase: DeepSeekIslandPhase,
+            toolCount: Int = 0,
+            pendingApprovalId: String = "",
+            pendingToolName: String = "",
+            pendingSummary: String = "",
+            pendingRiskLevel: String = "",
+            queuedCount: Int = 0
+        ) {
             self.phase = phase
             self.toolCount = toolCount
+            self.pendingApprovalId = pendingApprovalId
+            self.pendingToolName = pendingToolName
+            self.pendingSummary = pendingSummary
+            self.pendingRiskLevel = pendingRiskLevel
+            self.queuedCount = queuedCount
         }
     }
 

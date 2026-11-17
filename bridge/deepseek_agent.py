@@ -7,6 +7,7 @@ import json
 import os
 import ssl
 import subprocess
+import threading
 import urllib.parse
 import urllib.request
 import uuid
@@ -28,9 +29,11 @@ from bridge.fs_service import (
     to_rel_posix,
     write_file_content,
 )
+from bridge.sandbox_runner import SandboxRunner, audit_untrusted_code
+from bridge.search_service import execute_web_search
 
-WRITE_TOOLS = {"write_file", "edit_file", "run_command"}
-COMMAND_TOOLS = {"run_command"}
+WRITE_TOOLS = {"write_file", "edit_file", "run_command", "run_plugin"}
+COMMAND_TOOLS = {"run_command", "run_plugin"}
 MAX_TOOL_ROUNDS = 24
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
@@ -208,6 +211,80 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the public web using the configured search provider (DuckDuckGo, Tavily, Brave, Serper, Bocha, or Custom).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query keywords."},
+                    "max_results": {"type": "integer", "description": "Max search results (1-10)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_plugins",
+            "description": "List installed PC DSH plugins, enabled skills, and executable plugin tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_plugin",
+            "description": "Execute a tool provided by an enabled PC DSH plugin on the host PC.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plugin_id": {"type": "string", "description": "Plugin ID from list_plugins."},
+                    "tool_name": {"type": "string", "description": "Tool name inside the plugin (optional if default)."},
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "CLI arguments to pass to the PC plugin script.",
+                    },
+                    "stdin_text": {"type": "string", "description": "Optional stdin string."},
+                },
+                "required": ["plugin_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sandbox_audit_run",
+            "description": "Perform static security self-check and optionally run untrusted code in an isolated PC sandbox without host secrets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Source code to inspect or simulate."},
+                    "language": {
+                        "type": "string",
+                        "enum": ["python", "javascript", "powershell", "bash", "html"],
+                        "description": "Script language.",
+                    },
+                    "execute": {
+                        "type": "boolean",
+                        "description": "True to execute inside isolated PC sandbox after audit; false for static security audit only.",
+                    },
+                    "allow_network": {
+                        "type": "boolean",
+                        "description": "Allow outbound network in simulator (default false).",
+                    },
+                },
+                "required": ["code", "language"],
+            },
+        },
+    },
 ]
 
 
@@ -351,21 +428,29 @@ class DeepSeekSession:
         config_store: ConfigStore,
         sessions_dir: Path,
         model: str | None = None,
+        profile_id: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         events: list[dict[str, Any]] | None = None,
+        message_queue: list[dict[str, Any]] | None = None,
+        plugin_service: Any | None = None,
+        sandbox_runner: SandboxRunner | None = None,
     ):
         self.session_id = session_id
         self.title = title
         self.workspace = str(Path(workspace).resolve())
         self.approval_mode = approval_mode
         self.model = model or config_store.config.model or "deepseek-chat"
+        self.profile_id = profile_id or config_store.config.active_profile_id or ""
         self.config_store = config_store
         self.sessions_dir = sessions_dir
+        self.plugin_service = plugin_service
+        self.sandbox_runner = sandbox_runner
         self.created_at = _utc_now()
         self.updated_at = self.created_at
         self.messages: list[dict[str, Any]] = sanitize_conversation_messages(messages or [])
         self.events: list[dict[str, Any]] = compact_event_stream(events or [])
         self.next_seq = (self.events[-1]["seq"] + 1) if self.events else 1
+        self.message_queue: list[dict[str, Any]] = list(message_queue or [])
 
         self.status: str = "idle"
         self.subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -374,6 +459,7 @@ class DeepSeekSession:
 
         self._lock = asyncio.Lock()
         self._active_task: asyncio.Task[None] | None = None
+        self._cancel_requested: bool = False
         self._http_client_factory = lambda: httpx.AsyncClient(
             http2=False,
             timeout=httpx.Timeout(120.0, connect=15.0, read=90.0),
@@ -390,10 +476,13 @@ class DeepSeekSession:
             "workspace": self.workspace,
             "approval_mode": self.approval_mode,
             "model": self.model,
+            "profile_id": self.profile_id,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "last_seq": self.next_seq - 1,
+            "queued_count": len(self.message_queue),
+            "queued_messages": list(self.message_queue),
             "pending_approvals": [
                 {
                     "request_id": req.request_id,
@@ -420,14 +509,16 @@ class DeepSeekSession:
             "workspace": self.workspace,
             "approval_mode": self.approval_mode,
             "model": self.model,
+            "profile_id": self.profile_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "messages": self.messages[-120:],
             "events": self.events[-600:],
+            "message_queue": self.message_queue[-50:],
         }
-        tmp = self.storage_path.with_suffix(".json.tmp")
+        tmp = self.storage_path.with_suffix(f".json.tmp-{os.getpid()}-{threading.get_ident()}")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.storage_path)
+        os.replace(tmp, self.storage_path)
 
     def emit_event(
         self,
@@ -487,7 +578,15 @@ class DeepSeekSession:
                     self.events = self.events[-600:]
 
         for queue in list(self.subscribers):
-            queue.put_nowait(wire_event)
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(wire_event)
+            except asyncio.QueueFull:
+                pass
 
         if persist:
             self.save_to_disk()
@@ -499,7 +598,7 @@ class DeepSeekSession:
         return [ev for ev in self.events if ev["seq"] > after_seq]
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2048)
         self.subscribers.add(q)
         return q
 
@@ -535,7 +634,25 @@ class DeepSeekSession:
         loop = asyncio.get_running_loop()
         req_id = uuid.uuid4().hex[:10]
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
-        payload = {"tool_name": tool_name, "args": args}
+        payload: dict[str, Any] = {"tool_name": tool_name, "args": args}
+        if tool_name == "run_command" and args.get("command"):
+            audit = audit_untrusted_code(str(args["command"]), language="powershell")
+            payload["risk_level"] = audit["risk_level"]
+            payload["review_summary"] = audit["summary"]
+            payload["review_score"] = audit["score"]
+        elif tool_name == "write_file" and args.get("content"):
+            audit = audit_untrusted_code(
+                str(args["content"]),
+                language="",
+                filename=str(args.get("path") or "file.py"),
+            )
+            payload["risk_level"] = audit["risk_level"]
+            payload["review_summary"] = audit["summary"]
+            payload["review_score"] = audit["score"]
+        elif tool_name == "run_plugin":
+            payload["risk_level"] = "medium"
+            payload["review_summary"] = f"将在 PC 端执行插件 `{args.get('plugin_id', '')}`"
+            payload["review_score"] = 25
         req = PendingRequest(
             request_id=req_id,
             kind="approval",
@@ -864,6 +981,45 @@ class DeepSeekSession:
                 ans = await self._request_interaction(question, options)
                 return json.dumps(ans, ensure_ascii=False)
 
+            if name == "web_search":
+                query = str(args.get("query") or "").strip()
+                max_res = int(args.get("max_results") or 6)
+                res = await execute_web_search(query, cfg.search_config, max_results=max_res)
+                return json.dumps(res, ensure_ascii=False)
+
+            if name == "list_plugins":
+                if not self.plugin_service:
+                    return json.dumps({"plugins": [], "dsh_profile": {"exists": False}}, ensure_ascii=False)
+                return json.dumps(self.plugin_service.list_all(), ensure_ascii=False)
+
+            if name == "run_plugin":
+                if not self.plugin_service:
+                    return json.dumps({"error": "Plugin service is unavailable"}, ensure_ascii=False)
+                res = await asyncio.to_thread(
+                    self.plugin_service.run_plugin_tool,
+                    str(args["plugin_id"]),
+                    tool_name=str(args.get("tool_name") or ""),
+                    args=[str(a) for a in (args.get("args") or [])],
+                    stdin_text=str(args.get("stdin_text") or ""),
+                    workspace_cwd=str(root),
+                )
+                return json.dumps(res, ensure_ascii=False)
+
+            if name == "sandbox_audit_run":
+                code = str(args.get("code") or "")
+                lang = str(args.get("language") or "python")
+                do_exec = bool(args.get("execute", False))
+                allow_net = bool(args.get("allow_network", False))
+                if not do_exec or not self.sandbox_runner:
+                    return json.dumps(audit_untrusted_code(code, language=lang), ensure_ascii=False)
+                res = await asyncio.to_thread(
+                    self.sandbox_runner.run_sandbox_script,
+                    code,
+                    lang,
+                    allow_network=allow_net,
+                )
+                return json.dumps(res, ensure_ascii=False)
+
             return json.dumps({"error": f"Unknown tool: {name}"}, ensure_ascii=False)
         except WorkspaceSecurityError as exc:
             return json.dumps({"error": f"Security error: {exc}"}, ensure_ascii=False)
@@ -873,16 +1029,16 @@ class DeepSeekSession:
     def _build_api_messages(self) -> list[dict[str, Any]]:
         self.messages = sanitize_conversation_messages(self.messages)
         cfg = self.config_store.config
-        api_msgs: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(
-                    workspace=self.workspace,
-                    ai_access_mode=cfg.ai_access_mode,
-                    allowed_workspaces=", ".join(cfg.workspaces),
-                ),
-            }
-        ]
+        sys_text = SYSTEM_PROMPT.format(
+            workspace=self.workspace,
+            ai_access_mode=cfg.ai_access_mode,
+            allowed_workspaces=", ".join(cfg.workspaces),
+        )
+        if self.plugin_service:
+            plugin_appendix = self.plugin_service.get_agent_prompt_appendix()
+            if plugin_appendix:
+                sys_text += plugin_appendix
+        api_msgs: list[dict[str, Any]] = [{"role": "system", "content": sys_text}]
         last_user_idx = -1
         for i, msg in enumerate(self.messages):
             if msg.get("role") == "user":
@@ -901,18 +1057,42 @@ class DeepSeekSession:
         api_key: str,
         base_url: str,
         model: str,
+        *,
+        provider: str = "openai_compatible",
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        supports_tools: bool = True,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        if provider == "anthropic":
+            return await self._stream_anthropic_completion(
+                client,
+                api_key,
+                base_url,
+                model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                supports_tools=supports_tools,
+                extra_headers=extra_headers,
+            )
+
         url = f"{base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            **(extra_headers or {}),
         }
         body: dict[str, Any] = {
             "model": model,
             "messages": self._build_api_messages(),
-            "tools": TOOL_SCHEMAS,
             "stream": True,
         }
+        if supports_tools:
+            body["tools"] = TOOL_SCHEMAS
+        if "reasoner" not in model.lower():
+            body["temperature"] = temperature
+            if max_tokens > 0:
+                body["max_tokens"] = max_tokens
 
         last_exc: BaseException | None = None
         for attempt in range(1, 4):
@@ -940,7 +1120,7 @@ class DeepSeekSession:
                             ) or err_text
                         except json.JSONDecodeError:
                             msg = err_text
-                        raise RuntimeError(f"DeepSeek API ({resp.status_code}): {msg or '请求被拒绝'}")
+                        raise RuntimeError(f"Model API ({resp.status_code}): {msg or '请求被拒绝'}")
 
                     async for raw_line in resp.aiter_lines():
                         line = raw_line.strip()
@@ -1002,48 +1182,297 @@ class DeepSeekSession:
 
             except (httpx.TransportError, httpx.TimeoutException, ssl.SSLError, OSError) as exc:
                 last_exc = exc
-                # Retry if stream broke before any tokens or if partial stream had no tool calls yet
                 if attempt < 3 and not tool_calls_acc and not emitted_any:
                     await asyncio.sleep(0.8 * attempt)
                     continue
-                # If partial text/thoughts already streamed, still retry only if we haven't mutated tools
                 if attempt < 2 and not tool_calls_acc:
                     await asyncio.sleep(1.0)
                     continue
                 raise RuntimeError(_format_exception(exc)) from exc
 
-        raise RuntimeError(_format_exception(last_exc or RuntimeError("DeepSeek 请求失败")))
+        raise RuntimeError(_format_exception(last_exc or RuntimeError("模型请求失败")))
 
-    async def send_prompt(self, prompt: str, *, model: str | None = None) -> dict[str, Any]:
+    async def _stream_anthropic_completion(
+        self,
+        client: httpx.AsyncClient,
+        api_key: str,
+        base_url: str,
+        model: str,
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        supports_tools: bool = True,
+        extra_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Stream Anthropic Messages API (/v1/messages) into uniform internal OpenAI-shaped message."""
+        base = base_url.rstrip("/")
+        url = f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            **(extra_headers or {}),
+        }
+
+        raw_msgs = self._build_api_messages()
+        sys_parts: list[str] = []
+        anth_msgs: list[dict[str, Any]] = []
+        for m in raw_msgs:
+            role = m.get("role")
+            if role == "system":
+                if m.get("content"):
+                    sys_parts.append(str(m["content"]))
+            elif role == "user":
+                anth_msgs.append({"role": "user", "content": str(m.get("content") or "")})
+            elif role == "assistant":
+                blocks: list[dict[str, Any]] = []
+                if m.get("content"):
+                    blocks.append({"type": "text", "text": str(m["content"])})
+                for tc in m.get("tool_calls") or []:
+                    try:
+                        parsed_in = json.loads(tc["function"]["arguments"] or "{}")
+                        if not isinstance(parsed_in, dict):
+                            parsed_in = {"input": parsed_in}
+                    except Exception:
+                        parsed_in = {}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:8]}",
+                            "name": tc["function"]["name"],
+                            "input": parsed_in,
+                        }
+                    )
+                if blocks:
+                    anth_msgs.append({"role": "assistant", "content": blocks})
+            elif role == "tool":
+                tr_block = {
+                    "type": "tool_result",
+                    "tool_use_id": str(m.get("tool_call_id") or ""),
+                    "content": str(m.get("content") or ""),
+                }
+                if anth_msgs and anth_msgs[-1]["role"] == "user" and isinstance(anth_msgs[-1]["content"], list):
+                    anth_msgs[-1]["content"].append(tr_block)
+                else:
+                    anth_msgs.append({"role": "user", "content": [tr_block]})
+
+        anth_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters", {"type": "object", "properties": {}}),
+            }
+            for t in TOOL_SCHEMAS
+        ]
+
+        body: dict[str, Any] = {
+            "model": model,
+            "system": "\n\n".join(sys_parts),
+            "messages": anth_msgs,
+            "max_tokens": max(256, int(max_tokens or 4096)),
+            "temperature": temperature,
+            "stream": True,
+        }
+        if supports_tools:
+            body["tools"] = anth_tools
+
+        last_exc: BaseException | None = None
+        for attempt in range(1, 3):
+            content_parts: list[str] = []
+            reasoning_parts: list[str] = []
+            tool_calls_acc: dict[int, dict[str, Any]] = {}
+            emitted_any = False
+            try:
+                async with client.stream("POST", url, headers=headers, json=body) as resp:
+                    if resp.status_code in RETRYABLE_STATUS_CODES and attempt < 2:
+                        await resp.aread()
+                        await asyncio.sleep(0.8)
+                        continue
+                    if resp.status_code >= 400:
+                        err_text = (await resp.aread()).decode("utf-8", errors="replace").strip()
+                        raise RuntimeError(f"Anthropic API ({resp.status_code}): {err_text or '请求被拒绝'}")
+
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if not payload_str or payload_str == "[DONE]":
+                            continue
+                        try:
+                            ev = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        etype = ev.get("type")
+                        idx = int(ev.get("index", 0))
+                        if etype == "content_block_start":
+                            blk = ev.get("content_block") or {}
+                            if blk.get("type") == "tool_use":
+                                emitted_any = True
+                                tool_calls_acc[idx] = {
+                                    "id": blk.get("id") or f"toolu_{uuid.uuid4().hex[:8]}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": str(blk.get("name") or ""),
+                                        "arguments": "",
+                                    },
+                                }
+                        elif etype == "content_block_delta":
+                            delta = ev.get("delta") or {}
+                            dtype = delta.get("type")
+                            if dtype == "text_delta" and delta.get("text"):
+                                emitted_any = True
+                                txt = str(delta["text"])
+                                content_parts.append(txt)
+                                self.emit_event("text_delta", {"text": txt}, persist=False)
+                            elif dtype == "thinking_delta" and delta.get("thinking"):
+                                emitted_any = True
+                                th = str(delta["thinking"])
+                                reasoning_parts.append(th)
+                                self.emit_event("thought_delta", {"text": th}, persist=False)
+                            elif dtype == "input_json_delta" and "partial_json" in delta:
+                                if idx in tool_calls_acc:
+                                    tool_calls_acc[idx]["function"]["arguments"] += str(delta["partial_json"])
+                        elif etype == "message_stop":
+                            break
+
+                assistant_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "".join(content_parts) if content_parts else None,
+                }
+                if reasoning_parts:
+                    assistant_msg["reasoning_content"] = "".join(reasoning_parts)
+                if tool_calls_acc:
+                    for tc in tool_calls_acc.values():
+                        if not tc["function"]["arguments"].strip():
+                            tc["function"]["arguments"] = "{}"
+                    assistant_msg["tool_calls"] = [tool_calls_acc[k] for k in sorted(tool_calls_acc.keys())]
+                return assistant_msg
+            except (httpx.TransportError, httpx.TimeoutException, ssl.SSLError, OSError) as exc:
+                last_exc = exc
+                if attempt < 2 and not tool_calls_acc and not emitted_any:
+                    await asyncio.sleep(0.8)
+                    continue
+                raise RuntimeError(_format_exception(exc)) from exc
+        raise RuntimeError(_format_exception(last_exc or RuntimeError("Anthropic 请求失败")))
+
+    async def send_prompt(
+        self,
+        prompt: str,
+        *,
+        model: str | None = None,
+        profile_id: str | None = None,
+        queue_if_busy: bool = True,
+    ) -> dict[str, Any]:
         clean = prompt.strip()
         if not clean:
             raise ValueError("Prompt cannot be empty")
+
         if self._active_task and not self._active_task.done():
-            raise RuntimeError("当前会话正在执行任务，请先点击「停止」或处理待审批项。")
+            if not queue_if_busy:
+                raise RuntimeError("当前会话正在执行任务，请先点击「停止」或处理待审批项。")
+            item = {
+                "id": uuid.uuid4().hex[:10],
+                "prompt": clean,
+                "model": (model or "").strip() or self.model,
+                "profile_id": (profile_id or "").strip() or self.profile_id,
+                "created_at": _utc_now(),
+            }
+            self.message_queue.append(item)
+            ev = self.emit_event(
+                "queue_updated",
+                {
+                    "queued_messages": list(self.message_queue),
+                    "queued_count": len(self.message_queue),
+                    "enqueued": item,
+                },
+                include_session=True,
+            )
+            return {**ev, "queued": True, "queue_item": item}
 
         if model and model.strip():
             self.model = model.strip()
+        if profile_id is not None and profile_id.strip():
+            self.profile_id = profile_id.strip()
 
         if self.title in ("New Session", "DeepSeek Session") and len(self.events) == 0:
             self.title = clean[:40] + ("..." if len(clean) > 40 else "")
 
         user_event = self.emit_event("user_message", {"text": clean})
+        self._cancel_requested = False
         self.status = "running"
         self.emit_event("status", {"status": "running"}, persist=False, include_session=True)
         self._active_task = asyncio.create_task(self._run_turn(clean))
-        return user_event
+        return {**user_event, "queued": False}
+
+    def list_queue(self) -> list[dict[str, Any]]:
+        return list(self.message_queue)
+
+    def remove_queued_item(self, item_id: str) -> bool:
+        before = len(self.message_queue)
+        self.message_queue = [m for m in self.message_queue if m.get("id") != item_id]
+        if len(self.message_queue) == before:
+            return False
+        self.emit_event(
+            "queue_updated",
+            {"queued_messages": list(self.message_queue), "queued_count": len(self.message_queue)},
+            include_session=True,
+        )
+        return True
+
+    def clear_queue(self) -> int:
+        n = len(self.message_queue)
+        self.message_queue.clear()
+        self.emit_event(
+            "queue_updated",
+            {"queued_messages": [], "queued_count": 0},
+            include_session=True,
+        )
+        return n
+
+    async def send_queued_now(self, item_id: str) -> dict[str, Any]:
+        target = next((m for m in self.message_queue if m.get("id") == item_id), None)
+        if not target:
+            raise KeyError(f"Queue item not found: {item_id}")
+        self.message_queue = [m for m in self.message_queue if m.get("id") != item_id]
+        if self._active_task and not self._active_task.done():
+            # Promote to front of queue so it runs immediately after current turn
+            self.message_queue.insert(0, target)
+            ev = self.emit_event(
+                "queue_updated",
+                {"queued_messages": list(self.message_queue), "queued_count": len(self.message_queue)},
+                include_session=True,
+            )
+            return {**ev, "promoted": True}
+        self.emit_event(
+            "queue_updated",
+            {"queued_messages": list(self.message_queue), "queued_count": len(self.message_queue)},
+            include_session=True,
+        )
+        return await self.send_prompt(
+            str(target.get("prompt") or ""),
+            model=str(target.get("model") or "") or None,
+            profile_id=str(target.get("profile_id") or "") or None,
+            queue_if_busy=False,
+        )
 
     async def _run_turn(self, prompt: str) -> None:
+        was_cancelled = False
         try:
             async with self._lock:
                 cfg = self.config_store.config
-                api_key = cfg.effective_api_key()
+                creds = cfg.resolve_credentials(
+                    profile_id=self.profile_id or None,
+                    model_override=self.model or None,
+                )
+                api_key = creds["api_key"]
                 if not api_key:
                     raise RuntimeError(
-                        "请先在「Diff/设置」Tab 填入你的 DeepSeek API Key（或配置环境变量 DEEPSEEK_API_KEY）。"
+                        f"请先在「设置 -> 模型配置」填入 {creds['name']} 的 API Key。"
                     )
-                base_url = cfg.effective_base_url()
-                model = self.model or cfg.model or "deepseek-flash"
+                base_url = creds["base_url"]
+                model = creds["model"]
 
                 self.messages = sanitize_conversation_messages(self.messages)
                 self.messages.append({"role": "user", "content": prompt})
@@ -1051,7 +1480,15 @@ class DeepSeekSession:
                 async with self._http_client_factory() as client:
                     for _ in range(MAX_TOOL_ROUNDS):
                         assistant_msg = await self._stream_completion(
-                            client, api_key, base_url, model
+                            client,
+                            api_key,
+                            base_url,
+                            model,
+                            provider=creds["provider"],
+                            temperature=creds["temperature"],
+                            max_tokens=creds["max_tokens"],
+                            supports_tools=creds["supports_tools"],
+                            extra_headers=creds["extra_headers"],
                         )
                         self.messages.append(assistant_msg)
 
@@ -1142,6 +1579,7 @@ class DeepSeekSession:
                 self.emit_event("turn_done", {"stop_reason": "done"}, include_session=True)
                 asyncio.create_task(self._send_bark("DeepSeek 任务完成", self.title))
         except asyncio.CancelledError:
+            was_cancelled = True
             self.status = "idle"
             self.messages = sanitize_conversation_messages(self.messages)
             self.emit_event("turn_done", {"stop_reason": "cancelled"}, include_session=True)
@@ -1154,7 +1592,27 @@ class DeepSeekSession:
         finally:
             self.save_to_disk()
 
+        # Auto-dequeue next message only after cleanly releasing self._lock
+        if not was_cancelled and not self._cancel_requested and self.message_queue:
+            next_item = self.message_queue.pop(0)
+            self.emit_event(
+                "queue_updated",
+                {"queued_messages": list(self.message_queue), "queued_count": len(self.message_queue)},
+                include_session=True,
+            )
+            next_prompt = str(next_item.get("prompt") or "").strip()
+            if next_prompt:
+                if next_item.get("model"):
+                    self.model = str(next_item["model"]).strip()
+                if next_item.get("profile_id"):
+                    self.profile_id = str(next_item["profile_id"]).strip()
+                self.emit_event("user_message", {"text": next_prompt})
+                self.status = "running"
+                self.emit_event("status", {"status": "running"}, persist=False, include_session=True)
+                self._active_task = asyncio.create_task(self._run_turn(next_prompt))
+
     async def cancel_turn(self) -> None:
+        self._cancel_requested = True
         for req in list(self.pending_approvals.values()):
             if not req.future.done():
                 req.future.set_result({"allow": False, "reason": "Turn cancelled"})
@@ -1218,8 +1676,16 @@ class DeepSeekSession:
 class SessionManager:
     """Manages multiple DeepSeekSessions backed by disk storage."""
 
-    def __init__(self, config_store: ConfigStore):
+    def __init__(
+        self,
+        config_store: ConfigStore,
+        *,
+        plugin_service: Any | None = None,
+        sandbox_runner: SandboxRunner | None = None,
+    ):
         self.config_store = config_store
+        self.plugin_service = plugin_service
+        self.sandbox_runner = sandbox_runner
         self.sessions_dir = config_store.data_dir / "sessions"
         self.sessions: dict[str, DeepSeekSession] = {}
         self._load_existing()
@@ -1233,6 +1699,7 @@ class SessionManager:
                 sid = raw["session_id"]
                 raw_events = raw.get("events", [])
                 raw_msgs = raw.get("messages", [])
+                raw_queue = raw.get("message_queue", [])
                 sess = DeepSeekSession(
                     session_id=sid,
                     title=raw.get("title", "Session"),
@@ -1241,14 +1708,17 @@ class SessionManager:
                         "approval_mode", self.config_store.config.default_approval_mode
                     ),
                     model=raw.get("model") or self.config_store.config.model,
+                    profile_id=raw.get("profile_id") or "",
                     config_store=self.config_store,
                     sessions_dir=self.sessions_dir,
                     messages=raw_msgs,
                     events=raw_events,
+                    message_queue=raw_queue if isinstance(raw_queue, list) else [],
+                    plugin_service=self.plugin_service,
+                    sandbox_runner=self.sandbox_runner,
                 )
                 sess.created_at = raw.get("created_at", sess.created_at)
                 sess.updated_at = raw.get("updated_at", sess.updated_at)
-                # Persist compacted events and sanitized messages back to disk if shrunk
                 if len(sess.events) < len(raw_events) or len(sess.messages) != len(raw_msgs):
                     sess.save_to_disk()
                 self.sessions[sid] = sess
@@ -1267,6 +1737,7 @@ class SessionManager:
         title: str = "New Session",
         approval_mode: str | None = None,
         model: str | None = None,
+        profile_id: str | None = None,
     ) -> DeepSeekSession:
         ws = workspace or self.config_store.config.workspaces[0]
         sid = uuid.uuid4().hex[:12]
@@ -1276,8 +1747,11 @@ class SessionManager:
             workspace=ws,
             approval_mode=approval_mode or self.config_store.config.default_approval_mode,
             model=model or self.config_store.config.model,
+            profile_id=profile_id or self.config_store.config.active_profile_id,
             config_store=self.config_store,
             sessions_dir=self.sessions_dir,
+            plugin_service=self.plugin_service,
+            sandbox_runner=self.sandbox_runner,
         )
         sess.save_to_disk()
         self.sessions[sid] = sess

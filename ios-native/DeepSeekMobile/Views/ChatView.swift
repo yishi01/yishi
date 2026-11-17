@@ -3,8 +3,15 @@ import UniformTypeIdentifiers
 
 struct ChatView: View {
     @EnvironmentObject var client: BridgeClient
+    @ObservedObject private var theme = ThemePreferences.shared
     @Binding var showSessionDrawer: Bool
+
     @State private var promptText: String = ""
+    @FocusState private var isComposerFocused: Bool
+    @State private var isComposerCollapsed: Bool = false
+    @State private var idleTimerTask: Task<Void, Never>?
+    @State private var currentNavIndex: Int = 0
+
     @State private var showChatFileImporter: Bool = false
     @State private var isUploadingAttachment: Bool = false
     @State private var reviewingArtifact: FileArtifactItem?
@@ -18,55 +25,132 @@ struct ChatView: View {
 
     var body: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                if client.turns.isEmpty {
-                    emptyWelcomeView
-                } else {
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(client.turns) { turn in
-                            TurnRowView(
-                                turn: turn,
-                                onReviewArtifact: { art in
-                                    reviewingArtifact = art
-                                },
-                                onDownloadArtifact: { art in
-                                    Task {
-                                        if let url = try? await client.downloadPCFileToLocalTemp(pcPath: art.path, filename: art.name) {
-                                            downloadedShareItem = ShareSheetItem(url: url)
+            ZStack(alignment: .trailing) {
+                ScrollView {
+                    Color.clear
+                        .frame(height: 1)
+                        .id("chatTopAnchor")
+
+                    if client.turns.isEmpty {
+                        emptyWelcomeView
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: theme.compactMode ? 10 : 16) {
+                            ForEach(Array(client.turns.enumerated()), id: \.element.id) { idx, turn in
+                                TurnRowView(
+                                    turn: turn,
+                                    onReviewArtifact: { art in
+                                        reviewingArtifact = art
+                                    },
+                                    onDownloadArtifact: { art in
+                                        Task {
+                                            if let url = try? await client.downloadPCFileToLocalTemp(pcPath: art.path, filename: art.name) {
+                                                downloadedShareItem = ShareSheetItem(url: url)
+                                            }
                                         }
                                     }
+                                )
+                                .id(turn.id)
+                                .onAppear {
+                                    currentNavIndex = idx
                                 }
-                            )
-                            .id(turn.id)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            }
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.top, 8)
+                        .padding(.bottom, 22)
+                    }
+
+                    Color.clear
+                        .frame(height: 1)
+                        .id("chatBottomAnchor")
+                }
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 14).onChanged { _ in
+                        if theme.autoHideComposer && !isComposerFocused && promptText.isEmpty && client.pendingApprovals.isEmpty {
+                            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                                isComposerCollapsed = true
+                            }
                         }
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.top, 8)
-                    .padding(.bottom, 16)
-                    .animation(.spring(response: 0.34, dampingFraction: 0.84), value: client.turns.count)
-                }
-            }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                topHeaderBar
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                VStack(spacing: 8) {
-                    if !client.pendingApprovals.isEmpty {
-                        pendingApprovalsBar
-                            .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
-                    }
-                    composerBar
-                }
-                .padding(.bottom, 64)
-                .animation(.spring(response: 0.32, dampingFraction: 0.80), value: client.pendingApprovals.count)
-            }
-            .onChange(of: client.turns.count) { _ in
-                if let lastId = client.turns.last?.id {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                        proxy.scrollTo(lastId, anchor: .bottom)
+                )
+                .onTapGesture {
+                    if isComposerFocused {
+                        isComposerFocused = false
+                    } else {
+                        bumpIdleTimer()
                     }
                 }
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    topHeaderBar
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    VStack(spacing: 8) {
+                        if !client.pendingApprovals.isEmpty {
+                            pendingApprovalsBar
+                                .transition(.opacity.combined(with: .scale(scale: 0.95, anchor: .bottom)))
+                        }
+                        if !client.queuedMessages.isEmpty {
+                            queuedMessagesTray
+                                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
+                        if isComposerCollapsed && theme.autoHideComposer && client.pendingApprovals.isEmpty {
+                            collapsedComposerPill
+                                .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .bottomTrailing)))
+                        } else {
+                            composerBar
+                                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                        }
+                    }
+                    .padding(.bottom, 64)
+                    .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isComposerCollapsed)
+                    .animation(.spring(response: 0.32, dampingFraction: 0.80), value: client.pendingApprovals.count)
+                    .animation(.spring(response: 0.30, dampingFraction: 0.82), value: client.queuedMessages.count)
+                }
+
+                // Quick Context Up/Down Navigation Bar
+                if !client.turns.isEmpty {
+                    quickNavigationPill(proxy: proxy)
+                        .padding(.trailing, 8)
+                        .padding(.bottom, isComposerCollapsed ? 120 : 185)
+                        .transition(.opacity)
+                }
+            }
+            .onChange(of: client.turns.count) { newCount in
+                if newCount > 0 {
+                    currentNavIndex = max(0, newCount - 1)
+                }
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    proxy.scrollTo("chatBottomAnchor", anchor: .bottom)
+                }
+            }
+        }
+        .onAppear {
+            bumpIdleTimer()
+        }
+        .onDisappear {
+            idleTimerTask?.cancel()
+        }
+        .onChange(of: isComposerFocused) { focused in
+            if focused {
+                idleTimerTask?.cancel()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                    isComposerCollapsed = false
+                }
+            } else {
+                bumpIdleTimer()
+            }
+        }
+        .onChange(of: promptText) { _ in
+            bumpIdleTimer()
+        }
+        .onChange(of: theme.autoHideComposer) { enabled in
+            if !enabled {
+                idleTimerTask?.cancel()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                    isComposerCollapsed = false
+                }
+            } else {
+                bumpIdleTimer()
             }
         }
         .onChange(of: client.referencedFilePath) { path in
@@ -75,6 +159,8 @@ struct ChatView: View {
                     ? "请查看或处理电脑文件 `\(path)`："
                     : "\(promptText)\n请查看或处理电脑文件 `\(path)`："
                 client.referencedFilePath = nil
+                withAnimation { isComposerCollapsed = false }
+                bumpIdleTimer()
             }
         }
         .fileImporter(
@@ -88,6 +174,8 @@ struct ChatView: View {
                     if let uploaded = try? await client.uploadLocalFileToPC(fileURL: firstURL, targetDir: nil) {
                         let attachNote = "我已将文件上传到电脑本地路径 `\(uploaded.path)`，请查看或按需求处理该文件："
                         promptText = promptText.isEmpty ? attachNote : "\(promptText)\n\(attachNote)"
+                        isComposerCollapsed = false
+                        bumpIdleTimer()
                     }
                     isUploadingAttachment = false
                 }
@@ -100,6 +188,206 @@ struct ChatView: View {
         .sheet(item: $downloadedShareItem) { share in
             ActivityViewSheet(items: [share.url])
         }
+    }
+
+    private func bumpIdleTimer() {
+        idleTimerTask?.cancel()
+        guard theme.autoHideComposer else {
+            isComposerCollapsed = false
+            return
+        }
+        let delayNs = UInt64(max(1.5, theme.autoHideDelaySec) * 1_000_000_000)
+        idleTimerTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: delayNs)
+            guard !Task.isCancelled else { return }
+            let empty = promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if theme.autoHideComposer && !isComposerFocused && empty && client.pendingApprovals.isEmpty && client.queuedMessages.isEmpty {
+                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+                    isComposerCollapsed = true
+                }
+            }
+        }
+    }
+
+    private func quickNavigationPill(proxy: ScrollViewProxy) -> some View {
+        let total = client.turns.count
+        let clamped = min(max(0, currentNavIndex), max(0, total - 1))
+        return VStack(spacing: 4) {
+            Button {
+                Haptics.light()
+                bumpIdleTimer()
+                currentNavIndex = 0
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    proxy.scrollTo("chatTopAnchor", anchor: .top)
+                }
+            } label: {
+                Image(systemName: "arrow.up.to.line")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundStyle(Color.dsPrimary)
+                    .frame(width: 30, height: 28)
+            }
+
+            Button {
+                Haptics.light()
+                bumpIdleTimer()
+                let prev = max(0, clamped - 1)
+                currentNavIndex = prev
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(client.turns[prev].id, anchor: .top)
+                }
+            } label: {
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(clamped > 0 ? Color.dsAccent : .secondary.opacity(0.45))
+                    .frame(width: 30, height: 26)
+            }
+            .disabled(clamped <= 0)
+
+            Text("\(clamped + 1)/\(total)")
+                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .padding(.vertical, 1)
+
+            Button {
+                Haptics.light()
+                bumpIdleTimer()
+                let next = min(total - 1, clamped + 1)
+                currentNavIndex = next
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(client.turns[next].id, anchor: .top)
+                }
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(clamped < total - 1 ? Color.dsAccent : .secondary.opacity(0.45))
+                    .frame(width: 30, height: 26)
+            }
+            .disabled(clamped >= total - 1)
+
+            Button {
+                Haptics.light()
+                bumpIdleTimer()
+                currentNavIndex = max(0, total - 1)
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    proxy.scrollTo("chatBottomAnchor", anchor: .bottom)
+                }
+            } label: {
+                Image(systemName: "arrow.down.to.line")
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundStyle(Color.dsPrimary)
+                    .frame(width: 30, height: 28)
+            }
+        }
+        .padding(.vertical, 5)
+        .padding(.horizontal, 3)
+        .liquidGlass(cornerRadius: 18, prominent: false)
+    }
+
+    private var collapsedComposerPill: some View {
+        let isRunning = (client.sessionStatus == "running" || client.sessionStatus == "waiting_input")
+        return HStack(spacing: 8) {
+            Spacer()
+            if isRunning {
+                Button {
+                    Haptics.medium()
+                    Task { await client.cancelCurrentTurn() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 10.5, weight: .bold))
+                        Text("停止")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8.5)
+                    .background(Capsule().fill(Color.red.opacity(0.88)))
+                }
+                .glassPressable(scale: 0.94)
+            }
+
+            Button {
+                Haptics.light()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                    isComposerCollapsed = false
+                }
+                bumpIdleTimer()
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "square.and.pencil")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(theme.accentColor)
+                    Text("展开输入")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Color.dsPrimary)
+                    Text(client.selectedModel)
+                        .font(.system(size: 10.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 9)
+                .liquidGlass(cornerRadius: 999, prominent: true)
+            }
+            .glassPressable(scale: 0.95)
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 4)
+    }
+
+    private var queuedMessagesTray: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("消息排队中 (\(client.queuedMessages.count))", systemImage: "text.line.first.and.arrowtriangle.forward")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(theme.accentColor)
+                Spacer()
+                Button("全部清空") {
+                    Haptics.light()
+                    Task { await client.clearQueuedMessages() }
+                }
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundStyle(.secondary)
+            }
+
+            ForEach(Array(client.queuedMessages.enumerated()), id: \.element.id) { idx, q in
+                HStack(spacing: 8) {
+                    Text("#\(idx + 1)")
+                        .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                        .foregroundStyle(theme.accentColor)
+                    Text(q.prompt)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Color.dsPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    Button {
+                        Haptics.light()
+                        Task { await client.promoteQueuedMessage(q.id) }
+                    } label: {
+                        Text(client.sessionStatus == "idle" ? "立即发送" : "插队")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(theme.accentColor)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .background(Capsule().fill(theme.accentColor.opacity(0.12)))
+                    }
+                    Button {
+                        Haptics.light()
+                        Task { await client.deleteQueuedMessage(q.id) }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 14))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .cleanWhiteCard(cornerRadius: 12)
+            }
+        }
+        .padding(10)
+        .liquidGlass(cornerRadius: 18, prominent: false)
+        .padding(.horizontal, 12)
     }
 
     private var emptyWelcomeView: some View {
@@ -262,12 +550,31 @@ struct ChatView: View {
 
             ForEach(client.pendingApprovals) { req in
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("⚠️ 审批请求: \(req.toolName)")
-                        .font(.system(size: 13.5, weight: .semibold))
+                    HStack(spacing: 6) {
+                        Text("⚠️ 审批请求: \(req.toolName)")
+                            .font(.system(size: 13.5, weight: .semibold))
+                        Spacer()
+                        Button {
+                            Haptics.light()
+                            client.activeApprovalForPopup = req
+                        } label: {
+                            Label("审查弹窗", systemImage: "shield.lefthalf.filled")
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(theme.accentColor)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3.5)
+                                .background(Capsule().fill(theme.accentColor.opacity(0.12)))
+                        }
+                    }
+                    if !req.reviewSummary.isEmpty {
+                        Text(req.reviewSummary)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundStyle(req.riskLevel == "high" || req.riskLevel == "critical" ? .red : .orange)
+                    }
                     Text(req.argsJSON)
                         .font(.system(size: 11.5, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(4)
+                        .lineLimit(3)
 
                     HStack(spacing: 8) {
                         Button("允许执行") {
@@ -316,9 +623,10 @@ struct ChatView: View {
         let isEmptyPrompt = promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         return VStack(spacing: 7) {
-            TextField("给 DeepSeek 发送消息 (可让 AI 发送文件供下载或审查)...", text: $promptText, axis: .vertical)
+            TextField("给 AI 发送消息（运行中发送将自动加入排队）...", text: $promptText, axis: .vertical)
+                .focused($isComposerFocused)
                 .lineLimit(1...5)
-                .font(.system(size: 15.5))
+                .font(.system(size: theme.scaledFont(15.5)))
                 .padding(.horizontal, 6)
                 .padding(.top, 4)
 
@@ -331,7 +639,7 @@ struct ChatView: View {
                     HStack(spacing: 4) {
                         Image(systemName: isUploadingAttachment ? "arrow.triangle.2.circlepath" : "paperclip")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color.dsAccent)
+                            .foregroundStyle(theme.accentColor)
                         Text(isUploadingAttachment ? "上传中" : "发文件")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(Color.dsPrimary)
@@ -343,18 +651,33 @@ struct ChatView: View {
                 .glassPressable(scale: 0.94)
 
                 Menu {
-                    Button("deepseek-flash (DeepSeek-V4.1-Flash)") { client.selectedModel = "deepseek-flash" }
-                    Button("deepseek-v4-pro (DeepSeek-V4-Pro)") { client.selectedModel = "deepseek-v4-pro" }
-                    Button("deepseek-chat") { client.selectedModel = "deepseek-chat" }
-                    Button("deepseek-reasoner") { client.selectedModel = "deepseek-reasoner" }
+                    if !client.modelProfiles.isEmpty {
+                        ForEach(client.modelProfiles) { prof in
+                            Button {
+                                Task { await client.switchModelProfile(prof) }
+                            } label: {
+                                HStack {
+                                    Text(prof.name)
+                                    if prof.id == client.activeProfileId {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        Button("deepseek-flash") { client.selectedModel = "deepseek-flash" }
+                        Button("deepseek-chat") { client.selectedModel = "deepseek-chat" }
+                        Button("deepseek-reasoner") { client.selectedModel = "deepseek-reasoner" }
+                    }
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "sparkles")
                             .font(.system(size: 11, weight: .semibold))
-                            .foregroundStyle(Color.dsAccent)
+                            .foregroundStyle(theme.accentColor)
                         Text(client.selectedModel)
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(Color.dsPrimary)
+                            .lineLimit(1)
                         Image(systemName: "chevron.up.chevron.down")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundStyle(.secondary)
@@ -364,7 +687,42 @@ struct ChatView: View {
                     .cleanWhiteCard(cornerRadius: 999)
                 }
 
+                if theme.autoHideComposer {
+                    Button {
+                        Haptics.light()
+                        isComposerFocused = false
+                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+                            isComposerCollapsed = true
+                        }
+                    } label: {
+                        Image(systemName: "chevron.down.circle")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 Spacer()
+
+                if isRunning && !isEmptyPrompt {
+                    Button {
+                        Haptics.light()
+                        let text = promptText
+                        promptText = ""
+                        Task { await client.sendPrompt(text) }
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "text.badge.plus")
+                                .font(.system(size: 12, weight: .bold))
+                            Text("排队")
+                                .font(.system(size: 11.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 8)
+                        .background(Capsule().fill(theme.accentColor))
+                    }
+                    .glassPressable(scale: 0.92)
+                }
 
                 if isRunning {
                     Button {
@@ -379,12 +737,12 @@ struct ChatView: View {
                             .shadow(color: Color.dsPrimary.opacity(0.25), radius: 6, x: 0, y: 3)
                     }
                     .glassPressable(scale: 0.90)
-                    .transition(.scale.combined(with: .opacity))
                 } else {
                     Button {
                         Haptics.light()
                         let text = promptText
                         promptText = ""
+                        isComposerFocused = false
                         Task { await client.sendPrompt(text) }
                     } label: {
                         Image(systemName: "arrow.up")
@@ -408,13 +766,12 @@ struct ChatView: View {
                     .disabled(isEmptyPrompt)
                     .glassPressable(scale: 0.90)
                     .animation(.spring(response: 0.25, dampingFraction: 0.78), value: isEmptyPrompt)
-                    .transition(.scale.combined(with: .opacity))
                 }
             }
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 9)
-        .liquidGlass(cornerRadius: 24, prominent: true)
+        .liquidGlass(cornerRadius: CGFloat(theme.bubbleRadius + 4), prominent: true)
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
     }
@@ -425,20 +782,22 @@ struct TurnRowView: View {
     var onReviewArtifact: (FileArtifactItem) -> Void
     var onDownloadArtifact: (FileArtifactItem) -> Void
 
+    @ObservedObject private var theme = ThemePreferences.shared
     @State private var expandThoughts: Bool = false
     @State private var expandTools: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let radius = CGFloat(theme.bubbleRadius)
+        VStack(alignment: .leading, spacing: theme.compactMode ? 7 : 10) {
             if let userText = turn.userText, !userText.isEmpty {
                 HStack {
                     Spacer(minLength: 48)
                     Text(userText)
-                        .font(.system(size: 15.5))
+                        .font(.system(size: theme.scaledFont(15.5)))
                         .foregroundStyle(Color.dsPrimary)
                         .padding(.horizontal, 15)
-                        .padding(.vertical, 10.5)
-                        .liquidGlass(cornerRadius: 20, prominent: false)
+                        .padding(.vertical, theme.compactMode ? 8 : 10.5)
+                        .liquidGlass(cornerRadius: radius, prominent: false)
                 }
             }
 
@@ -562,9 +921,9 @@ struct TurnRowView: View {
             if !turn.assistantText.isEmpty {
                 FormattedMarkdownView(markdown: turn.assistantText)
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
+                    .padding(.vertical, theme.compactMode ? 9 : 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .cleanWhiteCard(cornerRadius: 20)
+                    .cleanWhiteCard(cornerRadius: radius)
             }
 
             if let err = turn.errorText {
@@ -814,21 +1173,23 @@ struct ArtifactReviewSheet: View {
 
 struct FormattedMarkdownView: View {
     let markdown: String
+    @ObservedObject private var theme = ThemePreferences.shared
 
     var body: some View {
+        let fSize = theme.scaledFont(15.5)
         if let attr = try? AttributedString(
             markdown: markdown,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
             Text(attr)
-                .font(.system(size: 15.5))
-                .lineSpacing(5)
+                .font(.system(size: fSize))
+                .lineSpacing(theme.compactMode ? 3.5 : 5)
                 .foregroundStyle(Color.dsPrimary)
                 .textSelection(.enabled)
         } else {
             Text(markdown)
-                .font(.system(size: 15.5))
-                .lineSpacing(5)
+                .font(.system(size: fSize))
+                .lineSpacing(theme.compactMode ? 3.5 : 5)
                 .foregroundStyle(Color.dsPrimary)
                 .textSelection(.enabled)
         }

@@ -13,16 +13,19 @@ struct DeepSeekMobileApp: App {
                 .task {
                     await client.bootstrap()
                 }
+                .onOpenURL { url in
+                    client.handleDeepLink(url)
+                }
                 .onChange(of: scenePhase) { newPhase in
                     switch newPhase {
                     case .background, .inactive:
-                        // Doubao-style Dynamic Island: only appears when switched to background while AI is running
                         LiveActivityController.shared.setSceneBackground(true)
                     case .active:
-                        // Immediately retract Dynamic Island when returning to foreground
                         LiveActivityController.shared.setSceneBackground(false)
                         if client.isAuthenticated {
-                            client.connectWebSocket(reset: false)
+                            Task {
+                                await client.recoverRouteAndSocket(reason: "foreground_resume")
+                            }
                         }
                     @unknown default:
                         break

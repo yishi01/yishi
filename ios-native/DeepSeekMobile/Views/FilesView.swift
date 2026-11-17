@@ -79,7 +79,7 @@ struct FilesView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 }
 
-                // 3. Parent Directory Row
+                // 3. Parent Directory Row (Single-Tap Immediate Response)
                 if !client.currentParentDir.isEmpty {
                     Button {
                         Haptics.light()
@@ -89,9 +89,9 @@ struct FilesView: View {
                             Image(systemName: "arrow.turn.up.left")
                                 .font(.system(size: 14, weight: .semibold))
                                 .foregroundStyle(Color.dsAccent)
-                                .frame(width: 32, height: 32)
-                                .background(Circle().fill(Color.white.opacity(0.70)))
-                            VStack(alignment: .leading, spacing: 1) {
+                                .frame(width: 34, height: 34)
+                                .background(Circle().fill(Color.white.opacity(0.75)))
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(".. (返回上一级)")
                                     .font(.system(size: 14.5, weight: .semibold))
                                     .foregroundStyle(Color.dsPrimary)
@@ -101,12 +101,17 @@ struct FilesView: View {
                                     .lineLimit(1)
                             }
                             Spacer()
+                            if client.isLoadingDirectory {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
                         }
                         .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 11)
+                        .contentShape(Rectangle())
                         .cleanWhiteCard(cornerRadius: 16)
                     }
-                    .glassPressable(scale: 0.98)
+                    .buttonStyle(SingleTapRowButtonStyle())
                 }
 
                 // 4. File & Directory Entries
@@ -117,7 +122,6 @@ struct FilesView: View {
             .padding(.horizontal, 14)
             .padding(.top, 8)
             .padding(.bottom, client.clipboard != nil ? 140 : 88)
-            .animation(.spring(response: 0.32, dampingFraction: 0.84), value: client.currentDir)
         }
         .safeAreaInset(edge: .top, spacing: 0) {
             filesTopToolbar
@@ -231,15 +235,33 @@ struct FilesView: View {
 
     private var filesTopToolbar: some View {
         HStack(spacing: 8) {
+            if !client.currentParentDir.isEmpty {
+                Button {
+                    Haptics.light()
+                    Task { await client.loadPCDirectory(client.currentParentDir) }
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(Color.dsPrimary)
+                        .frame(width: 36, height: 36)
+                        .cleanWhiteCard(cornerRadius: 999)
+                }
+                .buttonStyle(SingleTapRowButtonStyle())
+            }
+
             HStack(spacing: 7) {
-                Image(systemName: "externaldrive.fill.badge.wifi")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.dsAccent)
-                Text("电脑全盘文件管理")
-                    .font(.system(size: 14, weight: .semibold))
+                if client.isLoadingDirectory {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "externaldrive.fill.badge.wifi")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.dsAccent)
+                }
+                Text("电脑全盘文件")
+                    .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(Color.dsPrimary)
             }
-            .padding(.horizontal, 13)
+            .padding(.horizontal, 12)
             .padding(.vertical, 8.5)
             .liquidGlass(cornerRadius: 999, prominent: false)
 
@@ -354,7 +376,7 @@ struct FilesView: View {
                             .padding(.vertical, 9)
                             .liquidGlass(cornerRadius: 16, prominent: isSelected)
                         }
-                        .glassPressable(scale: 0.96)
+                        .buttonStyle(SingleTapRowButtonStyle())
                     }
                 }
             }
@@ -379,7 +401,7 @@ struct FilesView: View {
                             .padding(.vertical, 6)
                             .cleanWhiteCard(cornerRadius: 999)
                         }
-                        .glassPressable(scale: 0.95)
+                        .buttonStyle(SingleTapRowButtonStyle())
                     }
                 }
             }
@@ -509,8 +531,9 @@ struct FilesView: View {
                     }
                     Spacer()
                 }
+                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(SingleTapRowButtonStyle())
 
             // Context Action Menu Button
             Menu {
@@ -586,8 +609,10 @@ struct FilesView: View {
                 Image(systemName: "ellipsis.circle")
                     .font(.system(size: 18))
                     .foregroundStyle(.secondary)
-                    .frame(width: 32, height: 32)
+                    .frame(width: 38, height: 38)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.borderless)
         }
         .padding(.horizontal, 13)
         .padding(.vertical, 10)

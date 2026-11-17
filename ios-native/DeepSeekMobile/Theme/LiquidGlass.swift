@@ -1,33 +1,138 @@
 import SwiftUI
 import UIKit
 
-// MARK: - iOS Liquid Glass Design System
-// - Adopts Apple's native iOS 26+ `.glassEffect(.regular.tint(...), in:)` optical refraction when available.
-// - Falls back cleanly on iOS 16-25 to a 4-layer optical glass simulation (.ultraThinMaterial + caustic highlight + dual specular rim).
-// - All decorative backdrop and highlight layers disable hit-testing so buttons and inputs inside glass cards never block taps.
+// MARK: - Appearance & Interaction Customization Store
+
+enum AccentThemeOption: String, CaseIterable, Identifiable {
+    case blue = "blue"
+    case indigo = "indigo"
+    case teal = "teal"
+    case violet = "violet"
+    case emerald = "emerald"
+    case rose = "rose"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .blue: return "晴空蓝"
+        case .indigo: return "深海靛"
+        case .teal: return "冰川青"
+        case .violet: return "星云紫"
+        case .emerald: return "翡翠绿"
+        case .rose: return "绯樱粉"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .blue: return Color(red: 0.24, green: 0.42, blue: 0.98)
+        case .indigo: return Color(red: 0.34, green: 0.32, blue: 0.94)
+        case .teal: return Color(red: 0.06, green: 0.62, blue: 0.78)
+        case .violet: return Color(red: 0.56, green: 0.30, blue: 0.96)
+        case .emerald: return Color(red: 0.12, green: 0.68, blue: 0.48)
+        case .rose: return Color(red: 0.90, green: 0.28, blue: 0.46)
+        }
+    }
+}
+
+@MainActor
+final class ThemePreferences: ObservableObject {
+    static let shared = ThemePreferences()
+
+    @AppStorage("ds_theme_accent") var accentId: String = "blue" {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_glass_intensity") var glassIntensity: Double = 0.85 {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_font_scale") var fontScale: Double = 1.0 {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_bubble_radius") var bubbleRadius: Double = 20.0 {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_compact_mode") var compactMode: Bool = false {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_auto_hide_composer") var autoHideComposer: Bool = true {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_auto_hide_delay") var autoHideDelaySec: Double = 4.0 {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_dynamic_island") var enableDynamicIsland: Bool = true {
+        didSet { objectWillChange.send() }
+    }
+    @AppStorage("ds_theme_haptics") var enableHaptics: Bool = true {
+        didSet { objectWillChange.send() }
+    }
+
+    var accentOption: AccentThemeOption {
+        AccentThemeOption(rawValue: accentId) ?? .blue
+    }
+
+    var accentColor: Color {
+        accentOption.color
+    }
+
+    func scaledFont(_ base: CGFloat) -> CGFloat {
+        max(10.0, min(28.0, base * CGFloat(fontScale)))
+    }
+
+    func resetDefaults() {
+        accentId = "blue"
+        glassIntensity = 0.85
+        fontScale = 1.0
+        bubbleRadius = 20.0
+        compactMode = false
+        autoHideComposer = true
+        autoHideDelaySec = 4.0
+        enableDynamicIsland = true
+        enableHaptics = true
+    }
+
+    private init() {}
+}
 
 enum Haptics {
+    private static var enabled: Bool {
+        if let v = UserDefaults.standard.object(forKey: "ds_theme_haptics") as? Bool {
+            return v
+        }
+        return true
+    }
+
     static func light() {
+        guard enabled else { return }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     static func medium() {
+        guard enabled else { return }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
     static func success() {
+        guard enabled else { return }
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
     static func warning() {
+        guard enabled else { return }
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 }
 
-// MARK: - Ambient Light Backdrop (White-Dominant with Soft Refractive Light Orbs)
+// MARK: - Ambient Light Backdrop (Reactive to Theme Accent & Glass Intensity)
 
 struct LiquidGlassBackdropView: View {
+    @ObservedObject private var theme = ThemePreferences.shared
+
     var body: some View {
+        let accent = theme.accentColor
+        let orbScale = max(0.35, min(1.3, theme.glassIntensity))
+
         GeometryReader { geo in
             ZStack {
                 LinearGradient(
@@ -40,28 +145,26 @@ struct LiquidGlassBackdropView: View {
                     endPoint: .bottomTrailing
                 )
 
-                // Top-left icy sapphire refraction bloom
                 Circle()
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color(red: 0.62, green: 0.78, blue: 1.0).opacity(0.46),
-                                Color(red: 0.62, green: 0.78, blue: 1.0).opacity(0.0),
+                                accent.opacity(0.24 * orbScale),
+                                accent.opacity(0.0),
                             ],
                             center: .center,
                             startRadius: 10,
-                            endRadius: 210
+                            endRadius: 215
                         )
                     )
                     .frame(width: 380, height: 380)
                     .position(x: geo.size.width * 0.14, y: geo.size.height * 0.12)
 
-                // Center-right soft periwinkle/lavender refraction bloom
                 Circle()
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color(red: 0.78, green: 0.74, blue: 1.0).opacity(0.36),
+                                Color(red: 0.78, green: 0.74, blue: 1.0).opacity(0.36 * orbScale),
                                 Color(red: 0.78, green: 0.74, blue: 1.0).opacity(0.0),
                             ],
                             center: .center,
@@ -72,17 +175,16 @@ struct LiquidGlassBackdropView: View {
                     .frame(width: 350, height: 350)
                     .position(x: geo.size.width * 0.88, y: geo.size.height * 0.45)
 
-                // Bottom-left cool aqua refraction bloom
                 Circle()
                     .fill(
                         RadialGradient(
                             colors: [
-                                Color(red: 0.66, green: 0.87, blue: 0.99).opacity(0.42),
-                                Color(red: 0.66, green: 0.87, blue: 0.99).opacity(0.0),
+                                accent.opacity(0.18 * orbScale),
+                                accent.opacity(0.0),
                             ],
                             center: .center,
                             startRadius: 10,
-                            endRadius: 200
+                            endRadius: 205
                         )
                     )
                     .frame(width: 360, height: 360)
@@ -102,10 +204,12 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
     var cornerRadius: CGFloat = 24
     var tintOpacity: Double = 0.54
     var prominent: Bool = false
+    @ObservedObject private var theme = ThemePreferences.shared
 
     @ViewBuilder
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let alphaAdjust = max(0.32, min(0.88, tintOpacity * (1.28 - 0.34 * theme.glassIntensity)))
         #if compiler(>=6.2)
         if #available(iOS 26.0, *) {
             content
@@ -120,14 +224,14 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                     y: prominent ? 7 : 4
                 )
         } else {
-            fallbackGlassBody(content: content, shape: shape)
+            fallbackGlassBody(content: content, shape: shape, effOpacity: alphaAdjust)
         }
         #else
-        fallbackGlassBody(content: content, shape: shape)
+        fallbackGlassBody(content: content, shape: shape, effOpacity: alphaAdjust)
         #endif
     }
 
-    private func fallbackGlassBody(content: Content, shape: RoundedRectangle) -> some View {
+    private func fallbackGlassBody(content: Content, shape: RoundedRectangle, effOpacity: Double) -> some View {
         content
             .background(
                 ZStack {
@@ -136,9 +240,9 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
                     shape.fill(
                         LinearGradient(
                             colors: [
-                                Color.white.opacity(tintOpacity + 0.14),
-                                Color.white.opacity(tintOpacity - 0.12),
-                                Color(red: 0.94, green: 0.97, blue: 1.0).opacity(tintOpacity),
+                                Color.white.opacity(min(0.95, effOpacity + 0.14)),
+                                Color.white.opacity(max(0.18, effOpacity - 0.12)),
+                                Color(red: 0.94, green: 0.97, blue: 1.0).opacity(effOpacity),
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
@@ -190,7 +294,7 @@ struct LiquidGlassCapsuleModifier: ViewModifier {
     }
 }
 
-// MARK: - Interactive Liquid Glass Press Button Style (Moderate Spring Animation)
+// MARK: - Button Styles
 
 struct LiquidGlassPressButtonStyle: ButtonStyle {
     var scaleAmount: CGFloat = 0.96
@@ -200,7 +304,16 @@ struct LiquidGlassPressButtonStyle: ButtonStyle {
             .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed ? scaleAmount : 1.0)
             .brightness(configuration.isPressed ? 0.03 : 0.0)
-            .animation(.spring(response: 0.26, dampingFraction: 0.76), value: configuration.isPressed)
+            .animation(.spring(response: 0.24, dampingFraction: 0.78), value: configuration.isPressed)
+    }
+}
+
+/// Immediate single-tap row style for ScrollView/List items (zero scale animation lag or gesture theft).
+struct SingleTapRowButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed ? 0.65 : 1.0)
     }
 }
 
@@ -219,7 +332,10 @@ extension View {
 }
 
 extension Color {
-    static let dsAccent = Color(red: 0.26, green: 0.40, blue: 0.98)
+    static var dsAccent: Color {
+        let raw = UserDefaults.standard.string(forKey: "ds_theme_accent") ?? "blue"
+        return (AccentThemeOption(rawValue: raw) ?? .blue).color
+    }
     static let dsSurface = Color.white.opacity(0.46)
     static let dsSurface2 = Color.white.opacity(0.62)
     static let dsBorder = Color.white.opacity(0.75)

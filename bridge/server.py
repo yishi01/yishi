@@ -31,6 +31,16 @@ from pydantic import BaseModel, Field
 
 from bridge.config import VERSION, BridgeConfig, ConfigStore
 from bridge.deepseek_agent import SessionManager
+from bridge.log_service import (
+    collect_pc_diagnostics,
+    get_diagnostics_tracker,
+    get_log_handler,
+    install_log_capture,
+    run_pc_self_check,
+)
+from bridge.plugin_service import PluginService
+from bridge.sandbox_runner import SandboxRunner, audit_untrusted_code
+from bridge.search_service import execute_web_search
 from bridge.tunnel_manager import TunnelManager
 from bridge.fs_service import (
     FileConflictError,
@@ -73,6 +83,90 @@ class SettingsUpdateRequest(BaseModel):
     enable_tunnel: bool | None = None
     cloudflared_token: str | None = None
     public_url: str | None = None
+    active_profile_id: str | None = None
+    model_profiles: list[dict[str, Any]] | None = None
+    search_config: dict[str, Any] | None = None
+    appearance_config: dict[str, Any] | None = None
+    dsh_profile_dir: str | None = None
+
+
+class ProviderTestRequest(BaseModel):
+    profile_id: str | None = None
+    provider: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
+class SearchTestRequest(BaseModel):
+    query: str
+    search_config: dict[str, Any] | None = None
+    max_results: int = 5
+
+
+class PluginInstallRequest(BaseModel):
+    source_type: str = "inline"  # upload | local_path | git | inline
+    name: str = ""
+    description: str = ""
+    local_path: str = ""
+    git_url: str = ""
+    branch: str = ""
+    filename: str = ""
+    content_base64: str = ""
+    skill_markdown: str = ""
+    script_code: str = ""
+    script_language: str = "python"
+    config: dict[str, Any] | None = None
+    env: dict[str, str] | None = None
+
+
+class PluginToggleRequest(BaseModel):
+    enabled: bool
+
+
+class PluginConfigUpdateRequest(BaseModel):
+    config: dict[str, Any] | None = None
+    env: dict[str, str] | None = None
+    enabled: bool | None = None
+
+
+class PluginRunRequest(BaseModel):
+    tool_name: str = ""
+    args: list[str] = Field(default_factory=list)
+    stdin_text: str = ""
+    workspace: str | None = None
+    timeout_sec: int = 20
+
+
+class DshToggleRequest(BaseModel):
+    kind: str = "bundle"  # bundle | patch
+    id: str
+    enabled: bool
+
+
+class DshConfigRequest(BaseModel):
+    entry_id: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool | None = None
+
+
+class DshInstallRequest(BaseModel):
+    spec: str
+
+
+class SandboxAuditRequest(BaseModel):
+    code: str
+    language: str = "python"
+    filename: str = ""
+
+
+class SandboxRunRequest(BaseModel):
+    code: str
+    language: str = "python"
+    timeout_sec: int = 10
+    allow_network: bool = False
+    args: list[str] = Field(default_factory=list)
+    stdin_text: str = ""
 
 
 class AuthorizeWorkspaceRequest(BaseModel):
@@ -86,11 +180,14 @@ class CreateSessionRequest(BaseModel):
     title: str = "New Session"
     approval_mode: str | None = None
     model: str | None = None
+    profile_id: str | None = None
 
 
 class SendMessageRequest(BaseModel):
     prompt: str
     model: str | None = None
+    profile_id: str | None = None
+    queue_if_busy: bool = True
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -151,13 +248,40 @@ class PCUploadBase64Request(BaseModel):
 
 
 def create_app(data_dir: Path | None = None) -> FastAPI:
+    install_log_capture()
+    diagnostics_tracker = get_diagnostics_tracker()
     config_store = ConfigStore(data_dir=data_dir)
-    session_manager = SessionManager(config_store)
+    dsh_dir = Path(config_store.config.dsh_profile_dir) if config_store.config.dsh_profile_dir else None
+    plugin_service = PluginService(
+        plugins_dir=config_store.data_dir / "plugins",
+        dsh_profile_dir=dsh_dir,
+    )
+    sandbox_runner = SandboxRunner(base_dir=config_store.data_dir / "sandbox_runs")
+    session_manager = SessionManager(
+        config_store,
+        plugin_service=plugin_service,
+        sandbox_runner=sandbox_runner,
+    )
     tunnel_manager = TunnelManager(config_store)
     web_dir = PROJECT_ROOT / "web"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        loop = asyncio.get_running_loop()
+        prev_handler = loop.get_exception_handler()
+
+        def _quiet_win_socket_handler(el: asyncio.AbstractEventLoop, ctx: dict[str, Any]) -> None:
+            exc = ctx.get("exception")
+            if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+                return
+            if isinstance(exc, OSError) and getattr(exc, "winerror", None) in (64, 995, 10053, 10054):
+                return
+            if prev_handler is not None:
+                prev_handler(el, ctx)
+            else:
+                el.default_exception_handler(ctx)
+
+        loop.set_exception_handler(_quiet_win_socket_handler)
         await tunnel_manager.start()
         yield
         await tunnel_manager.stop()
@@ -167,6 +291,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.state.config_store = config_store
     app.state.session_manager = session_manager
     app.state.tunnel_manager = tunnel_manager
+    app.state.plugin_service = plugin_service
+    app.state.sandbox_runner = sandbox_runner
 
     app.add_middleware(
         CORSMiddleware,
@@ -177,8 +303,9 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     )
 
     @app.middleware("http")
-    async def no_cache_static(request, call_next):
+    async def no_cache_static(request: Request, call_next):
         response = await call_next(request)
+        diagnostics_tracker.http_completed(response.status_code, str(request.url.path))
         if request.url.path in ("/", "/index.html", "/app.js", "/styles.css", "/sw.js"):
             response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response
@@ -366,8 +493,324 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if body.public_url is not None:
             cfg_data["public_url"] = body.public_url.strip().rstrip("/")
 
-        updated = config_store.save(BridgeConfig(**cfg_data))
+        if body.model_profiles is not None:
+            old_map = {
+                str(p.get("id") or ""): p
+                for p in (cfg_data.get("model_profiles") or [])
+                if isinstance(p, dict)
+            }
+            cleaned_profiles: list[dict[str, Any]] = []
+            for raw_p in body.model_profiles:
+                if not isinstance(raw_p, dict):
+                    continue
+                pid = str(raw_p.get("id") or "").strip()
+                if not pid:
+                    continue
+                prev_key = str(old_map.get(pid, {}).get("api_key") or "")
+                new_key_raw = str(raw_p.get("api_key") or "").strip()
+                clear_flag = bool(raw_p.get("clear_api_key", False))
+                final_key = "" if clear_flag else (new_key_raw if new_key_raw else prev_key)
+                cleaned_profiles.append(
+                    {
+                        "id": pid,
+                        "name": str(raw_p.get("name") or pid).strip(),
+                        "provider": str(raw_p.get("provider") or "openai_compatible").strip(),
+                        "base_url": str(raw_p.get("base_url") or "").strip().rstrip("/"),
+                        "api_key": final_key,
+                        "model": str(raw_p.get("model") or "").strip(),
+                        "temperature": float(raw_p.get("temperature") if raw_p.get("temperature") is not None else 0.7),
+                        "max_tokens": int(raw_p.get("max_tokens") or 8192),
+                        "supports_tools": bool(raw_p.get("supports_tools", True)),
+                        "supports_reasoning": bool(raw_p.get("supports_reasoning", False)),
+                    }
+                )
+            if cleaned_profiles:
+                cfg_data["model_profiles"] = cleaned_profiles
+
+        if body.search_config is not None and isinstance(body.search_config, dict):
+            old_sc = dict(cfg_data.get("search_config") or {})
+            new_sc = dict(body.search_config)
+            clear_sk = bool(new_sc.pop("clear_api_key", False))
+            new_sk = str(new_sc.get("api_key") or "").strip()
+            new_sc.pop("has_api_key", None)
+            new_sc.pop("api_key_masked", None)
+            merged_sc = {**old_sc, **new_sc}
+            merged_sc["api_key"] = "" if clear_sk else (new_sk if new_sk else str(old_sc.get("api_key") or ""))
+            cfg_data["search_config"] = merged_sc
+
+        if body.appearance_config is not None and isinstance(body.appearance_config, dict):
+            old_app = dict(cfg_data.get("appearance_config") or {})
+            cfg_data["appearance_config"] = {**old_app, **body.appearance_config}
+
+        if body.dsh_profile_dir is not None and body.dsh_profile_dir.strip():
+            cfg_data["dsh_profile_dir"] = body.dsh_profile_dir.strip()
+            plugin_service.set_paths(dsh_profile_dir=Path(cfg_data["dsh_profile_dir"]))
+
+        cfg_obj = BridgeConfig(**cfg_data)
+        if body.active_profile_id is not None and body.active_profile_id.strip():
+            cfg_obj.apply_active_profile(body.active_profile_id.strip())
+        elif body.model is not None:
+            matched = next(
+                (p.get("id") for p in cfg_obj.model_profiles if p.get("model") == cfg_obj.model),
+                None,
+            )
+            if matched:
+                cfg_obj.active_profile_id = str(matched)
+
+        if body.deepseek_base_url is not None and body.deepseek_base_url.strip():
+            clean_url = body.deepseek_base_url.strip().rstrip("/")
+            cfg_obj.deepseek_base_url = clean_url
+            for prof in cfg_obj.model_profiles:
+                if prof.get("id") == cfg_obj.active_profile_id and prof.get("provider", "openai_compatible") == "openai_compatible":
+                    prof["base_url"] = clean_url
+                    break
+
+        updated = config_store.save(cfg_obj)
         return updated.to_public_dict()
+
+    @app.post("/api/providers/test", dependencies=[Depends(require_auth)])
+    async def api_test_provider(body: ProviderTestRequest) -> dict[str, Any]:
+        import time as _time
+        import httpx
+
+        cfg = config_store.config
+        creds = cfg.resolve_credentials(profile_id=body.profile_id, model_override=body.model)
+        provider = (body.provider or creds["provider"]).strip()
+        base_url = (body.base_url or creds["base_url"]).strip().rstrip("/")
+        api_key = (body.api_key or creds["api_key"]).strip()
+        model = (body.model or creds["model"]).strip()
+        if not api_key:
+            return {"ok": False, "status_code": 0, "latency_ms": 0.0, "detail": "未填写 API Key"}
+
+        started = _time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=12.0, http2=False) as client:
+                if provider == "anthropic":
+                    url = f"{base_url}/messages" if base_url.endswith("/v1") else f"{base_url}/v1/messages"
+                    resp = await client.post(
+                        url,
+                        headers={
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": model,
+                            "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "ping"}],
+                        },
+                    )
+                else:
+                    url = f"{base_url}/models"
+                    resp = await client.get(url, headers={"Authorization": f"Bearer {api_key}"})
+                    if resp.status_code == 404 or resp.status_code == 405:
+                        # Fallback to tiny non-streaming chat completion probe
+                        resp = await client.post(
+                            f"{base_url}/chat/completions",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json={"model": model, "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]},
+                        )
+            ms = round((_time.perf_counter() - started) * 1000, 1)
+            ok = 200 <= resp.status_code < 300
+            detail = f"HTTP {resp.status_code} 连通成功 ({model})" if ok else f"HTTP {resp.status_code}: {resp.text[:300]}"
+            return {"ok": ok, "status_code": resp.status_code, "latency_ms": ms, "detail": detail}
+        except Exception as exc:
+            ms = round((_time.perf_counter() - started) * 1000, 1)
+            return {"ok": False, "status_code": 0, "latency_ms": ms, "detail": str(exc)}
+
+    @app.post("/api/search/test", dependencies=[Depends(require_auth)])
+    async def api_test_search(body: SearchTestRequest) -> dict[str, Any]:
+        sc = dict(config_store.config.search_config)
+        if body.search_config:
+            incoming = dict(body.search_config)
+            if not str(incoming.get("api_key") or "").strip() and sc.get("api_key"):
+                incoming["api_key"] = sc["api_key"]
+            sc.update(incoming)
+        return await execute_web_search(body.query.strip() or "DeepSeek", sc, max_results=body.max_results)
+
+    # --- PC DSH Plugins & Sandbox Simulator APIs ---
+
+    @app.get("/api/plugins", dependencies=[Depends(require_auth)])
+    def api_list_plugins() -> dict[str, Any]:
+        return plugin_service.list_all()
+
+    @app.post("/api/plugins/install", dependencies=[Depends(require_auth)])
+    async def api_install_plugin(body: PluginInstallRequest) -> dict[str, Any]:
+        stype = (body.source_type or "inline").lower()
+        try:
+            if stype == "upload":
+                if not body.filename or not body.content_base64:
+                    raise HTTPException(status_code=400, detail="上传插件需要 filename 与 content_base64")
+                plugin = await asyncio.to_thread(
+                    plugin_service.install_from_upload,
+                    filename=body.filename,
+                    content_base64=body.content_base64,
+                    name=body.name,
+                    description=body.description,
+                    config=body.config,
+                )
+            elif stype == "local_path":
+                plugin = await asyncio.to_thread(
+                    plugin_service.install_from_local_path,
+                    body.local_path,
+                    name=body.name,
+                    config=body.config,
+                )
+            elif stype == "git":
+                plugin = await asyncio.to_thread(
+                    plugin_service.install_from_git,
+                    body.git_url,
+                    name=body.name,
+                    branch=body.branch,
+                    config=body.config,
+                )
+            else:
+                if not body.name.strip():
+                    raise HTTPException(status_code=400, detail="请填写插件名称")
+                plugin = await asyncio.to_thread(
+                    plugin_service.install_inline,
+                    name=body.name,
+                    description=body.description,
+                    skill_markdown=body.skill_markdown,
+                    script_code=body.script_code,
+                    script_language=body.script_language,
+                    config=body.config,
+                    env=body.env,
+                )
+            logging.getLogger("bridge").info("Installed PC plugin '%s' via %s", plugin.get("id"), stype)
+            return {"ok": True, "plugin": plugin, **plugin_service.list_all()}
+        except HTTPException:
+            raise
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/dsh/toggle", dependencies=[Depends(require_auth)])
+    def api_dsh_toggle(body: DshToggleRequest) -> dict[str, Any]:
+        try:
+            if body.kind == "bundle":
+                prof = plugin_service.toggle_dsh_bundle(body.id, body.enabled)
+            else:
+                prof = plugin_service.update_dsh_patch_entry(body.id, enabled=body.enabled)
+            return {"ok": True, "dsh_profile": prof}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/plugins/dsh/config", dependencies=[Depends(require_auth)])
+    def api_dsh_config(body: DshConfigRequest) -> dict[str, Any]:
+        try:
+            prof = plugin_service.update_dsh_patch_entry(
+                body.entry_id, enabled=body.enabled, config=body.config
+            )
+            return {"ok": True, "dsh_profile": prof}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/dsh/install", dependencies=[Depends(require_auth)])
+    async def api_dsh_install(body: DshInstallRequest) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(plugin_service.install_dsh_package, body.spec)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/toggle", dependencies=[Depends(require_auth)])
+    def api_toggle_plugin(plugin_id: str, body: PluginToggleRequest) -> dict[str, Any]:
+        try:
+            plugin = plugin_service.toggle_plugin(plugin_id, body.enabled)
+            return {"ok": True, "plugin": plugin, **plugin_service.list_all()}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.put("/api/plugins/{plugin_id}/config", dependencies=[Depends(require_auth)])
+    def api_update_plugin_config(plugin_id: str, body: PluginConfigUpdateRequest) -> dict[str, Any]:
+        try:
+            plugin = plugin_service.update_plugin_config(
+                plugin_id, config=body.config, env=body.env, enabled=body.enabled
+            )
+            return {"ok": True, "plugin": plugin, **plugin_service.list_all()}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/plugins/{plugin_id}/run", dependencies=[Depends(require_auth)])
+    async def api_run_plugin(plugin_id: str, body: PluginRunRequest) -> dict[str, Any]:
+        try:
+            ws_dir = body.workspace or config_store.config.effective_active_workspace()
+            return await asyncio.to_thread(
+                plugin_service.run_plugin_tool,
+                plugin_id,
+                tool_name=body.tool_name,
+                args=body.args,
+                stdin_text=body.stdin_text,
+                workspace_cwd=ws_dir,
+                timeout_sec=body.timeout_sec,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.delete("/api/plugins/{plugin_id}", dependencies=[Depends(require_auth)])
+    def api_delete_plugin(plugin_id: str) -> dict[str, Any]:
+        try:
+            plugin_service.uninstall_plugin(plugin_id)
+            return {"ok": True, **plugin_service.list_all()}
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sandbox/audit", dependencies=[Depends(require_auth)])
+    def api_sandbox_audit(body: SandboxAuditRequest) -> dict[str, Any]:
+        return audit_untrusted_code(body.code, language=body.language, filename=body.filename)
+
+    @app.post("/api/sandbox/run", dependencies=[Depends(require_auth)])
+    async def api_sandbox_run(body: SandboxRunRequest) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            sandbox_runner.run_sandbox_script,
+            body.code,
+            body.language,
+            timeout_sec=body.timeout_sec,
+            allow_network=body.allow_network,
+            args=body.args,
+            stdin_text=body.stdin_text,
+        )
+
+    # --- Diagnostics & Logs APIs ---
+
+    @app.get("/api/diagnostics/status", dependencies=[Depends(require_auth)])
+    def api_diagnostics_status() -> dict[str, Any]:
+        return collect_pc_diagnostics(
+            version=VERSION,
+            cfg=config_store.config,
+            tunnel_status=tunnel_manager.info(),
+            sessions=session_manager.list_sessions(),
+            plugins_summary=plugin_service.summary(),
+        )
+
+    @app.get("/api/diagnostics/logs", dependencies=[Depends(require_auth)])
+    def api_diagnostics_logs(
+        level: str | None = Query(default=None),
+        q: str | None = Query(default=None),
+        after_seq: int = Query(default=0, ge=0),
+        limit: int = Query(default=150, ge=1, le=500),
+    ) -> dict[str, Any]:
+        handler = get_log_handler()
+        return {"logs": handler.query(level=level, search=q, after_seq=after_seq, limit=limit)}
+
+    @app.delete("/api/diagnostics/logs", dependencies=[Depends(require_auth)])
+    def api_diagnostics_clear_logs() -> dict[str, Any]:
+        cleared = get_log_handler().clear()
+        return {"ok": True, "cleared": cleared}
+
+    @app.post("/api/diagnostics/selfcheck", dependencies=[Depends(require_auth)])
+    async def api_diagnostics_selfcheck() -> dict[str, Any]:
+        return await run_pc_self_check(
+            cfg=config_store.config,
+            tunnel_status=tunnel_manager.info(),
+            plugin_service=plugin_service,
+            sandbox_runner=sandbox_runner,
+        )
 
     @app.post("/api/workspaces/authorize", dependencies=[Depends(require_auth)])
     def authorize_workspace(body: AuthorizeWorkspaceRequest) -> dict[str, Any]:
@@ -672,6 +1115,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             title=body.title,
             approval_mode=body.approval_mode,
             model=body.model,
+            profile_id=body.profile_id,
         )
         return sess.summary()
 
@@ -704,12 +1148,58 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         try:
-            ev = await sess.send_prompt(body.prompt, model=body.model)
-            return {"event": ev, "session": sess.summary()}
+            ev = await sess.send_prompt(
+                body.prompt,
+                model=body.model,
+                profile_id=body.profile_id,
+                queue_if_busy=body.queue_if_busy,
+            )
+            return {
+                "event": ev,
+                "queued": bool(ev.get("queued", False)),
+                "queue_item": ev.get("queue_item"),
+                "session": sess.summary(),
+            }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/queue", dependencies=[Depends(require_auth)])
+    def api_list_queue(session_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"queued_messages": sess.list_queue(), "session": sess.summary()}
+
+    @app.post("/api/sessions/{session_id}/queue/{item_id}/send_now", dependencies=[Depends(require_auth)])
+    async def api_send_queued_now(session_id: str, item_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+            res = await sess.send_queued_now(item_id)
+            return {"ok": True, "result": res, "session": sess.summary()}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/sessions/{session_id}/queue/{item_id}", dependencies=[Depends(require_auth)])
+    def api_delete_queued_item(session_id: str, item_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not sess.remove_queued_item(item_id):
+            raise HTTPException(status_code=404, detail="Queue item not found")
+        return {"ok": True, "session": sess.summary()}
+
+    @app.delete("/api/sessions/{session_id}/queue", dependencies=[Depends(require_auth)])
+    def api_clear_queue(session_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cleared = sess.clear_queue()
+        return {"ok": True, "cleared": cleared, "session": sess.summary()}
 
     @app.post("/api/sessions/{session_id}/cancel", dependencies=[Depends(require_auth)])
     async def api_cancel_turn(session_id: str) -> dict[str, Any]:
@@ -776,28 +1266,98 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             return
 
         await websocket.accept()
+        diagnostics_tracker.ws_connected(is_reconnect=after_seq > 0)
         queue = sess.subscribe()
+        send_lock = asyncio.Lock()
+        disconnect_reason = "closed"
+
+        async def _safe_send(payload: dict[str, Any]) -> bool:
+            try:
+                async with send_lock:
+                    await websocket.send_json(payload)
+                return True
+            except (WebSocketDisconnect, ConnectionResetError, BrokenPipeError, RuntimeError, OSError):
+                return False
+
+        async def _sender_loop(start_seq: int) -> None:
+            last_sent = start_seq
+            while True:
+                try:
+                    ev = await asyncio.wait_for(queue.get(), timeout=12.0)
+                    if ev["seq"] > last_sent:
+                        if not await _safe_send(ev):
+                            return
+                        last_sent = ev["seq"]
+                except asyncio.TimeoutError:
+                    if not await _safe_send({"type": "ping", "ts": asyncio.get_running_loop().time()}):
+                        return
+
+        async def _receiver_loop() -> None:
+            nonlocal disconnect_reason
+            try:
+                while True:
+                    msg = await websocket.receive_text()
+                    trimmed = msg.strip()
+                    if trimmed == "ping" or '"ping"' in trimmed:
+                        if not await _safe_send({"type": "pong"}):
+                            return
+            except WebSocketDisconnect as exc:
+                disconnect_reason = f"ws_disconnect:{exc.code}"
+            except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError) as exc:
+                disconnect_reason = f"socket:{type(exc).__name__}"
+            except asyncio.CancelledError:
+                return
+
+        sender_task: asyncio.Task[None] | None = None
+        receiver_task: asyncio.Task[None] | None = None
         try:
             missed = sess.get_events_after(after_seq)
             last_sent = after_seq
             for ev in missed:
-                await websocket.send_json(ev)
+                if not await _safe_send(ev):
+                    disconnect_reason = "send_missed_failed"
+                    return
                 last_sent = max(last_sent, ev["seq"])
 
-            await websocket.send_json({"type": "sync_complete", "session": sess.summary()})
+            if not await _safe_send({"type": "sync_complete", "session": sess.summary()}):
+                disconnect_reason = "send_sync_failed"
+                return
 
-            while True:
+            sender_task = asyncio.create_task(_sender_loop(last_sent))
+            receiver_task = asyncio.create_task(_receiver_loop())
+            done, pending = await asyncio.wait(
+                [sender_task, receiver_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
                 try:
-                    ev = await asyncio.wait_for(queue.get(), timeout=25.0)
-                    if ev["seq"] > last_sent:
-                        await websocket.send_json(ev)
-                        last_sent = ev["seq"]
-                except asyncio.TimeoutError:
-                    await websocket.send_json({"type": "ping"})
-        except WebSocketDisconnect:
-            pass
+                    await p
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for d in done:
+                try:
+                    exc = d.exception()
+                except asyncio.CancelledError:
+                    exc = None
+                if exc and not isinstance(exc, (WebSocketDisconnect, ConnectionResetError, BrokenPipeError)):
+                    disconnect_reason = f"{type(exc).__name__}: {exc}"
+        except WebSocketDisconnect as exc:
+            disconnect_reason = f"ws_disconnect:{exc.code}"
+        except (ConnectionResetError, BrokenPipeError, RuntimeError, OSError) as exc:
+            disconnect_reason = f"socket:{type(exc).__name__}"
+        except asyncio.CancelledError:
+            disconnect_reason = "cancelled"
         finally:
+            for t in (sender_task, receiver_task):
+                if t and not t.done():
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
             sess.unsubscribe(queue)
+            diagnostics_tracker.ws_disconnected(disconnect_reason)
 
     # --- Static PWA Frontend ---
 

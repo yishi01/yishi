@@ -3,12 +3,7 @@ import AVFoundation
 import Foundation
 import UIKit
 
-/// Doubao-style Dynamic Island Controller for Unjailbroken iOS:
-/// 1. Only shows Dynamic Island when the app switches to background AND AI is actively running.
-/// 2. Displays ONLY the minimal phase (深度思考 / 工具调用 / 待确认), never verbose content.
-/// 3. When output finishes in background, shows "输出完成" for 2.2s and automatically retracts.
-/// 4. Uses a zero-volume mixWithOthers audio session while running in background so unjailbroken iOS
-///    does not freeze the WebSocket before "输出完成" retracts the island.
+/// Doubao-style Dynamic Island Controller for Unjailbroken iOS + Pending Approval Review Banner.
 @MainActor
 final class LiveActivityController: ObservableObject {
     static let shared = LiveActivityController()
@@ -24,17 +19,29 @@ final class LiveActivityController: ObservableObject {
     private(set) var latestToolCount: Int = 0
     private(set) var sessionTitle: String = "DeepSeek"
 
+    private(set) var pendingApprovalId: String = ""
+    private(set) var pendingToolName: String = ""
+    private(set) var pendingSummary: String = ""
+    private(set) var pendingRiskLevel: String = ""
+    private(set) var queuedCount: Int = 0
+
+    private var isIslandFeatureEnabled: Bool {
+        if let val = UserDefaults.standard.object(forKey: "ds_theme_dynamic_island") as? Bool {
+            return val
+        }
+        return true
+    }
+
     private init() {}
 
     func setSceneBackground(_ inBackground: Bool) {
         isInBackground = inBackground
         if inBackground {
-            if isTurnActive {
+            if isTurnActive || !pendingApprovalId.isEmpty {
                 startBackgroundKeepAlive()
-                startOrUpdateIsland(phase: latestPhase, toolCount: latestToolCount)
+                startOrUpdateIsland(phase: pendingApprovalId.isEmpty ? latestPhase : .waitingApproval, toolCount: latestToolCount)
             }
         } else {
-            // Returned to foreground: retract Dynamic Island immediately (Doubao behavior)
             retractTask?.cancel()
             retractTask = nil
             stopBackgroundKeepAlive()
@@ -49,6 +56,10 @@ final class LiveActivityController: ObservableObject {
         self.isTurnActive = true
         self.latestPhase = .thinking
         self.latestToolCount = 0
+        self.pendingApprovalId = ""
+        self.pendingToolName = ""
+        self.pendingSummary = ""
+        self.pendingRiskLevel = ""
         retractTask?.cancel()
         retractTask = nil
 
@@ -58,14 +69,48 @@ final class LiveActivityController: ObservableObject {
         }
     }
 
-    func notifyPhaseChanged(_ phase: DeepSeekIslandPhase, toolCount: Int = 0) {
+    func notifyPhaseChanged(
+        _ phase: DeepSeekIslandPhase,
+        toolCount: Int = 0,
+        approvalId: String = "",
+        toolName: String = "",
+        summary: String = "",
+        riskLevel: String = "",
+        queuedCount: Int = 0
+    ) {
         self.latestPhase = phase
         self.latestToolCount = toolCount
-        guard isTurnActive, isInBackground else { return }
+        self.queuedCount = queuedCount
+        if phase == .waitingApproval {
+            self.pendingApprovalId = approvalId
+            self.pendingToolName = toolName
+            self.pendingSummary = summary
+            self.pendingRiskLevel = riskLevel
+        } else {
+            self.pendingApprovalId = ""
+            self.pendingToolName = ""
+            self.pendingSummary = ""
+            self.pendingRiskLevel = ""
+        }
+        guard (isTurnActive || !pendingApprovalId.isEmpty), isInBackground else { return }
         startOrUpdateIsland(phase: phase, toolCount: toolCount)
     }
 
+    func clearPendingApproval() {
+        self.pendingApprovalId = ""
+        self.pendingToolName = ""
+        self.pendingSummary = ""
+        self.pendingRiskLevel = ""
+        if isTurnActive && isInBackground {
+            startOrUpdateIsland(phase: .callingTool, toolCount: latestToolCount)
+        }
+    }
+
     func notifyTurnFinished() {
+        self.pendingApprovalId = ""
+        self.pendingToolName = ""
+        self.pendingSummary = ""
+        self.pendingRiskLevel = ""
         guard isTurnActive else { return }
         isTurnActive = false
         latestPhase = .completed
@@ -76,7 +121,6 @@ final class LiveActivityController: ObservableObject {
             return
         }
 
-        // In background: show "输出完成" briefly (2.2s), then retract the Dynamic Island
         startOrUpdateIsland(phase: .completed, toolCount: latestToolCount)
         retractTask?.cancel()
         retractTask = Task { @MainActor in
@@ -88,8 +132,17 @@ final class LiveActivityController: ObservableObject {
     }
 
     private func startOrUpdateIsland(phase: DeepSeekIslandPhase, toolCount: Int) {
+        guard isIslandFeatureEnabled else { return }
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        let state = DeepSeekIslandAttributes.ContentState(phase: phase, toolCount: toolCount)
+        let state = DeepSeekIslandAttributes.ContentState(
+            phase: phase,
+            toolCount: toolCount,
+            pendingApprovalId: pendingApprovalId,
+            pendingToolName: pendingToolName,
+            pendingSummary: pendingSummary,
+            pendingRiskLevel: pendingRiskLevel,
+            queuedCount: queuedCount
+        )
 
         if let activity = currentActivity {
             Task {
@@ -98,41 +151,37 @@ final class LiveActivityController: ObservableObject {
         } else {
             do {
                 let attrs = DeepSeekIslandAttributes(sessionTitle: sessionTitle)
-                let content = ActivityContent(state: state, staleDate: nil)
-                currentActivity = try Activity.request(
+                let activity = try Activity.request(
                     attributes: attrs,
-                    content: content,
+                    content: ActivityContent(state: state, staleDate: nil),
                     pushType: nil
                 )
-            } catch {
-                // Ignore if Live Activities are disabled by user or signing profile
-            }
+                self.currentActivity = activity
+            } catch {}
         }
     }
 
     private func endIslandImmediately() async {
-        guard let activity = currentActivity else { return }
+        let activities = Activity<DeepSeekIslandAttributes>.activities
+        for act in activities {
+            await act.end(nil, dismissalPolicy: .immediate)
+        }
         currentActivity = nil
-        let finalState = DeepSeekIslandAttributes.ContentState(
-            phase: .completed,
-            toolCount: latestToolCount
-        )
-        await activity.end(
-            ActivityContent(state: finalState, staleDate: nil),
-            dismissalPolicy: .immediate
-        )
     }
-
-    // MARK: - Unjailbroken Background Keep-Alive (Only during active AI turn)
 
     private func startBackgroundKeepAlive() {
         if bgTaskId == .invalid {
-            bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "DeepSeekTurn") { [weak self] in
+            bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "DeepSeekBridgeKeepAlive") { [weak self] in
                 Task { @MainActor in
-                    self?.stopBackgroundKeepAlive()
+                    guard let self = self else { return }
+                    if self.bgTaskId != .invalid {
+                        UIApplication.shared.endBackgroundTask(self.bgTaskId)
+                        self.bgTaskId = .invalid
+                    }
                 }
             }
         }
+
         guard audioEngine == nil else { return }
         do {
             let session = AVAudioSession.sharedInstance()
@@ -140,31 +189,31 @@ final class LiveActivityController: ObservableObject {
             try session.setActive(true)
 
             let engine = AVAudioEngine()
-            let src = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
-                let abl = UnsafeMutableAudioBufferListPointer(audioBufferList)
-                for buf in abl {
-                    if let ptr = buf.mData {
-                        memset(ptr, 0, Int(buf.mDataByteSize))
+            let format = engine.mainMixerNode.outputFormat(forBus: 0)
+            let sampleRate = format.sampleRate > 0 ? format.sampleRate : 44100.0
+            let silenceNode = AVAudioSourceNode { _, _, frameCount, audioBufferList -> OSStatus in
+                let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
+                for buffer in ablPointer {
+                    if let data = buffer.mData {
+                        memset(data, 0, Int(frameCount) * Int(MemoryLayout<Float>.size))
                     }
                 }
                 return noErr
             }
-            engine.attach(src)
-            engine.connect(src, to: engine.mainMixerNode, format: nil)
-            engine.mainMixerNode.outputVolume = 0.0
-            try engine.start()
-            self.audioEngine = engine
-        } catch {
-            // Fallback to standard UIBackgroundTask only
-        }
+            if let sourceFormat = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: format.channelCount) {
+                engine.attach(silenceNode)
+                engine.connect(silenceNode, to: engine.mainMixerNode, format: sourceFormat)
+                engine.mainMixerNode.outputVolume = 0.0
+                try engine.start()
+                self.audioEngine = engine
+            }
+        } catch {}
     }
 
     private func stopBackgroundKeepAlive() {
-        if let engine = audioEngine {
-            engine.stop()
-            audioEngine = nil
-            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        }
+        audioEngine?.stop()
+        audioEngine = nil
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
         if bgTaskId != .invalid {
             UIApplication.shared.endBackgroundTask(bgTaskId)
             bgTaskId = .invalid

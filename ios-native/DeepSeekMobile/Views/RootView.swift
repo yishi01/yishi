@@ -3,12 +3,14 @@ import SwiftUI
 enum MainTab: String, CaseIterable {
     case chat = "对话"
     case files = "文件"
-    case settings = "变更·设置"
+    case plugins = "插件"
+    case settings = "设置"
 
     var icon: String {
         switch self {
         case .chat: return "bubble.left.and.bubble.right"
         case .files: return "folder"
+        case .plugins: return "puzzlepiece.extension"
         case .settings: return "slider.horizontal.3"
         }
     }
@@ -196,6 +198,9 @@ struct RootView: View {
                 case .files:
                     FilesView(activeTab: $activeTab)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
+                case .plugins:
+                    PluginsSimulatorView()
+                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
                 case .settings:
                     GitSettingsView(activeTab: $activeTab)
                         .transition(.opacity.combined(with: .scale(scale: 0.985)))
@@ -204,8 +209,8 @@ struct RootView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .animation(.spring(response: 0.34, dampingFraction: 0.84), value: activeTab)
 
-            // Floating iOS Liquid Glass Tab Bar with Fluid Morphing Droplet Pill
-            HStack(spacing: 4) {
+            // Floating iOS Liquid Glass Tab Bar with 4 Compact Pills
+            HStack(spacing: 3) {
                 ForEach(MainTab.allCases, id: \.self) { tab in
                     let isSelected = (activeTab == tab)
                     Button {
@@ -215,16 +220,16 @@ struct RootView: View {
                             activeTab = tab
                         }
                     } label: {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 5) {
                             Image(systemName: tab.icon)
-                                .font(.system(size: 14.5, weight: isSelected ? .semibold : .regular))
+                                .font(.system(size: 13.5, weight: isSelected ? .semibold : .regular))
                                 .scaleEffect(isSelected ? 1.05 : 1.0)
                             Text(tab.rawValue)
-                                .font(.system(size: 13.5, weight: isSelected ? .semibold : .medium))
+                                .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
                         }
                         .foregroundStyle(isSelected ? Color.dsPrimary : Color.secondary)
-                        .padding(.horizontal, 17)
-                        .padding(.vertical, 10)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 9.5)
                         .background {
                             if isSelected {
                                 Capsule(style: .continuous)
@@ -258,9 +263,30 @@ struct RootView: View {
             .padding(5)
             .liquidGlass(cornerRadius: 999, prominent: true)
             .padding(.bottom, 6)
+
+            if let toast = client.globalToast {
+                VStack {
+                    Text(toast)
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Color.dsPrimary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 9)
+                        .liquidGlass(cornerRadius: 999, prominent: true)
+                        .padding(.top, 56)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
         .sheet(isPresented: $showSessionDrawer) {
             SessionDrawerSheet()
+                .environmentObject(client)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+        }
+        .sheet(item: $client.activeApprovalForPopup) { approval in
+            ApprovalReviewSheet(item: approval)
                 .environmentObject(client)
                 .presentationDetents([.medium, .large])
                 .presentationDragIndicator(.visible)
