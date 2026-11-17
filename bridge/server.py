@@ -168,6 +168,62 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             "port": config_store.config.port,
         }
 
+    @app.get("/install.mobileconfig")
+    def install_mobileconfig(url: str = Query(default="http://dsh-pc/")) -> Response:
+        target_url = url.strip() or "http://dsh-pc/"
+        plist_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>FullScreen</key>
+      <true/>
+      <key>IsRemovable</key>
+      <true/>
+      <key>Label</key>
+      <string>DeepSeek Go</string>
+      <key>PayloadDescription</key>
+      <string>DeepSeek Mobile Bridge 全屏工作台</string>
+      <key>PayloadDisplayName</key>
+      <string>DeepSeek Go</string>
+      <key>PayloadIdentifier</key>
+      <string>com.agy.deepseek.webclip</string>
+      <key>PayloadType</key>
+      <string>com.apple.webClip.managed</string>
+      <key>PayloadUUID</key>
+      <string>8C7F9A21-4E5B-4D3A-9C12-6F0E8B2D4A11</string>
+      <key>PayloadVersion</key>
+      <integer>1</integer>
+      <key>Precomposed</key>
+      <true/>
+      <key>URL</key>
+      <string>{target_url}</string>
+    </dict>
+  </array>
+  <key>PayloadDescription</key>
+  <string>在 iPhone 主屏幕安装全屏版 DeepSeek Go</string>
+  <key>PayloadDisplayName</key>
+  <string>DeepSeek Go 桌面安装文件</string>
+  <key>PayloadIdentifier</key>
+  <string>com.agy.deepseek.profile</string>
+  <key>PayloadRemovalDisallowed</key>
+  <false/>
+  <key>PayloadType</key>
+  <string>Configuration</string>
+  <key>PayloadUUID</key>
+  <string>2A5E7B90-1C3D-4F8E-8A45-9D1C7E6B3F22</string>
+  <key>PayloadVersion</key>
+  <integer>1</integer>
+</dict>
+</plist>"""
+        return Response(
+            content=plist_xml.encode("utf-8"),
+            media_type="application/x-apple-aspen-config",
+            headers={"Content-Disposition": 'attachment; filename="DeepSeekGo.mobileconfig"'},
+        )
+
     @app.post("/api/auth/verify")
     def verify_auth(body: AuthVerifyRequest) -> dict[str, Any]:
         if not _is_valid_token(body.token):

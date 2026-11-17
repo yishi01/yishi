@@ -99,6 +99,46 @@ function setConnStatus(mode, label) {
   $("conn-label").textContent = label;
 }
 
+// Doubao-style Dynamic Island Capsule controller
+let islandRetractTimer = null;
+function setDynamicIslandState(phase) {
+  const pill = $("dynamic-island-pill");
+  const ico = $("island-icon");
+  const txt = $("island-text");
+  if (!pill || !ico || !txt) return;
+
+  clearTimeout(islandRetractTimer);
+  pill.classList.remove("retracting");
+
+  if (!phase || phase === "idle") {
+    pill.classList.add("retracting");
+    islandRetractTimer = setTimeout(() => pill.classList.add("hidden"), 280);
+    return;
+  }
+
+  pill.classList.remove("hidden");
+  if (phase === "thinking") {
+    ico.textContent = "✨";
+    txt.textContent = "深度思考中...";
+  } else if (phase === "tool") {
+    ico.textContent = "🔧";
+    txt.textContent = "工具调用中...";
+  } else if (phase === "approval") {
+    ico.textContent = "🔔";
+    txt.textContent = "等待操作确认";
+  } else if (phase === "answering") {
+    ico.textContent = "💬";
+    txt.textContent = "正在生成回复...";
+  } else if (phase === "done") {
+    ico.textContent = "✅";
+    txt.textContent = "输出已完成";
+    islandRetractTimer = setTimeout(() => {
+      pill.classList.add("retracting");
+      setTimeout(() => pill.classList.add("hidden"), 280);
+    }, 2200);
+  }
+}
+
 // --- Safe, Zero-Dependency Markdown Renderer ---
 
 function normalizeCleanText(raw) {
@@ -663,6 +703,7 @@ function renderEvent(ev) {
   }
 
   if (ev.type === "thought_delta") {
+    if (state.wsSynced) setDynamicIslandState("thinking");
     const turn = ensureCurrentTurn();
     ensureThoughtDrawer(turn);
     if (!turn.lastEventWasThought && turn.thoughtRounds[turn.thoughtRoundIdx]) {
@@ -681,6 +722,7 @@ function renderEvent(ev) {
     turn.thoughtPre.textContent = combinedThought;
     turn.thoughtBadge.textContent = `已收纳 · ${combinedThought.length} 字`;
   } else if (ev.type === "tool_call") {
+    if (state.wsSynced) setDynamicIslandState("tool");
     const turn = ensureCurrentTurn();
     turn.lastEventWasThought = false;
     turn.lastEventWasText = false;
@@ -754,6 +796,7 @@ function renderEvent(ev) {
     }
     turn.toolsBadge.textContent = `已收纳 · ${turn.toolCount} 次 (${turn.lastToolName || d.name || "完成"})`;
   } else if (ev.type === "text_delta") {
+    if (state.wsSynced) setDynamicIslandState("answering");
     const turn = ensureCurrentTurn();
     ensureAssistantBubble(turn);
     if (!turn.lastEventWasText && turn.textRounds[turn.textRoundIdx]) {
@@ -784,6 +827,7 @@ function renderEvent(ev) {
       $("cancel-btn").classList.remove("hidden");
     }
   } else if (ev.type === "turn_done") {
+    if (state.wsSynced) setDynamicIslandState("done");
     finalizeTurnDrawers(state.currentTurn);
     state.currentTurn = null;
     state.resolvingIds.clear();
@@ -792,6 +836,7 @@ function renderEvent(ev) {
     $("cancel-btn").classList.add("hidden");
     if (state.wsSynced && !d.session) refreshActiveSummary();
   } else if (ev.type === "error") {
+    if (state.wsSynced) setDynamicIslandState("idle");
     finalizeTurnDrawers(state.currentTurn);
     state.currentTurn = null;
     state.resolvingIds.clear();
