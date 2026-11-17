@@ -1,0 +1,14 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "workspaces": [
+    "C:\\Users\\Administrator\\.gemini\\antigravity\\scratch"
+  ],
+  "default_approval_mode": "ask_commands",
+  "bark_url": "",
+  "model": "",
+  "api_key": "",
+  "vertex": false,
+  "project": "",
+  "location": ""
+}

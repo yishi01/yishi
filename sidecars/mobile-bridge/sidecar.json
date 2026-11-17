@@ -1,0 +1,7 @@
+{
+  "display_name": "DeepSeek Mobile Bridge",
+  "description": "Runs the iOS mobile PWA + WebSocket coding agent bridge powered by DeepSeek.",
+  "command": "..\\..\\.venv\\Scripts\\python.exe",
+  "args": ["..\\..\\bridge\\server.py"],
+  "restart_policy": "on-failure"
+}

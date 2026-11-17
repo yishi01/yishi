@@ -1,0 +1,9 @@
+[project]
+name = "agy-mobile-bridge"
+version = "0.3.0"
+description = "DeepSeek Mobile Bridge (iOS PWA) for Windows workspaces"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
