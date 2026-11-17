@@ -23,7 +23,9 @@ from bridge.fs_service import (
     git_status_and_diff,
     list_directory,
     read_file_content,
+    resolve_ai_path,
     search_workspace,
+    to_rel_posix,
     write_file_content,
 )
 
@@ -33,17 +35,19 @@ MAX_TOOL_ROUNDS = 24
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
 
 SYSTEM_PROMPT = """You are a skilled AI coding assistant running inside the user's Windows workspace via DeepSeek Mobile Bridge.
-You have tools to inspect directories, read files, search code, write/edit files, inspect git status/diff, run shell commands, and ask the user questions.
+You have tools to inspect directories, read files, search code, write/edit files, present files to the user for download/review (Claude Artifact style), inspect git status/diff, run shell commands, and ask the user questions.
 
 Environment Facts:
 - Bridge HTTP/WebSocket server: http://127.0.0.1:8765 (health checks: http://127.0.0.1:8765/health and http://127.0.0.1:8765/api/health)
 - Project Python virtualenv: .venv\\Scripts\\python.exe (automatically prepended to PATH in run_command)
 - Frontend in `web/` is zero-build native ES Modules (no Node.js / npm required)
 - Active workspace root: {workspace}
+- AI Access Isolation Mode: {ai_access_mode} (Allowed workspaces: {allowed_workspaces})
 
 Guidelines:
 - Always inspect relevant files before editing them.
 - Prefer `edit_file` for targeted changes to existing files and `write_file` for creating new files.
+- Whenever the user asks you to send/share/provide a file for download, OR asks to review a newly created or modified file, call `present_file` so a Claude-style interactive File Artifact & Download card is pushed directly to their phone screen.
 - Keep responses concise and clear for mobile reading.
 """
 
@@ -152,6 +156,36 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "timeout": {"type": "integer", "description": "Timeout in seconds (default 60)."},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "present_file",
+            "description": "Send or present a file to the user on their mobile screen as a Claude-style File Artifact card for immediate review, preview, or local download.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative or absolute path to the file on the PC.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Display title for the file card (optional).",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief summary of what this file contains or what was changed (optional).",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["review", "download"],
+                        "description": "'review' for newly created/modified files to inspect, or 'download' when the user asked to download a file.",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -605,13 +639,63 @@ class DeepSeekSession:
                 return json.dumps({"error": f"Denied by user: {reason}"}, ensure_ascii=False)
 
         root = Path(self.workspace)
+        cfg = self.config_store.config
+        allowed_ws = cfg.workspaces
+        ai_mode = cfg.ai_access_mode
+
+        def _build_and_emit_artifact(
+            target_path: Path,
+            *,
+            title: str = "",
+            summary: str = "",
+            mode: str = "review",
+        ) -> dict[str, Any]:
+            st = target_path.stat()
+            preview_text = ""
+            is_text = False
+            if st.st_size <= 1_000_000:
+                try:
+                    raw_b = target_path.read_bytes()
+                    if b"\x00" not in raw_b[:4096]:
+                        decoded = raw_b.decode("utf-8", errors="replace")
+                        is_text = True
+                        preview_text = "\n".join(decoded.splitlines()[:120])[:6000]
+                except OSError:
+                    pass
+            artifact_info = {
+                "id": uuid.uuid4().hex[:10],
+                "name": target_path.name,
+                "path": str(target_path.resolve()),
+                "rel_path": to_rel_posix(root, target_path),
+                "title": title or target_path.name,
+                "summary": summary or ("已为你准备好文件，可直接预览审查或下载到手机" if mode == "review" else "点击下方按钮可将该文件下载到手机本地"),
+                "size": st.st_size,
+                "mtime": st.st_mtime,
+                "ext": target_path.suffix.lower(),
+                "mode": mode,
+                "is_text": is_text,
+                "preview": preview_text,
+            }
+            self.emit_event("file_artifact", artifact_info)
+            return artifact_info
+
         try:
             if name == "list_directory":
-                res = list_directory(root, str(args.get("path", "")))
+                res = list_directory(
+                    root,
+                    str(args.get("path", "")),
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                )
                 return json.dumps(res, ensure_ascii=False)
 
             if name == "read_file":
-                data = read_file_content(root, str(args["path"]))
+                data = read_file_content(
+                    root,
+                    str(args["path"]),
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                )
                 if data.get("is_binary") or data.get("too_large"):
                     return json.dumps(data, ensure_ascii=False)
                 lines = data["content"].splitlines()
@@ -623,6 +707,7 @@ class DeepSeekSession:
                 return json.dumps(
                     {
                         "path": data["path"],
+                        "abs_path": data.get("abs_path", ""),
                         "total_lines": len(lines),
                         "start_line": start,
                         "end_line": end,
@@ -637,14 +722,35 @@ class DeepSeekSession:
                     str(args["path"]),
                     str(args["content"]),
                     force=True,
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
                 )
+                target_file = resolve_ai_path(
+                    root,
+                    str(args["path"]),
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                    is_write=True,
+                )
+                if target_file.exists() and target_file.is_file():
+                    _build_and_emit_artifact(
+                        target_file,
+                        title=f"已写入文件 · {target_file.name}",
+                        summary="AI 已创建或更新此文件，点击可全屏审查代码或下载到手机",
+                        mode="review",
+                    )
                 return json.dumps(res, ensure_ascii=False)
 
             if name == "edit_file":
                 rel = str(args["path"])
                 target = str(args["target"])
                 replacement = str(args["replacement"])
-                data = read_file_content(root, rel)
+                data = read_file_content(
+                    root,
+                    rel,
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                )
                 if data.get("is_binary"):
                     return json.dumps({"error": "Cannot edit binary file"}, ensure_ascii=False)
                 text = data["content"]
@@ -657,8 +763,50 @@ class DeepSeekSession:
                         ensure_ascii=False,
                     )
                 updated = text.replace(target, replacement, 1)
-                res = write_file_content(root, rel, updated, force=True)
+                res = write_file_content(
+                    root,
+                    rel,
+                    updated,
+                    force=True,
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                )
+                target_file = resolve_ai_path(
+                    root,
+                    rel,
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                    is_write=True,
+                )
+                if target_file.exists() and target_file.is_file():
+                    _build_and_emit_artifact(
+                        target_file,
+                        title=f"已修改文件 · {target_file.name}",
+                        summary="AI 已修改此文件，点击可审查最新内容或下载到手机",
+                        mode="review",
+                    )
                 return json.dumps({"edited": True, **res}, ensure_ascii=False)
+
+            if name == "present_file":
+                raw_p = str(args["path"])
+                target_file = resolve_ai_path(
+                    root,
+                    raw_p,
+                    allowed_workspaces=allowed_ws,
+                    ai_access_mode=ai_mode,
+                    is_write=False,
+                )
+                if not target_file.exists():
+                    return json.dumps({"error": f"File not found: {raw_p}"}, ensure_ascii=False)
+                if target_file.is_dir():
+                    return json.dumps({"error": f"Path is a directory, not a file: {raw_p}"}, ensure_ascii=False)
+                art = _build_and_emit_artifact(
+                    target_file,
+                    title=str(args.get("title") or target_file.name),
+                    summary=str(args.get("summary") or "AI 已为你发送该文件，点击即可审查内容或下载到手机本地"),
+                    mode=str(args.get("mode") or "download"),
+                )
+                return json.dumps({"presented": True, "artifact": art}, ensure_ascii=False)
 
             if name == "search_files":
                 res = search_workspace(root, str(args.get("query", "")))
@@ -724,8 +872,16 @@ class DeepSeekSession:
 
     def _build_api_messages(self) -> list[dict[str, Any]]:
         self.messages = sanitize_conversation_messages(self.messages)
+        cfg = self.config_store.config
         api_msgs: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT.format(workspace=self.workspace)}
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT.format(
+                    workspace=self.workspace,
+                    ai_access_mode=cfg.ai_access_mode,
+                    allowed_workspaces=", ".join(cfg.workspaces),
+                ),
+            }
         ]
         last_user_idx = -1
         for i, msg in enumerate(self.messages):

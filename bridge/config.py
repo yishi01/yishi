@@ -10,7 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = Path(os.environ.get("PLUGIN_DATA") or (PROJECT_ROOT / "data"))
 
@@ -40,6 +40,8 @@ class BridgeConfig(BaseModel):
     port: int = 8765
     auth_token: str = ""
     workspaces: list[str] = Field(default_factory=_default_workspaces)
+    active_workspace: str = ""
+    ai_access_mode: Literal["workspace_only", "workspace_read_all", "full_access"] = "workspace_only"
     default_approval_mode: Literal["ask_commands", "ask_writes", "auto"] = "ask_commands"
     bark_url: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -59,12 +61,21 @@ class BridgeConfig(BaseModel):
             or "https://api.deepseek.com"
         ).rstrip("/")
 
+    def effective_active_workspace(self) -> str:
+        if self.active_workspace and Path(self.active_workspace).exists():
+            return str(Path(self.active_workspace).resolve())
+        if self.workspaces:
+            return str(Path(self.workspaces[0]).resolve())
+        return str(PROJECT_ROOT.resolve())
+
     def to_public_dict(self) -> dict:
         return {
             "version": VERSION,
             "host": self.host,
             "port": self.port,
             "workspaces": self.workspaces,
+            "active_workspace": self.effective_active_workspace(),
+            "ai_access_mode": self.ai_access_mode,
             "default_approval_mode": self.default_approval_mode,
             "bark_url": self.bark_url,
             "deepseek_base_url": self.effective_base_url(),
@@ -119,6 +130,10 @@ class ConfigStore:
             normalized = _default_workspaces()
             changed = True
         cfg.workspaces = normalized
+
+        if not cfg.active_workspace or not Path(cfg.active_workspace).exists():
+            cfg.active_workspace = cfg.workspaces[0]
+            changed = True
 
         if changed:
             self.save(cfg)

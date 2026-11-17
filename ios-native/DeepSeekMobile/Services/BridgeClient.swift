@@ -10,11 +10,29 @@ struct ToolCallItem: Identifiable, Hashable {
     var isError: Bool = false
 }
 
+struct FileArtifactItem: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let path: String
+    let title: String
+    let summary: String
+    let size: Int
+    let ext: String
+    let mode: String // "review" | "download"
+    let isText: Bool
+    let preview: String
+
+    var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+}
+
 struct ChatTurnItem: Identifiable, Hashable {
     let id: String
     var userText: String?
     var thoughtText: String = ""
     var toolCalls: [ToolCallItem] = []
+    var artifacts: [FileArtifactItem] = []
     var assistantText: String = ""
     var errorText: String?
 }
@@ -25,13 +43,81 @@ struct PendingApprovalItem: Identifiable, Hashable {
     let argsJSON: String
 }
 
+struct PCDriveItem: Identifiable, Hashable {
+    var id: String { path }
+    let letter: String
+    let name: String
+    let label: String
+    let path: String
+    let totalBytes: Int64
+    let usedBytes: Int64
+    let freeBytes: Int64
+
+    var usageRatio: Double {
+        guard totalBytes > 0 else { return 0 }
+        return Double(usedBytes) / Double(totalBytes)
+    }
+
+    var formattedCapacity: String {
+        let freeStr = ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+        let totalStr = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        return "可用 \(freeStr) / 共 \(totalStr)"
+    }
+}
+
+struct PCShortcutItem: Identifiable, Hashable {
+    var id: String { path }
+    let name: String
+    let path: String
+    let icon: String
+}
+
 struct FileEntryItem: Identifiable, Hashable {
     var id: String { path }
     let name: String
     let path: String
+    let parentPath: String
     let isDir: Bool
     let size: Int
     let mtime: Double
+    let ctime: Double
+    let atime: Double
+    let ext: String
+    let mimeType: String
+    let isReadonly: Bool
+    let isHidden: Bool
+    let inAIWorkspace: Bool
+    let aiCanRead: Bool
+    let aiCanWrite: Bool
+
+    var formattedSize: String {
+        isDir ? "文件夹" : ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+
+    var formattedMtime: String {
+        Self.formatTimestamp(mtime)
+    }
+
+    var formattedCtime: String {
+        Self.formatTimestamp(ctime)
+    }
+
+    var formattedAtime: String {
+        Self.formatTimestamp(atime)
+    }
+
+    static func formatTimestamp(_ ts: Double) -> String {
+        guard ts > 0 else { return "-" }
+        let d = Date(timeIntervalSince1970: ts)
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return fmt.string(from: d)
+    }
+}
+
+struct FileClipboardItem: Equatable {
+    let source: FileEntryItem
+    let isMove: Bool // true = 移动(剪切), false = 复制
 }
 
 struct SessionSummaryItem: Identifiable, Hashable {
@@ -54,6 +140,7 @@ final class BridgeClient: ObservableObject {
     @Published var authError: String?
 
     @Published var workspaces: [String] = []
+    @Published var aiAccessMode: String = "workspace_only" // "workspace_only" | "workspace_read_all" | "full_access"
     @Published var selectedModel: String = "deepseek-chat"
     @Published var approvalMode: String = "ask_commands"
     @Published var deepseekBaseURL: String = "https://api.deepseek.com"
@@ -65,12 +152,24 @@ final class BridgeClient: ObservableObject {
     @Published var pendingApprovals: [PendingApprovalItem] = []
     @Published var sessionStatus: String = "idle"
 
+    // Full PC File Manager State
+    @Published var pcDrives: [PCDriveItem] = []
+    @Published var pcShortcuts: [PCShortcutItem] = []
     @Published var currentDir: String = ""
+    @Published var currentParentDir: String = ""
+    @Published var currentDrive: String = "C:"
+    @Published var currentDirInAIWorkspace: Bool = false
+    @Published var showHiddenFiles: Bool = false
     @Published var fileEntries: [FileEntryItem] = []
+    @Published var clipboard: FileClipboardItem?
+    @Published var fileError: String?
+
+    // Git & Cross-Tab References
     @Published var gitBranch: String = ""
     @Published var gitDiff: String = ""
     @Published var isGitRepo: Bool = false
     @Published var referencedFilePath: String?
+    @Published var activeArtifactForReview: FileArtifactItem?
 
     private var lastSeq: Int = 0
     private var webSocketTask: URLSessionWebSocketTask?
@@ -92,7 +191,8 @@ final class BridgeClient: ObservableObject {
             try await fetchSettings()
             isAuthenticated = true
             await loadSessions()
-            await loadDirectory("")
+            await loadPCDrives()
+            await loadPCDirectory(activeWorkspace)
             await refreshGitDiff()
         } catch {
             isAuthenticated = false
@@ -113,7 +213,8 @@ final class BridgeClient: ObservableObject {
             isAuthenticated = true
             Haptics.success()
             await loadSessions()
-            await loadDirectory("")
+            await loadPCDrives()
+            await loadPCDirectory(activeWorkspace)
             await refreshGitDiff()
         } catch {
             authError = error.localizedDescription
@@ -142,7 +243,7 @@ final class BridgeClient: ObservableObject {
         }
         var req = URLRequest(url: url)
         req.httpMethod = method
-        req.timeoutInterval = 25
+        req.timeoutInterval = 35
         if useAuth && !authToken.isEmpty {
             req.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         }
@@ -175,8 +276,14 @@ final class BridgeClient: ObservableObject {
         if let ws = json["workspaces"] as? [String] {
             workspaces = ws
             if !ws.contains(activeWorkspace) {
-                activeWorkspace = ws.first ?? ""
+                activeWorkspace = (json["active_workspace"] as? String) ?? ws.first ?? ""
             }
+        }
+        if let act = json["active_workspace"] as? String, !act.isEmpty {
+            activeWorkspace = act
+        }
+        if let aiMode = json["ai_access_mode"] as? String {
+            aiAccessMode = aiMode
         }
         if let m = json["model"] as? String, !m.isEmpty {
             selectedModel = m
@@ -196,6 +303,8 @@ final class BridgeClient: ObservableObject {
     func saveSettings(apiKey: String) async throws {
         var payload: [String: Any] = [
             "workspaces": workspaces,
+            "active_workspace": activeWorkspace,
+            "ai_access_mode": aiAccessMode,
             "default_approval_mode": approvalMode,
             "bark_url": barkURL,
             "deepseek_base_url": deepseekBaseURL,
@@ -209,7 +318,41 @@ final class BridgeClient: ObservableObject {
         if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
             applySettings(json)
         }
+        await loadPCDrives()
         Haptics.success()
+    }
+
+    func authorizeWorkspace(path: String, setActive: Bool = true) async {
+        do {
+            let payload: [String: Any] = [
+                "path": path,
+                "set_active": setActive,
+                "session_id": activeSessionId,
+            ]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/workspaces/authorize", method: "POST", body: body)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                applySettings(json)
+            }
+            await loadPCDrives()
+            await loadPCDirectory(currentDir)
+            Haptics.success()
+        } catch {
+            fileError = error.localizedDescription
+        }
+    }
+
+    func removeWorkspace(_ path: String) async {
+        guard workspaces.count > 1 else {
+            fileError = "至少需要保留一个 AI 工作区目录"
+            return
+        }
+        workspaces.removeAll { $0 == path }
+        if activeWorkspace == path {
+            activeWorkspace = workspaces.first ?? ""
+        }
+        try? await saveSettings(apiKey: "")
+        await loadPCDirectory(currentDir)
     }
 
     // MARK: - Sessions & WebSocket
@@ -382,6 +525,30 @@ final class BridgeClient: ObservableObject {
                 turns[turns.count - 1].toolCalls[pos].isError = (errStr != nil)
             }
 
+        case "file_artifact":
+            ensureActiveTurn()
+            let art = FileArtifactItem(
+                id: (d["id"] as? String) ?? UUID().uuidString,
+                name: (d["name"] as? String) ?? "file",
+                path: (d["path"] as? String) ?? "",
+                title: (d["title"] as? String) ?? (d["name"] as? String) ?? "文件",
+                summary: (d["summary"] as? String) ?? "点击可审查内容或下载到手机本地",
+                size: (d["size"] as? Int) ?? 0,
+                ext: (d["ext"] as? String) ?? "",
+                mode: (d["mode"] as? String) ?? "review",
+                isText: (d["is_text"] as? Bool) ?? false,
+                preview: (d["preview"] as? String) ?? ""
+            )
+            // Replace if same path already in this turn's artifacts, else append
+            if let existingIdx = turns[turns.count - 1].artifacts.firstIndex(where: { $0.path == art.path }) {
+                turns[turns.count - 1].artifacts[existingIdx] = art
+            } else {
+                turns[turns.count - 1].artifacts.append(art)
+            }
+            if wsSynced {
+                Haptics.light()
+            }
+
         case "text_delta":
             ensureActiveTurn()
             if let full = d["full_text"] as? String {
@@ -492,39 +659,93 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    // MARK: - Files & Git
+    // MARK: - Full PC File System Manager (Drives C/D/E, Metadata, Move/Copy/Upload/Download)
 
-    func loadDirectory(_ relPath: String) async {
-        currentDir = relPath
-        let wsEnc = activeWorkspace.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let pathEnc = relPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+    func loadPCDrives() async {
         do {
-            let data = try await request("/api/files/tree?workspace=\(wsEnc)&path=\(pathEnc)")
-            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let entries = json["entries"] as? [[String: Any]] else { return }
-            fileEntries = entries.compactMap { e in
-                guard let name = e["name"] as? String,
-                      let path = e["path"] as? String else { return nil }
-                return FileEntryItem(
-                    name: name,
-                    path: path,
-                    isDir: (e["is_dir"] as? Bool) ?? false,
-                    size: (e["size"] as? Int) ?? 0,
-                    mtime: (e["mtime"] as? Double) ?? 0
-                )
+            let data = try await request("/api/pc/drives")
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            if let rawDrives = json["drives"] as? [[String: Any]] {
+                pcDrives = rawDrives.compactMap { d in
+                    guard let letter = d["letter"] as? String,
+                          let path = d["path"] as? String else { return nil }
+                    return PCDriveItem(
+                        letter: letter,
+                        name: (d["name"] as? String) ?? letter,
+                        label: (d["label"] as? String) ?? "磁盘",
+                        path: path,
+                        totalBytes: (d["total_bytes"] as? NSNumber)?.int64Value ?? 0,
+                        usedBytes: (d["used_bytes"] as? NSNumber)?.int64Value ?? 0,
+                        freeBytes: (d["free_bytes"] as? NSNumber)?.int64Value ?? 0
+                    )
+                }
+            }
+            if let rawShortcuts = json["shortcuts"] as? [[String: Any]] {
+                pcShortcuts = rawShortcuts.compactMap { s in
+                    guard let name = s["name"] as? String,
+                          let path = s["path"] as? String else { return nil }
+                    return PCShortcutItem(
+                        name: name,
+                        path: path,
+                        icon: (s["icon"] as? String) ?? "folder"
+                    )
+                }
             }
         } catch {}
     }
 
-    func readFile(_ relPath: String) async throws -> (content: String, mtime: Double) {
-        let wsEnc = activeWorkspace.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let pathEnc = relPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
-        let data = try await request("/api/files/read?workspace=\(wsEnc)&path=\(pathEnc)")
+    func loadPCDirectory(_ path: String) async {
+        fileError = nil
+        let target = path.isEmpty ? activeWorkspace : path
+        let pathEnc = target.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let hiddenFlag = showHiddenFiles ? "true" : "false"
+        do {
+            let data = try await request("/api/pc/list?path=\(pathEnc)&show_hidden=\(hiddenFlag)")
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let entries = json["entries"] as? [[String: Any]] else { return }
+            currentDir = (json["path"] as? String) ?? target
+            currentParentDir = (json["parent_path"] as? String) ?? ""
+            currentDrive = (json["drive"] as? String) ?? "C:"
+            currentDirInAIWorkspace = (json["in_ai_workspace"] as? Bool) ?? false
+            fileEntries = entries.compactMap { Self.parseFileEntry($0) }
+        } catch {
+            fileError = error.localizedDescription
+        }
+    }
+
+    static func parseFileEntry(_ e: [String: Any]) -> FileEntryItem? {
+        guard let name = e["name"] as? String,
+              let path = e["path"] as? String else { return nil }
+        return FileEntryItem(
+            name: name,
+            path: path,
+            parentPath: (e["parent_path"] as? String) ?? "",
+            isDir: (e["is_dir"] as? Bool) ?? false,
+            size: (e["size"] as? Int) ?? 0,
+            mtime: (e["mtime"] as? Double) ?? 0,
+            ctime: (e["ctime"] as? Double) ?? 0,
+            atime: (e["atime"] as? Double) ?? 0,
+            ext: (e["ext"] as? String) ?? "",
+            mimeType: (e["mime_type"] as? String) ?? "application/octet-stream",
+            isReadonly: (e["is_readonly"] as? Bool) ?? false,
+            isHidden: (e["is_hidden"] as? Bool) ?? false,
+            inAIWorkspace: (e["in_ai_workspace"] as? Bool) ?? false,
+            aiCanRead: (e["ai_can_read"] as? Bool) ?? false,
+            aiCanWrite: (e["ai_can_write"] as? Bool) ?? false
+        )
+    }
+
+    func readPCFile(_ fullPath: String) async throws -> (content: String, mtime: Double) {
+        let pathEnc = fullPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let data = try await request("/api/pc/read?path=\(pathEnc)")
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw URLError(.cannotParseResponse)
         }
         if (json["is_binary"] as? Bool) == true {
-            throw NSError(domain: "Bridge", code: 400, userInfo: [NSLocalizedDescriptionKey: "二进制文件暂不支持文本编辑"])
+            throw NSError(domain: "Bridge", code: 400, userInfo: [NSLocalizedDescriptionKey: "该文件为二进制格式，请使用「下载到手机」查看"])
+        }
+        if (json["too_large"] as? Bool) == true {
+            throw NSError(domain: "Bridge", code: 400, userInfo: [NSLocalizedDescriptionKey: "文件超过 2MB，请使用「下载到手机」查看"])
         }
         return (
             content: (json["content"] as? String) ?? "",
@@ -532,19 +753,110 @@ final class BridgeClient: ObservableObject {
         )
     }
 
-    func writeFile(_ relPath: String, content: String, expectedMtime: Double) async throws -> Double {
-        let payload: [String: Any] = [
-            "workspace": activeWorkspace,
-            "path": relPath,
+    func writePCFile(_ fullPath: String, content: String) async throws {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "path": fullPath,
             "content": content,
-            "expected_mtime": expectedMtime,
-            "force": true,
-        ]
-        let body = try JSONSerialization.data(withJSONObject: payload)
-        let data = try await request("/api/files/write", method: "PUT", body: body)
-        let json = (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        ])
+        _ = try await request("/api/pc/write", method: "PUT", body: body)
         Haptics.success()
-        return (json["mtime"] as? Double) ?? expectedMtime
+        await loadPCDirectory(currentDir)
+    }
+
+    func createPCEntry(name: String, isDir: Bool, content: String = "") async throws {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else { return }
+        let sep = currentDir.hasSuffix("\\") || currentDir.hasSuffix("/") ? "" : "\\"
+        let fullPath = "\(currentDir)\(sep)\(cleanName)"
+        let body = try JSONSerialization.data(withJSONObject: [
+            "path": fullPath,
+            "is_dir": isDir,
+            "content": content,
+        ])
+        _ = try await request("/api/pc/create", method: "POST", body: body)
+        Haptics.success()
+        await loadPCDirectory(currentDir)
+    }
+
+    func renamePCEntry(item: FileEntryItem, newName: String) async throws {
+        let clean = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        let parent = item.parentPath.isEmpty ? currentDir : item.parentPath
+        let sep = parent.hasSuffix("\\") || parent.hasSuffix("/") ? "" : "\\"
+        let dst = "\(parent)\(sep)\(clean)"
+        let body = try JSONSerialization.data(withJSONObject: [
+            "src_path": item.path,
+            "dst_path": dst,
+            "overwrite": false,
+        ])
+        _ = try await request("/api/pc/move", method: "POST", body: body)
+        Haptics.success()
+        await loadPCDirectory(currentDir)
+    }
+
+    func pasteClipboardIntoCurrentDir() async throws {
+        guard let clip = clipboard else { return }
+        let sep = currentDir.hasSuffix("\\") || currentDir.hasSuffix("/") ? "" : "\\"
+        let dst = "\(currentDir)\(sep)\(clip.source.name)"
+        let endpoint = clip.isMove ? "/api/pc/move" : "/api/pc/copy"
+        let body = try JSONSerialization.data(withJSONObject: [
+            "src_path": clip.source.path,
+            "dst_path": dst,
+            "overwrite": false,
+        ])
+        _ = try await request(endpoint, method: "POST", body: body)
+        if clip.isMove {
+            clipboard = nil
+        }
+        Haptics.success()
+        await loadPCDirectory(currentDir)
+    }
+
+    func deletePCEntry(_ item: FileEntryItem) async throws {
+        let pathEnc = item.path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        _ = try await request("/api/pc/delete?path=\(pathEnc)", method: "DELETE")
+        Haptics.success()
+        await loadPCDirectory(currentDir)
+    }
+
+    func uploadLocalFileToPC(fileURL: URL, targetDir: String? = nil) async throws -> (name: String, path: String) {
+        let accessing = fileURL.startAccessingSecurityScopedResource()
+        defer {
+            if accessing {
+                fileURL.stopAccessingSecurityScopedResource()
+            }
+        }
+        let fileData = try Data(contentsOf: fileURL)
+        let b64 = fileData.base64EncodedString()
+        let filename = fileURL.lastPathComponent
+        let dir = targetDir ?? currentDir
+        let body = try JSONSerialization.data(withJSONObject: [
+            "dir_path": dir,
+            "filename": filename,
+            "base64_data": b64,
+        ])
+        let respData = try await request("/api/pc/upload", method: "POST", body: body)
+        let json = (try? JSONSerialization.jsonObject(with: respData) as? [String: Any]) ?? [:]
+        let savedPath = (json["path"] as? String) ?? ""
+        let savedName = (json["name"] as? String) ?? filename
+        Haptics.success()
+        if targetDir == nil || targetDir == currentDir {
+            await loadPCDirectory(currentDir)
+        }
+        return (name: savedName, path: savedPath)
+    }
+
+    func downloadPCFileToLocalTemp(pcPath: String, filename: String) async throws -> URL {
+        let pathEnc = pcPath.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? ""
+        let data = try await request("/api/pc/download?path=\(pathEnc)")
+        let safeName = (filename as NSString).lastPathComponent
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(safeName)
+        if FileManager.default.fileExists(atPath: tempURL.path) {
+            try? FileManager.default.removeItem(at: tempURL)
+        }
+        try data.write(to: tempURL, options: .atomic)
+        Haptics.success()
+        return tempURL
     }
 
     func refreshGitDiff() async {

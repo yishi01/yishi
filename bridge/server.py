@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hmac
 import logging
 import mimetypes
@@ -19,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -30,14 +31,23 @@ from bridge.deepseek_agent import SessionManager
 from bridge.fs_service import (
     FileConflictError,
     WorkspaceSecurityError,
+    copy_pc_entry,
     create_entry,
+    create_pc_entry,
     delete_entry,
+    delete_pc_entry,
     git_status_and_diff,
     list_directory,
+    list_pc_directory,
+    list_pc_drives,
     read_file_content,
+    read_pc_file,
     rename_entry,
+    rename_or_move_pc_entry,
     search_workspace,
+    stat_pc_entry,
     write_file_content,
+    write_pc_file,
 )
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
@@ -49,11 +59,19 @@ class AuthVerifyRequest(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     workspaces: list[str] | None = None
+    active_workspace: str | None = None
+    ai_access_mode: str | None = None
     default_approval_mode: str | None = None
     bark_url: str | None = None
     deepseek_base_url: str | None = None
     model: str | None = None
     deepseek_api_key: str | None = None
+
+
+class AuthorizeWorkspaceRequest(BaseModel):
+    path: str
+    set_active: bool = True
+    session_id: str | None = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -100,6 +118,31 @@ class RenameEntryRequest(BaseModel):
     new_path: str
 
 
+# --- Full PC File System Request Models ---
+
+class PCWriteFileRequest(BaseModel):
+    path: str
+    content: str
+
+
+class PCCreateEntryRequest(BaseModel):
+    path: str
+    is_dir: bool = False
+    content: str = ""
+
+
+class PCMoveOrCopyRequest(BaseModel):
+    src_path: str
+    dst_path: str
+    overwrite: bool = False
+
+
+class PCUploadBase64Request(BaseModel):
+    dir_path: str = ""
+    filename: str
+    base64_data: str
+
+
 def create_app(data_dir: Path | None = None) -> FastAPI:
     config_store = ConfigStore(data_dir=data_dir)
     session_manager = SessionManager(config_store)
@@ -138,20 +181,26 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     def require_auth(
         authorization: str | None = Header(default=None),
         x_auth_token: str | None = Header(default=None),
+        token: str | None = Query(default=None),
     ) -> None:
-        token = x_auth_token
-        if not token and authorization and authorization.lower().startswith("bearer "):
-            token = authorization[7:].strip()
-        if not _is_valid_token(token):
+        tok = x_auth_token
+        if not tok and authorization and authorization.lower().startswith("bearer "):
+            tok = authorization[7:].strip()
+        if not tok and token:
+            tok = token.strip()
+        if not _is_valid_token(tok):
             raise HTTPException(status_code=401, detail="Invalid or missing auth token")
 
     def resolve_allowed_workspace(workspace: str | None) -> Path:
-        allowed = [Path(w).resolve() for w in config_store.config.workspaces]
+        cfg = config_store.config
+        allowed = [Path(w).resolve() for w in cfg.workspaces]
         if not allowed:
             raise HTTPException(status_code=400, detail="No workspaces configured")
         if not workspace:
-            return allowed[0]
+            return Path(cfg.effective_active_workspace()).resolve()
         candidate = Path(workspace).resolve()
+        if cfg.ai_access_mode == "full_access" and candidate.exists() and candidate.is_dir():
+            return candidate
         if candidate not in allowed:
             raise HTTPException(status_code=403, detail="Workspace not in configured allowlist")
         if not candidate.exists() or not candidate.is_dir():
@@ -240,7 +289,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         if body.workspaces is not None:
             valid_ws: list[str] = []
             for raw_ws in body.workspaces:
-                p = Path(raw_ws.strip()).expanduser()
+                clean_ws = raw_ws.strip()
+                if len(clean_ws) == 2 and clean_ws[1] == ":":
+                    clean_ws += "\\"
+                p = Path(clean_ws).expanduser()
                 if not p.exists() or not p.is_dir():
                     raise HTTPException(
                         status_code=400,
@@ -252,6 +304,22 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             if not valid_ws:
                 raise HTTPException(status_code=400, detail="At least one workspace is required")
             cfg_data["workspaces"] = valid_ws
+
+        if body.active_workspace is not None and body.active_workspace.strip():
+            clean_act = body.active_workspace.strip()
+            if len(clean_act) == 2 and clean_act[1] == ":":
+                clean_act += "\\"
+            act_p = Path(clean_act).expanduser()
+            if act_p.exists() and act_p.is_dir():
+                act_str = str(act_p.resolve())
+                cfg_data["active_workspace"] = act_str
+                if act_str not in cfg_data["workspaces"]:
+                    cfg_data["workspaces"].insert(0, act_str)
+
+        if body.ai_access_mode is not None:
+            if body.ai_access_mode not in {"workspace_only", "workspace_read_all", "full_access"}:
+                raise HTTPException(status_code=400, detail="Invalid ai_access_mode")
+            cfg_data["ai_access_mode"] = body.ai_access_mode
 
         if body.default_approval_mode is not None:
             if body.default_approval_mode not in {"ask_commands", "ask_writes", "auto"}:
@@ -269,7 +337,193 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         updated = config_store.save(BridgeConfig(**cfg_data))
         return updated.to_public_dict()
 
-    # --- Workspace File & Git APIs ---
+    @app.post("/api/workspaces/authorize", dependencies=[Depends(require_auth)])
+    def authorize_workspace(body: AuthorizeWorkspaceRequest) -> dict[str, Any]:
+        clean = body.path.strip()
+        if len(clean) == 2 and clean[1] == ":":
+            clean += "\\"
+        target = Path(clean).resolve()
+        if not target.exists():
+            raise HTTPException(status_code=404, detail=f"路径不存在: {clean}")
+        if not target.is_dir():
+            target = target.parent
+        ws_str = str(target)
+
+        cfg_data = config_store.config.model_dump()
+        ws_list: list[str] = list(cfg_data.get("workspaces") or [])
+        if ws_str not in ws_list:
+            ws_list.append(ws_str)
+        cfg_data["workspaces"] = ws_list
+        if body.set_active:
+            cfg_data["active_workspace"] = ws_str
+        updated = config_store.save(BridgeConfig(**cfg_data))
+
+        if body.session_id and body.set_active:
+            try:
+                sess = session_manager.get_session(body.session_id)
+                sess.workspace = ws_str
+                sess.save_to_disk()
+            except KeyError:
+                pass
+        return updated.to_public_dict()
+
+    # =========================================================================
+    # Full PC File System Manager APIs (Drives C/D/E, Metadata, Move/Copy/Upload/Download)
+    # =========================================================================
+
+    @app.get("/api/pc/drives", dependencies=[Depends(require_auth)])
+    def api_pc_drives() -> dict[str, Any]:
+        cfg = config_store.config
+        return list_pc_drives(
+            cfg.workspaces,
+            cfg.effective_active_workspace(),
+            cfg.ai_access_mode,
+        )
+
+    @app.get("/api/pc/list", dependencies=[Depends(require_auth)])
+    def api_pc_list(
+        path: str = Query(default=""),
+        show_hidden: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        cfg = config_store.config
+        try:
+            return list_pc_directory(
+                path,
+                cfg.workspaces,
+                cfg.ai_access_mode,
+                show_hidden=show_hidden,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except NotADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.get("/api/pc/stat", dependencies=[Depends(require_auth)])
+    def api_pc_stat(path: str = Query(...)) -> dict[str, Any]:
+        cfg = config_store.config
+        try:
+            return stat_pc_entry(path, cfg.workspaces, cfg.ai_access_mode)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/pc/read", dependencies=[Depends(require_auth)])
+    def api_pc_read(path: str = Query(...)) -> dict[str, Any]:
+        try:
+            return read_pc_file(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/pc/write", dependencies=[Depends(require_auth)])
+    def api_pc_write(body: PCWriteFileRequest) -> dict[str, Any]:
+        try:
+            return write_pc_file(body.path, body.content)
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/pc/create", dependencies=[Depends(require_auth)])
+    def api_pc_create(body: PCCreateEntryRequest) -> dict[str, Any]:
+        try:
+            return create_pc_entry(body.path, is_dir=body.is_dir, content=body.content)
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/pc/move", dependencies=[Depends(require_auth)])
+    def api_pc_move(body: PCMoveOrCopyRequest) -> dict[str, Any]:
+        try:
+            return rename_or_move_pc_entry(body.src_path, body.dst_path, overwrite=body.overwrite)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/pc/copy", dependencies=[Depends(require_auth)])
+    def api_pc_copy(body: PCMoveOrCopyRequest) -> dict[str, Any]:
+        try:
+            return copy_pc_entry(body.src_path, body.dst_path, overwrite=body.overwrite)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.delete("/api/pc/delete", dependencies=[Depends(require_auth)])
+    def api_pc_delete(path: str = Query(...)) -> dict[str, Any]:
+        try:
+            return delete_pc_entry(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/pc/upload", dependencies=[Depends(require_auth)])
+    async def api_pc_upload(
+        request: Request,
+        dir_path: str = Query(default=""),
+        filename: str = Query(default=""),
+    ) -> dict[str, Any]:
+        """Upload a file from the phone to the PC (supports either JSON base64 or raw binary body)."""
+        cfg = config_store.config
+        content_type = request.headers.get("content-type", "").lower()
+
+        if "application/json" in content_type:
+            body_json = await request.json()
+            target_dir_str = str(body_json.get("dir_path") or dir_path or "").strip()
+            fname = str(body_json.get("filename") or filename or "uploaded_file").strip()
+            b64 = str(body_json.get("base64_data") or "")
+            raw_bytes = base64.b64decode(b64)
+        else:
+            target_dir_str = dir_path.strip()
+            fname = filename.strip() or "uploaded_file"
+            raw_bytes = await request.body()
+
+        safe_fname = Path(fname).name
+        if not target_dir_str:
+            target_dir = Path(cfg.effective_active_workspace()) / "uploads"
+        else:
+            if len(target_dir_str) == 2 and target_dir_str[1] == ":":
+                target_dir_str += "\\"
+            target_dir = Path(target_dir_str).resolve()
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dest_file = target_dir / safe_fname
+        dest_file.write_bytes(raw_bytes)
+        st = dest_file.stat()
+        return {
+            "ok": True,
+            "name": dest_file.name,
+            "path": str(dest_file.resolve()),
+            "dir": str(target_dir.resolve()),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        }
+
+    @app.get("/api/pc/download", dependencies=[Depends(require_auth)])
+    def api_pc_download(path: str = Query(...)) -> FileResponse:
+        """Download any file from the PC to the user's phone."""
+        target = Path(path.strip()).resolve()
+        if not target.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {path}")
+        if target.is_dir():
+            raise HTTPException(status_code=400, detail="Cannot download a directory directly")
+        mime, _ = mimetypes.guess_type(target.name)
+        return FileResponse(
+            path=target,
+            filename=target.name,
+            media_type=mime or "application/octet-stream",
+        )
+
+    # --- Workspace File & Git APIs (Legacy & Workspace-Scoped) ---
 
     @app.get("/api/files/tree", dependencies=[Depends(require_auth)])
     def api_list_tree(
@@ -559,9 +813,9 @@ def main() -> None:
 
     pid_path.write_text(str(os.getpid()), encoding="utf-8")
     print("=" * 60)
-    print(f"DeepSeek Mobile Bridge v{VERSION} (iOS PWA)")
+    print(f"DeepSeek Mobile Bridge v{VERSION} (iOS Liquid Glass & Full PC File Manager)")
     print(f"Listening: http://{cfg.host}:{cfg.port} (Health: /api/health)")
-    print(f"Workspaces: {', '.join(cfg.workspaces)}")
+    print(f"Workspaces: {', '.join(cfg.workspaces)} (AI Mode: {cfg.ai_access_mode})")
     print(f"Model: {cfg.model} ({cfg.effective_base_url()})")
     print(f"Auth Token: {cfg.auth_token}")
     print(f"Config Path: {store.config_path}")

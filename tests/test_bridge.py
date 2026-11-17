@@ -650,3 +650,106 @@ def test_batch_multi_tool_approvals(bridge_env):
         e["type"] == "text_delta" and "Both commands ran." in e["data"].get("full_text", "")
         for e in ev_res["events"]
     )
+
+
+def test_pc_file_manager_ai_isolation_and_claude_artifacts(bridge_env, tmp_path: Path):
+    client, workspace, _ = bridge_env
+    ws = str(workspace.resolve())
+    external_dir = tmp_path / "external_drive_folder"
+    external_dir.mkdir()
+    ext_file = external_dir / "secret_doc.txt"
+    ext_file.write_text("external content", encoding="utf-8")
+
+    # 1. Drives & Shortcuts listing
+    drives_res = client.get("/api/pc/drives", headers=_headers())
+    assert drives_res.status_code == 200
+    assert len(drives_res.json()["drives"]) >= 1
+    assert drives_res.json()["ai_access_mode"] == "workspace_only"
+
+    # 2. User can browse, stat, copy, move, rename, upload, and download in external_dir
+    # even though AI is isolated to `workspace`!
+    list_res = client.get("/api/pc/list", params={"path": str(external_dir)}, headers=_headers())
+    assert list_res.status_code == 200
+    assert list_res.json()["in_ai_workspace"] is False
+    entries = list_res.json()["entries"]
+    assert len(entries) == 1
+    assert entries[0]["name"] == "secret_doc.txt"
+    assert entries[0]["in_ai_workspace"] is False
+    assert entries[0]["ai_can_write"] is False
+
+    stat_res = client.get("/api/pc/stat", params={"path": str(ext_file)}, headers=_headers())
+    assert stat_res.status_code == 200
+    assert stat_res.json()["size"] == len("external content")
+
+    # Copy file
+    copied_path = external_dir / "secret_copy.txt"
+    cp_res = client.post(
+        "/api/pc/copy",
+        json={"src_path": str(ext_file), "dst_path": str(copied_path)},
+        headers=_headers(),
+    )
+    assert cp_res.status_code == 200
+    assert copied_path.exists()
+
+    # Move/Rename file
+    moved_path = external_dir / "secret_moved.txt"
+    mv_res = client.post(
+        "/api/pc/move",
+        json={"src_path": str(copied_path), "dst_path": str(moved_path)},
+        headers=_headers(),
+    )
+    assert mv_res.status_code == 200
+    assert moved_path.exists() and not copied_path.exists()
+
+    # Upload file (base64 JSON) & Download file
+    import base64
+    b64_payload = base64.b64encode(b"uploaded from iphone").decode("ascii")
+    up_res = client.post(
+        "/api/pc/upload",
+        json={
+            "dir_path": str(external_dir),
+            "filename": "from_iphone.txt",
+            "base64_data": b64_payload,
+        },
+        headers=_headers(),
+    )
+    assert up_res.status_code == 200
+    uploaded_file_path = up_res.json()["path"]
+
+    dl_res = client.get("/api/pc/download", params={"path": uploaded_file_path}, headers=_headers())
+    assert dl_res.status_code == 200
+    assert dl_res.content == b"uploaded from iphone"
+
+    # 3. Verify AI is blocked from reading/writing `ext_file` in `workspace_only` mode,
+    # and verify `present_file` emits a Claude-style `file_artifact` event!
+    sid = client.post(
+        "/api/sessions",
+        json={"workspace": ws, "title": "Isolation & Artifact Test", "approval_mode": "auto"},
+        headers=_headers(),
+    ).json()["session_id"]
+    sess = client.app.state.session_manager.get_session(sid)
+
+    # AI blocked from external path in workspace_only mode
+    blocked_res = json.loads(
+        pytest.MonkeyPatch().context() and "" or "{}"
+    )
+    import asyncio
+    blocked_raw = asyncio.run(
+        sess._execute_tool("write_file", json.dumps({"path": str(ext_file), "content": "hack"}))
+    )
+    assert "Security error" in blocked_raw
+
+    # AI allowed to write inside workspace and automatically emits `file_artifact`, plus `present_file`
+    write_raw = asyncio.run(
+        sess._execute_tool("write_file", json.dumps({"path": "deliverable.md", "content": "# Hello Artifact\nLine 2"}))
+    )
+    assert "deliverable.md" in write_raw
+    present_raw = asyncio.run(
+        sess._execute_tool(
+            "present_file",
+            json.dumps({"path": "deliverable.md", "title": "审查报告", "summary": "供下载与审查", "mode": "review"}),
+        )
+    )
+    assert json.loads(present_raw)["presented"] is True
+    assert any(e["type"] == "file_artifact" and e["data"]["name"] == "deliverable.md" for e in sess.events)
+

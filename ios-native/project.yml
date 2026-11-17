@@ -27,9 +27,11 @@ targets:
       properties:
         CFBundleDisplayName: DeepSeek Go
         CFBundleIconName: AppIcon
-        CFBundleShortVersionString: "0.6.1"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.7.0"
+        CFBundleVersion: "8"
         UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:
@@ -59,8 +61,8 @@ targets:
       path: DeepSeekIslandExtension/Info.plist
       properties:
         CFBundleDisplayName: DeepSeek Island
-        CFBundleShortVersionString: "0.6.1"
-        CFBundleVersion: "7"
+        CFBundleShortVersionString: "0.7.0"
+        CFBundleVersion: "8"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
