@@ -326,12 +326,16 @@ def test_settings_secret_preservation_multi_provider_anthropic_and_queue(v8_env,
 
 
 def test_diagnostics_logs_and_selfcheck(v8_env):
+    import os as _os
+
     client, _workspace, _data_dir, _dsh_dir = v8_env
     st = client.get("/api/diagnostics/status", headers=_headers())
     assert st.status_code == 200
     body = st.json()
     assert body["version"] == VERSION
     assert body["model"]["api_key_configured"] is True
+    if _os.name == "nt":
+        assert isinstance(body["memory_mb"], (int, float)) and body["memory_mb"] > 0
 
     sc = client.post("/api/diagnostics/selfcheck", headers=_headers())
     assert sc.status_code == 200

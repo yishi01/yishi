@@ -190,8 +190,16 @@ def _get_process_memory_mb() -> float | None:
 
             counters = PROCESS_MEMORY_COUNTERS()
             counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.K32GetProcessMemoryInfo.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                ctypes.c_ulong,
+            ]
+            k32.K32GetProcessMemoryInfo.restype = ctypes.c_bool
+            handle = k32.GetCurrentProcess()
+            if k32.K32GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
                 return round(counters.WorkingSetSize / (1024 * 1024), 1)
         except Exception:
             pass

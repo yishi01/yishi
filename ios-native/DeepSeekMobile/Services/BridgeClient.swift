@@ -5,7 +5,7 @@ import SwiftUI
 @MainActor
 final class BridgeClient: ObservableObject {
     static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
-    static let initialCloudflareURL = "https://version-bowl-search-drama.trycloudflare.com"
+    static let initialCloudflareURL = "https://patterns-traveller-replied-parallel.trycloudflare.com"
     static let defaultPresetURLs: [(label: String, url: String)] = [
         ("Wi-Fi 局域网直连", "http://192.168.31.190:8765"),
         ("Tailscale 域名", "http://dsh-pc"),
