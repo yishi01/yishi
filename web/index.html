@@ -43,14 +43,18 @@
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h10M4 17h16"/></svg>
           </button>
           <div class="header-title-wrap">
-            <div id="header-session-title" class="header-title">DeepSeek</div>
+            <div id="header-session-title" class="header-title" title="点击重命名会话">DeepSeek</div>
             <div class="header-sub">
               <span id="conn-badge" class="status-dot offline"></span>
               <span id="conn-label">未连接</span>
               <span class="sep">·</span>
-              <select id="workspace-select" class="inline-select" aria-label="切换工作区"></select>
+              <select id="workspace-profile-select" class="inline-select" aria-label="切换工作区档案" title="切换工作区档案"></select>
+              <button id="manage-workspace-profile-btn" class="inline-icon-btn" title="管理工作区档案與共享备注" aria-label="管理工作区档案">⚙️</button>
+              <span class="sep">·</span>
+              <select id="workspace-select" class="inline-select" aria-label="切换工作区目录"></select>
             </div>
           </div>
+          <button id="open-browser-btn" class="icon-btn ghost" title="打开协同浏览器" aria-label="协同浏览器">🌐</button>
           <button id="new-session-btn" class="icon-btn ghost" aria-label="新建会话">
             <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>
           </button>
@@ -63,9 +67,15 @@
         <div class="drawer-panel">
           <div class="drawer-header">
             <strong>对话历史</strong>
-            <button id="close-drawer-btn" class="icon-btn ghost" aria-label="关闭">
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
-            </button>
+            <div class="row-gap" style="align-items:center">
+              <label class="drawer-filter-toggle" title="仅显示当前工作区档案下的会话">
+                <input id="filter-ws-sessions-chk" type="checkbox" />
+                <span>仅当前工作区</span>
+              </label>
+              <button id="close-drawer-btn" class="icon-btn ghost" aria-label="关闭">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+              </button>
+            </div>
           </div>
           <div id="session-list" class="session-list"></div>
         </div>
@@ -79,7 +89,9 @@
           <div id="pending-box" class="pending-box hidden"></div>
           <div class="composer">
             <div class="composer-card">
+              <div id="composer-attachments" class="composer-attachments hidden"></div>
               <textarea id="chat-input" rows="1" placeholder="给 DeepSeek 发送消息" enterkeyhint="send"></textarea>
+              <input id="image-file-input" type="file" accept="image/*" multiple class="hidden" />
               <div class="composer-tools">
                 <div class="composer-tools-left">
                   <select id="quick-model-select" class="model-chip" aria-label="切换模型">
@@ -87,7 +99,10 @@
                     <option value="deepseek-chat">deepseek-chat</option>
                     <option value="deepseek-reasoner">deepseek-reasoner</option>
                   </select>
-                  <button id="mention-open-file-btn" class="chip-btn hidden">@ 引用文件</button>
+                  <button id="upload-image-btn" type="button" class="chip-btn action-chip" title="上传图片附件">🖼️ 图片</button>
+                  <button id="pc-screenshot-btn" type="button" class="chip-btn action-chip" title="抓取电脑屏幕截图">🖥️ 截电脑屏</button>
+                  <button id="composer-browser-btn" type="button" class="chip-btn action-chip" title="在聊天中打开协同浏览器">🌐 浏览器</button>
+                  <button id="mention-open-file-btn" type="button" class="chip-btn hidden">@ 引用文件</button>
                   <span id="agent-state-pill" class="state-pill">空闲</span>
                 </div>
                 <div class="composer-tools-right">
@@ -165,6 +180,83 @@
               <pre id="git-diff-view" class="diff-view"></pre>
             </div>
 
+            <!-- Module E: API Wallet & Auto-Downgrade Card -->
+            <div class="section-title">API 钱包与额度降级</div>
+            <div class="card" id="wallet-card">
+              <div class="card-head">
+                <div>
+                  <strong>💰 API 钱包与自动降级</strong>
+                  <div id="wallet-updated-label" class="muted small-text">实时统计 Token 与费用</div>
+                </div>
+                <div class="row-gap">
+                  <button id="wallet-refresh-btn" class="btn small">刷新余额</button>
+                </div>
+              </div>
+
+              <div id="wallet-downgrade-banner" class="wallet-alert-banner hidden">
+                <span id="wallet-downgrade-text">已触发自动降级保护</span>
+                <button id="wallet-reset-downgrade-btn" class="btn small">恢复原模型</button>
+              </div>
+
+              <div class="wallet-metrics-grid">
+                <div class="wallet-metric-box">
+                  <span class="wallet-metric-label">当前可用余额</span>
+                  <strong id="wallet-balance-val" class="wallet-metric-val">--</strong>
+                  <span id="wallet-balance-sub" class="muted small-text">来源: 未查询</span>
+                </div>
+                <div class="wallet-metric-box">
+                  <span class="wallet-metric-label">今日消耗</span>
+                  <strong id="wallet-today-cost" class="wallet-metric-val">¥0.0000</strong>
+                  <span id="wallet-today-tokens" class="muted small-text">0 Tokens · 0 轮</span>
+                </div>
+                <div class="wallet-metric-box">
+                  <span class="wallet-metric-label">当前小时消耗</span>
+                  <strong id="wallet-hour-cost" class="wallet-metric-val">¥0.0000</strong>
+                  <span id="wallet-hour-tokens" class="muted small-text">0 Tokens</span>
+                </div>
+              </div>
+
+              <div id="wallet-models-breakdown" class="wallet-models-breakdown"></div>
+
+              <details class="collapsible-card">
+                <summary style="cursor:pointer;font-weight:600">⚙️ 自动降级阈值与手动额度规则</summary>
+                <div style="display:flex;flex-direction:column;gap:10px;margin-top:10px">
+                  <label class="row-between" style="font-size:13px">
+                    <span>启用低余额 / 超额自动降级</span>
+                    <input id="wallet-rule-enabled" type="checkbox" checked />
+                  </label>
+                  <div class="wallet-rules-grid">
+                    <label class="field">
+                      <span>余额低于阈值触发 (CNY)</span>
+                      <input id="wallet-rule-balance-below" type="number" step="0.5" placeholder="5.0" />
+                    </label>
+                    <label class="field">
+                      <span>单日消费超过触发 (CNY)</span>
+                      <input id="wallet-rule-daily-above" type="number" step="1" placeholder="20.0" />
+                    </label>
+                  </div>
+                  <div class="wallet-rules-grid">
+                    <label class="field">
+                      <span>降级目标备用模型 Profile</span>
+                      <input id="wallet-rule-fallback" type="text" placeholder="deepseek-flash" />
+                    </label>
+                    <label class="field">
+                      <span>手动设定初始余额 (可选，无官方余额API时估算)</span>
+                      <input id="wallet-rule-manual-balance" type="number" step="1" placeholder="留空则使用官方 API" />
+                    </label>
+                  </div>
+                  <label class="row-between" style="font-size:13px">
+                    <span>触发降级时发送 Bark 推送通知</span>
+                    <input id="wallet-rule-bark" type="checkbox" checked />
+                  </label>
+                  <div class="row-between">
+                    <span id="wallet-rules-status" class="muted small-text"></span>
+                    <button id="save-wallet-rules-btn" class="btn primary small">保存降级规则</button>
+                  </div>
+                </div>
+              </details>
+            </div>
+
             <div class="section-title">设置</div>
             <div class="card">
               <div class="card-head">
@@ -225,6 +317,61 @@
       </nav>
     </div>
   </div>
+
+  <!-- Module A: Workspace Profile Manager Modal -->
+  <div id="workspace-profile-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="card-head">
+        <strong id="ws-modal-title">管理工作区档案</strong>
+        <button id="close-ws-modal-btn" class="icon-btn ghost" aria-label="关闭">✕</button>
+      </div>
+      <label class="field">
+        <span>选择或新建档案</span>
+        <select id="ws-modal-select"></select>
+      </label>
+      <label class="field">
+        <span>档案名称</span>
+        <input id="ws-modal-name" type="text" placeholder="例如：核心后端项目" />
+      </label>
+      <label class="field">
+        <span>绑定根目录路径</span>
+        <input id="ws-modal-root" type="text" placeholder="C:\Users\..." />
+      </label>
+      <label class="field">
+        <span>跨对话共享记忆 / 备注 (Shared Notes)</span>
+        <textarea id="ws-modal-notes" rows="3" placeholder="记录该项目架构约定、常用命令或长期上下文，工作区内所有对话自动共享..."></textarea>
+      </label>
+      <label class="row-between" style="font-size:13px">
+        <span>允许跨对话读取历史上下文 (Cross-Session Read)</span>
+        <input id="ws-modal-cross-read" type="checkbox" checked />
+      </label>
+      <div class="row-between" style="margin-top:6px">
+        <button id="ws-modal-delete-btn" class="btn small danger-outline">删除档案</button>
+        <div class="row-gap">
+          <button id="ws-modal-new-btn" class="btn small">新建空白</button>
+          <button id="ws-modal-save-btn" class="btn primary small">保存并激活</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Module B: Full-Screen Zoomable Image Lightbox Modal -->
+  <div id="image-lightbox-modal" class="lightbox-overlay hidden">
+    <div class="lightbox-toolbar">
+      <span id="lightbox-caption" class="lightbox-caption">图片预览</span>
+      <div class="row-gap">
+        <button id="lightbox-zoom-out-btn" class="btn small">－</button>
+        <button id="lightbox-zoom-reset-btn" class="btn small">100%</button>
+        <button id="lightbox-zoom-in-btn" class="btn small">＋</button>
+        <a id="lightbox-download-link" class="btn small" download target="_blank" rel="noopener">下载</a>
+        <button id="lightbox-close-btn" class="btn small danger">关闭</button>
+      </div>
+    </div>
+    <div id="lightbox-stage" class="lightbox-stage">
+      <img id="lightbox-img" src="" alt="Preview" />
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden"></div>
   <script type="module" src="/app.js"></script>
 </body>

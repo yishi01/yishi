@@ -1507,3 +1507,575 @@ select:focus {
 .drawer.hidden {
   animation: none;
 }
+
+
+/* ==========================================================================
+   v0.9.0 Extensions: Workspace Profiles, Turn Actions, Attachments, Lightbox,
+   Collaborative Browser Card, Agent Team Card & API Wallet Panel
+   ========================================================================== */
+
+.inline-icon-btn {
+  border: none;
+  background: transparent;
+  padding: 1px 4px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 6px;
+  line-height: 1;
+}
+
+.inline-icon-btn:active {
+  background: var(--surface-2);
+}
+
+.drawer-filter-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.drawer-filter-toggle input {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin: 0;
+}
+
+.session-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+/* ---------- Composer Attachments & Action Chips ---------- */
+.action-chip {
+  color: var(--text-2);
+  background: var(--surface);
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.action-chip:active {
+  background: var(--surface-2);
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 4px 2px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.att-Input-thumb {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+}
+
+.att-Input-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  cursor: pointer;
+}
+
+.att-remove-btn {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(17, 17, 20, 0.72);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* ---------- Turn Attachments & Action Bar & Usage Badge ---------- */
+.turn-attachments-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.turn-att-img {
+  max-width: 180px;
+  max-height: 140px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  cursor: zoom-in;
+  background: var(--surface);
+  transition: transform 0.12s ease;
+}
+
+.turn-att-img:active {
+  transform: scale(0.98);
+}
+
+.turn-footer-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 6px;
+  padding-top: 4px;
+}
+
+.msg.user .turn-footer-bar {
+  justify-content: flex-end;
+  margin-top: 6px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.turn-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.turn-act-btn {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.turn-act-btn:hover,
+.turn-act-btn:active {
+  background: var(--surface-2);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.turn-act-btn.danger:hover,
+.turn-act-btn.danger:active {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.turn-usage-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+  background: var(--surface);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.model-switch-banner {
+  align-self: stretch;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--amber-soft);
+  border: 1px solid #fde68a;
+  color: #92400e;
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+/* ---------- Module F: Inline Collaborative Browser Card ---------- */
+.browser-chat-card {
+  align-self: stretch;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.browser-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px;
+  background: #0f172a;
+  color: #f8fafc;
+}
+
+.browser-nav-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.browser-icon-btn {
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #e2e8f0;
+  border-radius: 7px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.browser-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.browser-url-form {
+  flex: 1;
+  min-width: 160px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.browser-url-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 10px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #f8fafc;
+  font-family: var(--mono);
+}
+
+.browser-control-btn {
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+}
+
+.browser-control-btn.agent {
+  background: #2563eb;
+  color: #fff;
+}
+
+.browser-control-btn.human {
+  background: #d97706;
+  color: #fff;
+}
+
+.browser-gate-banner {
+  padding: 7px 12px;
+  background: var(--red-soft);
+  border-bottom: 1px solid #fecaca;
+  color: #b91c1c;
+  font-size: 12.5px;
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.browser-viewport-wrap {
+  position: relative;
+  width: 100%;
+  background: #0f172a;
+  line-height: 0;
+  overflow: hidden;
+}
+
+.browser-viewport-img {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 960 / 640;
+  object-fit: contain;
+  cursor: crosshair;
+  display: block;
+  user-select: none;
+}
+
+.browser-elements-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  max-height: 112px;
+  overflow-y: auto;
+}
+
+.browser-el-chip {
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+  color: var(--text-2);
+  border-radius: 999px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  cursor: pointer;
+  max-width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-el-chip strong {
+  color: var(--accent);
+}
+
+.browser-el-chip:active {
+  background: var(--accent-soft);
+}
+
+/* ---------- Module D: Agent Team Status Card ---------- */
+.agent-team-card {
+  align-self: stretch;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-team-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.agent-team-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agent-member-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.agent-member-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.agent-member-title {
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.agent-member-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.agent-status-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.agent-status-badge.running {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.agent-status-badge.completed,
+.agent-status-badge.done {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.agent-status-badge.failed,
+.agent-status-badge.cancelled,
+.agent-status-badge.error {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+/* ---------- Module E: API Wallet Panel ---------- */
+.wallet-alert-banner {
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  background: var(--amber-soft);
+  border: 1px solid #fde68a;
+  color: #92400e;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wallet-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+  gap: 8px;
+}
+
+.wallet-metric-box {
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.wallet-metric-label {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.wallet-metric-val {
+  font-size: 18px;
+  font-weight: 650;
+  color: var(--text);
+  font-family: var(--mono);
+}
+
+.wallet-models-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12.5px;
+}
+
+.wallet-model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.wallet-rules-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+}
+
+/* ---------- Modals & Lightbox ---------- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  background: rgba(17, 17, 20, 0.42);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  animation: fade-in 0.16s ease;
+}
+
+.modal-card {
+  width: 100%;
+  max-width: 440px;
+  max-height: 88dvh;
+  overflow-y: auto;
+  background: var(--bg);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.lightbox-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 95;
+  background: rgba(10, 10, 14, 0.92);
+  display: flex;
+  flex-direction: column;
+  animation: fade-in 0.15s ease;
+}
+
+.lightbox-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: calc(10px + var(--safe-top)) 14px 10px;
+  background: rgba(17, 17, 22, 0.85);
+  color: #fff;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.lightbox-caption {
+  font-size: 13px;
+  color: #e2e8f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lightbox-stage {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+
+.lightbox-stage img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  transition: transform 0.15s ease;
+  transform-origin: center center;
+}

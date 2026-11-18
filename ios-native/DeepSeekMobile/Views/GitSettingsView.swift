@@ -10,6 +10,7 @@ struct GitSettingsView: View {
     enum SettingsSection: String, CaseIterable {
         case appearance = "美化定制"
         case modelsSearch = "模型与搜索"
+        case wallet = "API 钱包"
         case diagnostics = "版本与日志"
         case workspaceGit = "工作区·Git"
     }
@@ -78,6 +79,17 @@ struct GitSettingsView: View {
                 case .modelsSearch:
                     multiModelProfilesCard
                     searchProviderCard
+                case .wallet:
+                    WalletDashboardCardView(
+                        wallet: client.walletSummary,
+                        modelProfiles: client.modelProfiles,
+                        onRefresh: {
+                            Task { await client.loadWalletSummary(forceBalance: true) }
+                        },
+                        onSaveRules: { rules in
+                            Task { await client.saveWalletRules(rules) }
+                        }
+                    )
                 case .diagnostics:
                     versionHealthCard
                     logsViewerCard
@@ -111,6 +123,7 @@ struct GitSettingsView: View {
         }
         .onAppear {
             Task {
+                await client.loadWalletSummary()
                 await client.refreshGitDiff()
                 await client.refreshTunnelStatus()
                 await client.loadPCDiagnostics()
@@ -306,6 +319,14 @@ struct GitSettingsView: View {
                                         .padding(.vertical, 1.5)
                                         .background(Capsule().fill(theme.accentColor.opacity(0.12)))
                                         .foregroundStyle(theme.accentColor)
+                                    if prof.supportsVision {
+                                        Text("👁️ 视觉")
+                                            .font(.system(size: 9.5, weight: .bold))
+                                            .padding(.horizontal, 5.5)
+                                            .padding(.vertical, 1.5)
+                                            .background(Capsule().fill(Color.green.opacity(0.14)))
+                                            .foregroundStyle(.green)
+                                    }
                                 }
                                 Text("\(prof.model) · \(prof.hasAPIKey ? "Key已配置 \(prof.apiKeyMasked)" : "未填Key")")
                                     .font(.system(size: 11, design: .monospaced))
@@ -1023,6 +1044,7 @@ private struct ModelProfileEditorView: View {
                     Stepper("最大输出 Tokens: \(profile.maxTokens)", value: $profile.maxTokens, in: 1024...32768, step: 1024)
                     Toggle("启用工具调用 (Tools)", isOn: $profile.supportsTools)
                     Toggle("思考模型 (Reasoning)", isOn: $profile.supportsReasoning)
+                    Toggle("支持多模态视觉看图 (Vision)", isOn: $profile.supportsVision)
                 }
 
                 Section {

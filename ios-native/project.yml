@@ -27,12 +27,15 @@ targets:
       properties:
         CFBundleDisplayName: DeepSeek Go
         CFBundleIconName: AppIcon
-        CFBundleShortVersionString: "0.8.1"
-        CFBundleVersion: "13"
+        CFBundleShortVersionString: "0.9.0"
+        CFBundleVersion: "14"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         NSLocalNetworkUsageDescription: "用于通过同一 Wi-Fi 局域网直连电脑端 DeepSeek 工作区与全盘文件服务"
+        NSPhotoLibraryUsageDescription: "用于从手机相册选择图片发送给 DeepSeek 多模态模型分析"
+        NSPhotoLibraryAddUsageDescription: "用于保存对话中的图片与电脑屏幕截图到手机相册"
+        NSCameraUsageDescription: "用于拍照并直接发送给 DeepSeek 进行多模态视觉识别"
         CFBundleURLTypes:
           - CFBundleTypeRole: Editor
             CFBundleURLName: com.agy.deepseek.mobile.deeplink
@@ -67,8 +70,8 @@ targets:
       path: DeepSeekIslandExtension/Info.plist
       properties:
         CFBundleDisplayName: DeepSeek Island
-        CFBundleShortVersionString: "0.8.1"
-        CFBundleVersion: "13"
+        CFBundleShortVersionString: "0.9.0"
+        CFBundleVersion: "14"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:

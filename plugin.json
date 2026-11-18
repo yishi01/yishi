@@ -1,7 +1,7 @@
 {
   "name": "agy-mobile-bridge",
   "displayName": "DeepSeek Mobile Bridge (iOS)",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Mobile-first iOS PWA agent workbench powered by DeepSeek with workspace file browsing, CodeMirror 6 editing, Git diff review, and live command approvals.",
   "suggestedPrompts": [
     "Check the status of the DeepSeek mobile bridge sidecar",

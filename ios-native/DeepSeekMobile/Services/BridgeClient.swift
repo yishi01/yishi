@@ -19,6 +19,7 @@ final class BridgeClient: ObservableObject {
     @AppStorage("ds_rendezvous_gist_id") var savedRendezvousGistID: String = ""
     @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
+    @AppStorage("ds_active_workspace_profile_id") var activeWorkspaceProfileId: String = "ws_default"
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
     @AppStorage("ds_has_paired_once") var hasPairedOnce: Bool = false
     @AppStorage("ds_last_bundled_build") var lastBundledBuild: String = ""
@@ -38,6 +39,7 @@ final class BridgeClient: ObservableObject {
 
     // Settings, Model Profiles & Search Config
     @Published var workspaces: [String] = []
+    @Published var workspaceProfiles: [WorkspaceProfileItem] = []
     @Published var aiAccessMode: String = "workspace_only"
     @Published var selectedModel: String = "deepseek-flash"
     @Published var activeProfileId: String = "deepseek-flash"
@@ -54,13 +56,19 @@ final class BridgeClient: ObservableObject {
     @Published var searchConfig: SearchConfigItem = SearchConfigItem()
     @Published var dshProfileDir: String = ""
 
-    // Sessions, Chat Turns, Queue & Review Approvals
+    // Sessions, Chat Turns, Attachments, Queue & Review Approvals
     @Published var sessions: [SessionSummaryItem] = []
     @Published var turns: [ChatTurnItem] = []
+    @Published var pendingAttachments: [ChatAttachmentItem] = []
+    @Published var editingTurnId: String? = nil
     @Published var pendingApprovals: [PendingApprovalItem] = []
     @Published var activeApprovalForPopup: PendingApprovalItem?
     @Published var queuedMessages: [QueuedMessageItem] = []
     @Published var sessionStatus: String = "idle"
+
+    // v0.9.0 Wallet & Built-in Collaborative Browser
+    @Published var walletSummary: WalletSummaryData = WalletSummaryData()
+    @Published var activeBrowserSessions: [String: BrowserSessionState] = [:]
 
     // Full PC File Manager State
     @Published var pcDrives: [PCDriveItem] = []
@@ -499,10 +507,12 @@ final class BridgeClient: ObservableObject {
             isAuthenticated = true
             isConnecting = false
             Haptics.success()
+            await loadWorkspaceProfiles()
             await loadSessions()
             await loadPCDrives()
             await loadPCDirectory(activeWorkspace)
             await loadPlugins()
+            await loadWalletSummary()
             await refreshGitDiff()
         } else {
             isConnecting = false
@@ -790,6 +800,7 @@ final class BridgeClient: ObservableObject {
                     maxTokens: (item["max_tokens"] as? Int) ?? 8192,
                     supportsTools: (item["supports_tools"] as? Bool) ?? true,
                     supportsReasoning: (item["supports_reasoning"] as? Bool) ?? false,
+                    supportsVision: (item["supports_vision"] as? Bool) ?? false,
                     hasAPIKey: (item["has_api_key"] as? Bool) ?? false,
                     apiKeyMasked: (item["api_key_masked"] as? String) ?? "",
                     inheritsGlobalKey: (item["inherits_global_key"] as? Bool) ?? false
@@ -925,6 +936,7 @@ final class BridgeClient: ObservableObject {
                 "max_tokens": p.maxTokens,
                 "supports_tools": p.supportsTools,
                 "supports_reasoning": p.supportsReasoning,
+                "supports_vision": p.supportsVision,
             ]
             if let overrideKey = apiKeyOverrides[p.id]?.trimmingCharacters(in: .whitespacesAndNewlines), !overrideKey.isEmpty {
                 dict["api_key"] = overrideKey
@@ -1072,13 +1084,16 @@ final class BridgeClient: ObservableObject {
                         sessionId: sid,
                         title: (item["title"] as? String) ?? "Session",
                         status: (item["status"] as? String) ?? "idle",
-                        model: (item["model"] as? String) ?? "deepseek-flash"
+                        model: (item["model"] as? String) ?? "deepseek-flash",
+                        workspaceProfileId: (item["workspace_profile_id"] as? String) ?? "ws_default",
+                        workspace: (item["workspace"] as? String) ?? ""
                     )
                 }
                 self.sessions = parsed
                 if activeSessionId.isEmpty || !parsed.contains(where: { $0.sessionId == activeSessionId }) {
-                    if let first = parsed.first {
-                        activeSessionId = first.sessionId
+                    let matchingWS = parsed.first(where: { $0.workspaceProfileId == activeWorkspaceProfileId })
+                    if let chosen = matchingWS ?? parsed.first {
+                        activeSessionId = chosen.sessionId
                     } else {
                         _ = try? await createNewSession()
                         return
@@ -1093,6 +1108,7 @@ final class BridgeClient: ObservableObject {
         let ws = activeWorkspace.isEmpty ? (workspaces.first ?? "") : activeWorkspace
         let payload: [String: Any] = [
             "workspace": ws,
+            "workspace_profile_id": activeWorkspaceProfileId,
             "title": "New Session",
             "model": selectedModel,
             "profile_id": activeProfileId,
@@ -1106,7 +1122,9 @@ final class BridgeClient: ObservableObject {
                 sessionId: sid,
                 title: (json["title"] as? String) ?? "New Session",
                 status: (json["status"] as? String) ?? "idle",
-                model: (json["model"] as? String) ?? selectedModel
+                model: (json["model"] as? String) ?? selectedModel,
+                workspaceProfileId: (json["workspace_profile_id"] as? String) ?? activeWorkspaceProfileId,
+                workspace: (json["workspace"] as? String) ?? ws
             )
             sessions.insert(item, at: 0)
             await selectSession(sid)
@@ -1117,6 +1135,7 @@ final class BridgeClient: ObservableObject {
 
     func selectSession(_ sessionId: String) async {
         activeSessionId = sessionId
+        editingTurnId = nil
         turns = []
         pendingApprovals = []
         queuedMessages = []
@@ -1242,6 +1261,7 @@ final class BridgeClient: ObservableObject {
             lastSeq = seq
         }
         let d = (msg["data"] as? [String: Any]) ?? [:]
+        let turnId = (d["turn_id"] as? String) ?? (msg["turn_id"] as? String) ?? ""
         if let sess = d["session"] as? [String: Any] {
             applySessionSummary(sess)
         }
@@ -1249,35 +1269,122 @@ final class BridgeClient: ObservableObject {
         switch type {
         case "user_message":
             let text = (d["text"] as? String) ?? ""
-            turns.append(ChatTurnItem(id: UUID().uuidString, userText: text))
+            let atts = Self.parseAttachmentItems((d["attachments"] as? [[String: Any]]) ?? [])
+            if !turnId.isEmpty, let existingIdx = turns.firstIndex(where: { $0.turnId == turnId || $0.id == turnId }) {
+                turns[existingIdx].userText = text
+                if !atts.isEmpty {
+                    turns[existingIdx].attachments = atts
+                }
+            } else {
+                turns.append(
+                    ChatTurnItem(
+                        id: turnId.isEmpty ? UUID().uuidString : turnId,
+                        turnId: turnId,
+                        userText: text,
+                        attachments: atts
+                    )
+                )
+            }
             if wsSynced {
                 LiveActivityController.shared.notifyTurnStarted(sessionTitle: "DeepSeek")
             }
 
+        case "turn_deleted":
+            let tid = (d["turn_id"] as? String) ?? turnId
+            if !tid.isEmpty {
+                turns.removeAll { $0.turnId == tid || $0.id == tid }
+            }
+
+        case "turns_truncated":
+            if let removed = d["removed_turn_ids"] as? [String], !removed.isEmpty {
+                turns.removeAll { removed.contains($0.turnId) || removed.contains($0.id) }
+            } else if let fromTid = d["from_turn_id"] as? String,
+                      !fromTid.isEmpty,
+                      let idx = turns.firstIndex(where: { $0.turnId == fromTid || $0.id == fromTid }) {
+                turns.removeSubrange(idx..<turns.count)
+            }
+
+        case "session_updated":
+            let sid = (d["session_id"] as? String) ?? activeSessionId
+            if let idx = sessions.firstIndex(where: { $0.sessionId == sid }) {
+                if let title = d["title"] as? String, !title.isEmpty {
+                    sessions[idx].title = title
+                }
+                if let st = d["status"] as? String, !st.isEmpty {
+                    sessions[idx].status = st
+                }
+                if let m = d["model"] as? String, !m.isEmpty {
+                    sessions[idx].model = m
+                }
+                if let wpid = d["workspace_profile_id"] as? String, !wpid.isEmpty {
+                    sessions[idx].workspaceProfileId = wpid
+                }
+                if let ws = d["workspace"] as? String, !ws.isEmpty {
+                    sessions[idx].workspace = ws
+                }
+            }
+
+        case "image_attachment":
+            let rawAtt = (d["attachment"] as? [String: Any]) ?? d
+            if let att = Self.parseAttachmentItem(rawAtt) {
+                let tIdx = activeTurnIndex(for: turnId)
+                if !turns[tIdx].attachments.contains(where: { $0.attId == att.attId }) {
+                    turns[tIdx].attachments.append(att)
+                }
+            }
+
+        case "browser_state":
+            let rawBrowser = (d["browser"] as? [String: Any]) ?? (d["snapshot"] as? [String: Any]) ?? d
+            if let state = Self.parseBrowserSessionState(rawBrowser) {
+                activeBrowserSessions[state.browserId] = state
+                let tIdx = activeTurnIndex(for: turnId)
+                if let bIdx = turns[tIdx].browserSessions.firstIndex(where: { $0.browserId == state.browserId }) {
+                    turns[tIdx].browserSessions[bIdx] = state
+                } else {
+                    turns[tIdx].browserSessions.append(state)
+                }
+            }
+
+        case "agent_team_update":
+            let rawAgents = (d["agents"] as? [[String: Any]]) ?? (d["subagents"] as? [[String: Any]]) ?? []
+            let agents = Self.parseTeamAgents(rawAgents)
+            let tIdx = activeTurnIndex(for: turnId)
+            turns[tIdx].teamAgents = agents
+
+        case "model_auto_switched":
+            let tIdx = activeTurnIndex(for: turnId)
+            turns[tIdx].modelSwitchedNote = (d["reason"] as? String) ?? (d["message"] as? String) ?? "已自动切换模型"
+            if let newModel = (d["to_model"] as? String) ?? (d["model"] as? String), !newModel.isEmpty {
+                selectedModel = newModel
+            }
+            if let newProf = (d["to_profile_id"] as? String) ?? (d["profile_id"] as? String), !newProf.isEmpty {
+                activeProfileId = newProf
+            }
+
         case "thought_delta":
-            ensureActiveTurn()
+            let tIdx = activeTurnIndex(for: turnId)
             if let full = d["full_text"] as? String {
-                turns[turns.count - 1].thoughtText = full
+                turns[tIdx].thoughtText = full
             } else if let delta = d["text"] as? String {
-                turns[turns.count - 1].thoughtText += delta
+                turns[tIdx].thoughtText += delta
             }
             if wsSynced {
                 LiveActivityController.shared.notifyPhaseChanged(
                     .thinking,
-                    toolCount: turns.last?.toolCalls.count ?? 0,
+                    toolCount: turns[tIdx].toolCalls.count,
                     queuedCount: queuedMessages.count
                 )
             }
 
         case "tool_call":
-            ensureActiveTurn()
+            let tIdx = activeTurnIndex(for: turnId)
             let tcId = (d["id"] as? String) ?? UUID().uuidString
             let name = (d["name"] as? String) ?? "tool"
             let argsObj = d["args"] ?? [:]
             let argsData = (try? JSONSerialization.data(withJSONObject: argsObj, options: [.prettyPrinted])) ?? Data()
             let argsStr = String(data: argsData, encoding: .utf8) ?? "{}"
-            let idx = turns[turns.count - 1].toolCalls.count + 1
-            turns[turns.count - 1].toolCalls.append(
+            let idx = turns[tIdx].toolCalls.count + 1
+            turns[tIdx].toolCalls.append(
                 ToolCallItem(id: tcId, index: idx, name: name, argsText: argsStr)
             )
             if wsSynced {
@@ -1290,17 +1397,17 @@ final class BridgeClient: ObservableObject {
             }
 
         case "tool_result":
-            ensureActiveTurn()
+            let tIdx = activeTurnIndex(for: turnId)
             let tcId = (d["id"] as? String) ?? ""
             let errStr = d["error"] as? String
             let resStr = (d["result"] as? String) ?? ""
-            if let pos = turns[turns.count - 1].toolCalls.firstIndex(where: { $0.id == tcId }) {
-                turns[turns.count - 1].toolCalls[pos].resultText = errStr ?? resStr
-                turns[turns.count - 1].toolCalls[pos].isError = (errStr != nil)
+            if let pos = turns[tIdx].toolCalls.firstIndex(where: { $0.id == tcId }) {
+                turns[tIdx].toolCalls[pos].resultText = errStr ?? resStr
+                turns[tIdx].toolCalls[pos].isError = (errStr != nil)
             }
 
         case "file_artifact":
-            ensureActiveTurn()
+            let tIdx = activeTurnIndex(for: turnId)
             let art = FileArtifactItem(
                 id: (d["id"] as? String) ?? UUID().uuidString,
                 name: (d["name"] as? String) ?? "file",
@@ -1313,24 +1420,24 @@ final class BridgeClient: ObservableObject {
                 isText: (d["is_text"] as? Bool) ?? false,
                 preview: (d["preview"] as? String) ?? ""
             )
-            if let existingIdx = turns[turns.count - 1].artifacts.firstIndex(where: { $0.path == art.path }) {
-                turns[turns.count - 1].artifacts[existingIdx] = art
+            if let existingIdx = turns[tIdx].artifacts.firstIndex(where: { $0.path == art.path }) {
+                turns[tIdx].artifacts[existingIdx] = art
             } else {
-                turns[turns.count - 1].artifacts.append(art)
+                turns[tIdx].artifacts.append(art)
             }
             if wsSynced { Haptics.light() }
 
         case "text_delta":
-            ensureActiveTurn()
+            let tIdx = activeTurnIndex(for: turnId)
             if let full = d["full_text"] as? String {
-                turns[turns.count - 1].assistantText = full
+                turns[tIdx].assistantText = full
             } else if let delta = d["text"] as? String {
-                turns[turns.count - 1].assistantText += delta
+                turns[tIdx].assistantText += delta
             }
             if wsSynced {
                 LiveActivityController.shared.notifyPhaseChanged(
                     .answering,
-                    toolCount: turns.last?.toolCalls.count ?? 0,
+                    toolCount: turns[tIdx].toolCalls.count,
                     queuedCount: queuedMessages.count
                 )
             }
@@ -1365,15 +1472,20 @@ final class BridgeClient: ObservableObject {
             }
 
         case "turn_done":
+            if let u = (d["usage"] as? [String: Any]) ?? (msg["usage"] as? [String: Any]) {
+                let tIdx = activeTurnIndex(for: turnId)
+                turns[tIdx].usage = Self.parseTurnUsage(u)
+            }
             sessionStatus = "idle"
             if wsSynced {
                 Haptics.success()
                 LiveActivityController.shared.notifyTurnFinished()
+                Task { await loadWalletSummary() }
             }
 
         case "error":
-            ensureActiveTurn()
-            turns[turns.count - 1].errorText = (d["message"] as? String) ?? "连接中断，请重试"
+            let tIdx = activeTurnIndex(for: turnId)
+            turns[tIdx].errorText = (d["message"] as? String) ?? "连接中断，请重试"
             sessionStatus = "error"
             if wsSynced {
                 LiveActivityController.shared.notifyTurnFinished()
@@ -1384,9 +1496,131 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    private func ensureActiveTurn() {
+    @discardableResult
+    private func activeTurnIndex(for turnId: String = "") -> Int {
+        if !turnId.isEmpty, let idx = turns.firstIndex(where: { $0.turnId == turnId || $0.id == turnId }) {
+            return idx
+        }
         if turns.isEmpty {
-            turns.append(ChatTurnItem(id: UUID().uuidString))
+            turns.append(ChatTurnItem(id: turnId.isEmpty ? UUID().uuidString : turnId, turnId: turnId))
+            return 0
+        }
+        if !turnId.isEmpty && turns[turns.count - 1].turnId.isEmpty {
+            turns[turns.count - 1].turnId = turnId
+        }
+        return turns.count - 1
+    }
+
+    private func ensureActiveTurn(turnId: String = "") {
+        _ = activeTurnIndex(for: turnId)
+    }
+
+    static func parseAttachmentItem(_ raw: [String: Any]) -> ChatAttachmentItem? {
+        let attId = (raw["att_id"] as? String)
+            ?? (raw["attachment_id"] as? String)
+            ?? (raw["id"] as? String)
+            ?? ""
+        guard !attId.isEmpty else { return nil }
+        return ChatAttachmentItem(
+            attId: attId,
+            filename: (raw["filename"] as? String) ?? (raw["name"] as? String) ?? "image.jpg",
+            mimeType: (raw["mime_type"] as? String) ?? "image/jpeg",
+            width: (raw["width"] as? NSNumber)?.intValue ?? 0,
+            height: (raw["height"] as? NSNumber)?.intValue ?? 0,
+            size: (raw["size"] as? NSNumber)?.intValue ?? 0,
+            url: (raw["url"] as? String) ?? "/api/attachments/\(attId)",
+            thumbURL: (raw["thumb_url"] as? String) ?? "/api/attachments/\(attId)/thumb",
+            source: (raw["source"] as? String) ?? "upload"
+        )
+    }
+
+    static func parseAttachmentItems(_ list: [[String: Any]]) -> [ChatAttachmentItem] {
+        list.compactMap { parseAttachmentItem($0) }
+    }
+
+    static func parseTurnUsage(_ u: [String: Any]) -> TurnUsageInfo {
+        let pTok = (u["prompt_tokens"] as? NSNumber)?.intValue ?? 0
+        let cHit = (u["cache_hit_tokens"] as? NSNumber)?.intValue
+            ?? (u["prompt_cache_hit_tokens"] as? NSNumber)?.intValue
+            ?? 0
+        let compTok = (u["completion_tokens"] as? NSNumber)?.intValue ?? 0
+        let reasTok = (u["reasoning_tokens"] as? NSNumber)?.intValue ?? 0
+        let totTok = (u["total_tokens"] as? NSNumber)?.intValue ?? (pTok + compTok)
+        let cost = (u["cost"] as? NSNumber)?.doubleValue ?? 0.0
+        return TurnUsageInfo(
+            promptTokens: pTok,
+            cacheHitTokens: cHit,
+            completionTokens: compTok,
+            reasoningTokens: reasTok,
+            totalTokens: totTok,
+            cost: cost,
+            currency: (u["currency"] as? String) ?? "CNY",
+            model: (u["model"] as? String) ?? "",
+            estimated: (u["estimated"] as? Bool) ?? false
+        )
+    }
+
+    static func parseBrowserSessionState(_ raw: [String: Any]) -> BrowserSessionState? {
+        let bid = (raw["browser_id"] as? String) ?? (raw["id"] as? String) ?? ""
+        guard !bid.isEmpty else { return nil }
+        let rawEls = (raw["elements"] as? [[String: Any]]) ?? []
+        let els: [BrowserElementItem] = rawEls.compactMap { e in
+            guard let eid = (e["id"] as? NSNumber)?.intValue ?? (e["id"] as? Int) else { return nil }
+            let bboxRaw = (e["bbox"] as? [Any]) ?? []
+            let bbox = bboxRaw.compactMap { ($0 as? NSNumber)?.intValue ?? ($0 as? Int) }
+            return BrowserElementItem(
+                id: eid,
+                tag: (e["tag"] as? String) ?? "a",
+                type: (e["type"] as? String) ?? "link",
+                text: (e["text"] as? String) ?? "",
+                href: (e["href"] as? String) ?? "",
+                value: (e["value"] as? String) ?? "",
+                bbox: bbox
+            )
+        }
+        return BrowserSessionState(
+            browserId: bid,
+            sessionId: (raw["session_id"] as? String) ?? "global",
+            url: (raw["url"] as? String) ?? "about:blank",
+            title: (raw["title"] as? String) ?? "浏览器",
+            controlOwner: (raw["control_owner"] as? String) ?? "agent",
+            humanRequired: (raw["human_required"] as? Bool) ?? false,
+            humanReason: (raw["human_reason"] as? String) ?? "",
+            scrollY: (raw["scroll_y"] as? NSNumber)?.intValue ?? 0,
+            elements: els,
+            textMarkdown: (raw["text_markdown"] as? String) ?? "",
+            frameB64: (raw["frame_b64"] as? String) ?? (raw["last_frame_b64"] as? String) ?? ""
+        )
+    }
+
+    static func parseTeamAgents(_ list: [[String: Any]]) -> [TeamSubagentItem] {
+        list.compactMap { item in
+            let aid = (item["agent_id"] as? String) ?? (item["id"] as? String) ?? ""
+            guard !aid.isEmpty else { return nil }
+            let rawStatus = (item["status"] as? String) ?? "running"
+            let normalizedStatus = (rawStatus == "idle") ? "done" : rawStatus
+            let usageDict = item["usage"] as? [String: Any]
+            let costVal = (item["cost"] as? NSNumber)?.doubleValue
+                ?? (usageDict?["cost"] as? NSNumber)?.doubleValue
+                ?? 0.0
+            return TeamSubagentItem(
+                agentId: aid,
+                role: (item["role"] as? String) ?? "Subagent",
+                task: (item["task"] as? String) ?? (item["goal"] as? String) ?? (item["title"] as? String) ?? "",
+                status: normalizedStatus,
+                model: (item["model"] as? String) ?? "",
+                roundsUsed: (item["rounds_used"] as? NSNumber)?.intValue ?? (item["rounds"] as? NSNumber)?.intValue ?? 1,
+                cost: costVal,
+                resultSummary: (item["result_summary"] as? String)
+                    ?? (item["summary_text"] as? String)
+                    ?? (item["summary"] as? String)
+                    ?? (item["result"] as? String)
+                    ?? "",
+                transcriptPreview: (item["transcript_preview"] as? String)
+                    ?? (item["preview"] as? String)
+                    ?? (item["summary_text"] as? String)
+                    ?? ""
+            )
         }
     }
 
@@ -1407,6 +1641,24 @@ final class BridgeClient: ObservableObject {
     private func applySessionSummary(_ sess: [String: Any]) {
         if let st = sess["status"] as? String {
             sessionStatus = st
+        }
+        if let sid = sess["session_id"] as? String,
+           let idx = sessions.firstIndex(where: { $0.sessionId == sid }) {
+            if let title = sess["title"] as? String, !title.isEmpty {
+                sessions[idx].title = title
+            }
+            if let st = sess["status"] as? String, !st.isEmpty {
+                sessions[idx].status = st
+            }
+            if let m = sess["model"] as? String, !m.isEmpty {
+                sessions[idx].model = m
+            }
+            if let wpid = sess["workspace_profile_id"] as? String, !wpid.isEmpty {
+                sessions[idx].workspaceProfileId = wpid
+            }
+            if let ws = sess["workspace"] as? String, !ws.isEmpty {
+                sessions[idx].workspace = ws
+            }
         }
         if let rawQ = sess["queued_messages"] as? [[String: Any]] {
             queuedMessages = Self.parseQueuedMessages(rawQ)
@@ -1438,11 +1690,22 @@ final class BridgeClient: ObservableObject {
 
     func sendPrompt(_ prompt: String) async {
         let clean = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !activeSessionId.isEmpty else { return }
+        guard (!clean.isEmpty || !pendingAttachments.isEmpty), !activeSessionId.isEmpty else { return }
         Haptics.light()
+        let attIds = pendingAttachments.map(\.attId)
+        pendingAttachments = []
+
+        if let editTid = editingTurnId, !editTid.isEmpty {
+            editingTurnId = nil
+            await editAndResendTurn(editTid, newText: clean, attachments: attIds)
+            return
+        }
+
+        let effectivePrompt = clean.isEmpty ? "请查看并分析这些图片" : clean
         do {
             let body = try JSONSerialization.data(withJSONObject: [
-                "prompt": clean,
+                "prompt": effectivePrompt,
+                "attachments": attIds,
                 "model": selectedModel,
                 "profile_id": activeProfileId,
                 "queue_if_busy": true,
@@ -1458,6 +1721,643 @@ final class BridgeClient: ObservableObject {
             }
         } catch {
             showToastMessage("发送失败: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Module C: Session & Turn Operations
+
+    func renameSession(_ sessionId: String, title: String) async {
+        let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        do {
+            let body = try JSONSerialization.data(withJSONObject: ["title": clean])
+            let data = try await request("/api/sessions/\(sessionId)", method: "PATCH", body: body)
+            if let idx = sessions.firstIndex(where: { $0.sessionId == sessionId }) {
+                sessions[idx].title = clean
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sess = json["session"] as? [String: Any] {
+                applySessionSummary(sess)
+            }
+            Haptics.light()
+            showToastMessage("会话已重命名")
+        } catch {
+            showToastMessage("重命名失败: \(error.localizedDescription)")
+        }
+    }
+
+    func deleteSession(_ sessionId: String) async {
+        do {
+            _ = try await request("/api/sessions/\(sessionId)", method: "DELETE")
+            sessions.removeAll { $0.sessionId == sessionId }
+            Haptics.medium()
+            if activeSessionId == sessionId {
+                let matchingWS = sessions.first(where: { $0.workspaceProfileId == activeWorkspaceProfileId })
+                if let next = matchingWS ?? sessions.first {
+                    await selectSession(next.sessionId)
+                } else {
+                    _ = try? await createNewSession()
+                }
+            }
+        } catch {
+            showToastMessage("删除会话失败: \(error.localizedDescription)")
+        }
+    }
+
+    func deleteTurn(_ turnId: String) async {
+        guard !activeSessionId.isEmpty, !turnId.isEmpty else { return }
+        turns.removeAll { $0.turnId == turnId || $0.id == turnId }
+        Haptics.medium()
+        do {
+            let encTid = turnId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? turnId
+            _ = try await request("/api/sessions/\(activeSessionId)/turns/\(encTid)", method: "DELETE")
+        } catch {
+            showToastMessage("删除消息失败: \(error.localizedDescription)")
+        }
+    }
+
+    func editAndResendTurn(_ turnId: String, newText: String, attachments: [String] = []) async {
+        guard !activeSessionId.isEmpty, !turnId.isEmpty else { return }
+        if let idx = turns.firstIndex(where: { $0.turnId == turnId || $0.id == turnId }) {
+            turns.removeSubrange(idx..<turns.count)
+        }
+        Haptics.light()
+        do {
+            let encTid = turnId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? turnId
+            let payload: [String: Any] = [
+                "new_text": newText,
+                "text": newText,
+                "prompt": newText,
+                "attachments": attachments,
+                "model": selectedModel,
+                "profile_id": activeProfileId,
+            ]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request(
+                "/api/sessions/\(activeSessionId)/turns/\(encTid)/edit",
+                method: "POST",
+                body: body
+            )
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sess = json["session"] as? [String: Any] {
+                applySessionSummary(sess)
+            }
+        } catch {
+            showToastMessage("重发失败: \(error.localizedDescription)")
+        }
+    }
+
+    func regenerateTurn(_ turnId: String) async {
+        guard !activeSessionId.isEmpty, !turnId.isEmpty else { return }
+        if let idx = turns.firstIndex(where: { $0.turnId == turnId || $0.id == turnId }) {
+            let userMsg = turns[idx].userText ?? ""
+            turns.removeSubrange(idx..<turns.count)
+            if !userMsg.isEmpty && turns.isEmpty {
+                // Server will re-emit user_message or stream response
+            }
+        }
+        Haptics.light()
+        do {
+            let encTid = turnId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? turnId
+            let payload: [String: Any] = [
+                "model": selectedModel,
+                "profile_id": activeProfileId,
+            ]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request(
+                "/api/sessions/\(activeSessionId)/turns/\(encTid)/regenerate",
+                method: "POST",
+                body: body
+            )
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sess = json["session"] as? [String: Any] {
+                applySessionSummary(sess)
+            }
+        } catch {
+            showToastMessage("重新生成失败: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Module A: Workspace Profiles
+
+    private static func parseWorkspaceProfile(_ raw: [String: Any]) -> WorkspaceProfileItem? {
+        guard let id = raw["id"] as? String else { return nil }
+        return WorkspaceProfileItem(
+            id: id,
+            name: (raw["name"] as? String) ?? id,
+            icon: (raw["icon"] as? String) ?? "folder.fill",
+            color: (raw["color"] as? String) ?? "blue",
+            rootPaths: (raw["root_paths"] as? [String]) ?? [],
+            defaultProfileId: (raw["default_profile_id"] as? String) ?? "deepseek-flash",
+            defaultApprovalMode: (raw["default_approval_mode"] as? String) ?? "ask_commands",
+            sharedNotes: (raw["shared_notes"] as? String) ?? "",
+            crossSessionRead: (raw["cross_session_read"] as? Bool) ?? true,
+            sessionCount: (raw["session_count"] as? NSNumber)?.intValue ?? 0
+        )
+    }
+
+    func loadWorkspaceProfiles() async {
+        do {
+            let data = try await request("/api/workspace-profiles")
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let rawList = (json["profiles"] as? [[String: Any]])
+                    ?? (json["workspace_profiles"] as? [[String: Any]])
+                    ?? []
+                let parsed = rawList.compactMap { Self.parseWorkspaceProfile($0) }
+                if !parsed.isEmpty {
+                    workspaceProfiles = parsed
+                    if !parsed.contains(where: { $0.id == activeWorkspaceProfileId }),
+                       let first = parsed.first {
+                        activeWorkspaceProfileId = first.id
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    func selectWorkspaceProfile(_ profileId: String) async {
+        activeWorkspaceProfileId = profileId
+        if let prof = workspaceProfiles.first(where: { $0.id == profileId }) {
+            if let firstRoot = prof.rootPaths.first, !firstRoot.isEmpty {
+                activeWorkspace = firstRoot
+            }
+            if !prof.defaultProfileId.isEmpty {
+                activeProfileId = prof.defaultProfileId
+                if let matchedModel = modelProfiles.first(where: { $0.id == prof.defaultProfileId })?.model {
+                    selectedModel = matchedModel
+                }
+            }
+            if !prof.defaultApprovalMode.isEmpty {
+                approvalMode = prof.defaultApprovalMode
+            }
+            showToastMessage("已切换工作区: \(prof.name)")
+        }
+        Haptics.light()
+        await loadSessions()
+        let matched = sessions.first(where: { $0.workspaceProfileId == profileId })
+        if let matched = matched {
+            if activeSessionId != matched.sessionId {
+                await selectSession(matched.sessionId)
+            }
+        } else {
+            _ = try? await createNewSession()
+        }
+    }
+
+    func saveWorkspaceProfile(
+        id: String?,
+        name: String,
+        icon: String,
+        color: String,
+        rootPaths: [String],
+        defaultProfileId: String,
+        defaultApprovalMode: String,
+        sharedNotes: String,
+        crossSessionRead: Bool
+    ) async {
+        let payload: [String: Any] = [
+            "name": name,
+            "icon": icon,
+            "color": color,
+            "root_paths": rootPaths,
+            "default_profile_id": defaultProfileId,
+            "default_approval_mode": defaultApprovalMode,
+            "shared_notes": sharedNotes,
+            "cross_session_read": crossSessionRead,
+        ]
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data: Data
+            if let id = id, !id.isEmpty {
+                data = try await request("/api/workspace-profiles/\(id)", method: "PUT", body: body)
+            } else {
+                data = try await request("/api/workspace-profiles", method: "POST", body: body)
+            }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let profDict = (json["profile"] as? [String: Any]) ?? json as [String: Any]?,
+               let saved = Self.parseWorkspaceProfile(profDict) {
+                if let idx = workspaceProfiles.firstIndex(where: { $0.id == saved.id }) {
+                    workspaceProfiles[idx] = saved
+                } else {
+                    workspaceProfiles.append(saved)
+                }
+            }
+            await loadWorkspaceProfiles()
+            Haptics.success()
+            showToastMessage("工作区配置已保存")
+        } catch {
+            showToastMessage("保存工作区失败: \(error.localizedDescription)")
+        }
+    }
+
+    func deleteWorkspaceProfile(_ profileId: String, deleteSessions: Bool = false) async {
+        guard profileId != "ws_default" else {
+            showToastMessage("默认工作区不可删除")
+            return
+        }
+        do {
+            let flag = deleteSessions ? "true" : "false"
+            _ = try await request("/api/workspace-profiles/\(profileId)?delete_sessions=\(flag)", method: "DELETE")
+            workspaceProfiles.removeAll { $0.id == profileId }
+            if activeWorkspaceProfileId == profileId {
+                activeWorkspaceProfileId = "ws_default"
+            }
+            await loadWorkspaceProfiles()
+            await loadSessions()
+            Haptics.medium()
+            showToastMessage("已删除工作区")
+        } catch {
+            showToastMessage("删除工作区失败: \(error.localizedDescription)")
+        }
+    }
+
+    func moveSessionToWorkspaceProfile(_ sessionId: String, workspaceProfileId: String) async {
+        do {
+            let payload: [String: Any] = [
+                "workspace_profile_id": workspaceProfileId,
+                "target_workspace_profile_id": workspaceProfileId,
+            ]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            _ = try await request("/api/sessions/\(sessionId)/move", method: "POST", body: body)
+            if let idx = sessions.firstIndex(where: { $0.sessionId == sessionId }) {
+                sessions[idx].workspaceProfileId = workspaceProfileId
+            }
+            await loadWorkspaceProfiles()
+            Haptics.light()
+            showToastMessage("已移动会话到目标工作区")
+        } catch {
+            showToastMessage("移动会话失败: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Module B: Attachments & PC Screenshots
+
+    @discardableResult
+    func uploadImageAttachment(data: Data, filename: String = "photo.jpg") async -> ChatAttachmentItem? {
+        let b64 = data.base64EncodedString()
+        let payload: [String: Any] = [
+            "filename": filename,
+            "base64_data": b64,
+            "content_base64": b64,
+            "data_base64": b64,
+            "session_id": activeSessionId.isEmpty ? "global" : activeSessionId,
+        ]
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let resp = try await request("/api/attachments", method: "POST", body: body, timeout: 60)
+            if let json = try JSONSerialization.jsonObject(with: resp) as? [String: Any] {
+                let rawAtt = (json["attachment"] as? [String: Any]) ?? json
+                if let item = Self.parseAttachmentItem(rawAtt) {
+                    if !pendingAttachments.contains(where: { $0.attId == item.attId }) {
+                        pendingAttachments.append(item)
+                    }
+                    Haptics.light()
+                    return item
+                }
+            }
+        } catch {
+            showToastMessage("图片上传失败: \(error.localizedDescription)")
+        }
+        return nil
+    }
+
+    func removePendingAttachment(_ attId: String) {
+        pendingAttachments.removeAll { $0.attId == attId }
+        Haptics.light()
+    }
+
+    @discardableResult
+    func capturePCScreenshot(target: String = "full", windowTitle: String = "") async -> ChatAttachmentItem? {
+        let payload: [String: Any] = [
+            "target": target,
+            "window_title": windowTitle,
+            "session_id": activeSessionId.isEmpty ? "global" : activeSessionId,
+        ]
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let resp = try await request("/api/pc/screenshot", method: "POST", body: body, timeout: 30)
+            if let json = try JSONSerialization.jsonObject(with: resp) as? [String: Any] {
+                let rawAtt = (json["attachment"] as? [String: Any]) ?? json
+                if let item = Self.parseAttachmentItem(rawAtt) {
+                    if !pendingAttachments.contains(where: { $0.attId == item.attId }) {
+                        pendingAttachments.append(item)
+                    }
+                    Haptics.success()
+                    showToastMessage("已抓取电脑屏幕并添加到待发栏")
+                    return item
+                }
+            }
+        } catch {
+            showToastMessage("电脑截屏失败: \(error.localizedDescription)")
+        }
+        return nil
+    }
+
+    // MARK: - Module E: API Wallet & Token Ledger
+
+    func loadWalletSummary(forceBalance: Bool = false) async {
+        let flag = forceBalance ? "true" : "false"
+        do {
+            let data = try await request("/api/wallet/summary?force_balance=\(flag)")
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+
+            let bal = (json["balance"] as? [String: Any]) ?? json
+            let today = (json["today"] as? [String: Any]) ?? json
+            let curHour = (json["current_hour"] as? [String: Any]) ?? [:]
+            let rawRules = (json["rules"] as? [String: Any]) ?? [:]
+
+            let rawByModel = (today["by_model"] as? [[String: Any]]) ?? (json["by_model"] as? [[String: Any]]) ?? []
+            let byModelItems: [WalletModelUsageItem] = rawByModel.compactMap { m in
+                guard let modelName = m["model"] as? String else { return nil }
+                return WalletModelUsageItem(
+                    model: modelName,
+                    totalTokens: (m["total_tokens"] as? NSNumber)?.intValue ?? 0,
+                    promptTokens: (m["prompt_tokens"] as? NSNumber)?.intValue ?? 0,
+                    completionTokens: (m["completion_tokens"] as? NSNumber)?.intValue ?? 0,
+                    cost: (m["cost"] as? NSNumber)?.doubleValue ?? 0.0,
+                    turns: (m["turns"] as? NSNumber)?.intValue ?? 0
+                )
+            }
+
+            let rawDays = (json["last_7_days"] as? [[String: Any]]) ?? []
+            let dayItems: [WalletDayItem] = rawDays.compactMap { d in
+                guard let dateStr = d["date"] as? String else { return nil }
+                return WalletDayItem(
+                    date: dateStr,
+                    totalTokens: (d["total_tokens"] as? NSNumber)?.intValue
+                        ?? (d["tokens"] as? NSNumber)?.intValue
+                        ?? 0,
+                    cost: (d["cost"] as? NSNumber)?.doubleValue ?? 0.0,
+                    turns: (d["turns"] as? NSNumber)?.intValue ?? 0
+                )
+            }
+
+            let rawHours = (json["hourly_today"] as? [[String: Any]]) ?? []
+            let hourItems: [WalletHourItem] = rawHours.compactMap { h in
+                guard let hr = h["hour"] as? String else { return nil }
+                return WalletHourItem(
+                    hour: hr,
+                    tokens: (h["tokens"] as? NSNumber)?.intValue
+                        ?? (h["total_tokens"] as? NSNumber)?.intValue
+                        ?? 0,
+                    cost: (h["cost"] as? NSNumber)?.doubleValue ?? 0.0
+                )
+            }
+
+            let parsedRules = WalletRulesItem(
+                enabled: (rawRules["enabled"] as? Bool) ?? true,
+                balanceBelow: (rawRules["balance_below"] as? NSNumber)?.doubleValue ?? 5.0,
+                dailySpendAbove: (rawRules["daily_spend_above"] as? NSNumber)?.doubleValue ?? 20.0,
+                fallbackProfileId: (rawRules["fallback_profile_id"] as? String) ?? "deepseek-flash",
+                notifyBark: (rawRules["notify_bark"] as? Bool) ?? true,
+                hysteresis: (rawRules["hysteresis"] as? NSNumber)?.doubleValue ?? 1.0,
+                manualBalance: (rawRules["manual_balance"] as? NSNumber)?.doubleValue,
+                currency: (rawRules["currency"] as? String) ?? "CNY"
+            )
+
+            walletSummary = WalletSummaryData(
+                balanceAvailable: (bal["available"] as? Bool) ?? (json["balance_available"] as? Bool) ?? false,
+                balanceSource: (bal["source"] as? String) ?? (json["balance_source"] as? String) ?? "unavailable",
+                totalBalance: (bal["total_balance"] as? NSNumber)?.doubleValue,
+                grantedBalance: (bal["granted_balance"] as? NSNumber)?.doubleValue ?? 0.0,
+                toppedUpBalance: (bal["topped_up_balance"] as? NSNumber)?.doubleValue ?? 0.0,
+                currency: (bal["currency"] as? String) ?? parsedRules.currency,
+                todayPromptTokens: (today["prompt_tokens"] as? NSNumber)?.intValue ?? 0,
+                todayCacheHitTokens: (today["cache_hit_tokens"] as? NSNumber)?.intValue ?? 0,
+                todayCompletionTokens: (today["completion_tokens"] as? NSNumber)?.intValue ?? 0,
+                todayTotalTokens: (today["total_tokens"] as? NSNumber)?.intValue ?? 0,
+                todayCost: (today["cost"] as? NSNumber)?.doubleValue ?? 0.0,
+                todayTurns: (today["turns"] as? NSNumber)?.intValue ?? 0,
+                currentHourTokens: (curHour["total_tokens"] as? NSNumber)?.intValue
+                    ?? (curHour["tokens"] as? NSNumber)?.intValue
+                    ?? 0,
+                currentHourCost: (curHour["cost"] as? NSNumber)?.doubleValue ?? 0.0,
+                byModel: byModelItems,
+                last7Days: dayItems,
+                hourlyToday: hourItems,
+                rules: parsedRules,
+                downgradeActive: (json["downgrade_active"] as? Bool) ?? false
+            )
+        } catch {}
+    }
+
+    func saveWalletRules(_ rules: WalletRulesItem) async {
+        var payload: [String: Any] = [
+            "enabled": rules.enabled,
+            "balance_below": rules.balanceBelow,
+            "daily_spend_above": rules.dailySpendAbove,
+            "fallback_profile_id": rules.fallbackProfileId,
+            "notify_bark": rules.notifyBark,
+            "hysteresis": rules.hysteresis,
+            "currency": rules.currency,
+        ]
+        if let manual = rules.manualBalance {
+            payload["manual_balance"] = manual
+        } else {
+            payload["manual_balance"] = NSNull()
+        }
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            _ = try await request("/api/wallet/rules", method: "PUT", body: body)
+            await loadWalletSummary(forceBalance: true)
+            Haptics.success()
+            showToastMessage("已保存钱包与自动降级规则")
+        } catch {
+            showToastMessage("保存钱包规则失败: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Module F: Built-in Collaborative Browser
+
+    private func upsertBrowserStateInChat(_ state: BrowserSessionState) {
+        activeBrowserSessions[state.browserId] = state
+        for idx in turns.indices {
+            if let bIdx = turns[idx].browserSessions.firstIndex(where: { $0.browserId == state.browserId }) {
+                turns[idx].browserSessions[bIdx] = state
+                return
+            }
+        }
+        let tIdx = activeTurnIndex()
+        turns[tIdx].browserSessions.append(state)
+    }
+
+    func openBrowserInChat(url: String = "https://www.deepseek.com") async {
+        let createPayload: [String: Any] = [
+            "session_id": activeSessionId.isEmpty ? "global" : activeSessionId,
+            "workspace_profile_id": activeWorkspaceProfileId,
+        ]
+        do {
+            let createBody = try JSONSerialization.data(withJSONObject: createPayload)
+            let createData = try await request("/api/browser/sessions", method: "POST", body: createBody)
+            guard let createJSON = try JSONSerialization.jsonObject(with: createData) as? [String: Any] else { return }
+            let rawBrowser = (createJSON["browser"] as? [String: Any]) ?? (createJSON["session"] as? [String: Any]) ?? createJSON
+            let bid = (rawBrowser["browser_id"] as? String) ?? (createJSON["browser_id"] as? String) ?? ""
+            guard !bid.isEmpty else { return }
+
+            let navPayload: [String: Any] = [
+                "url": url,
+                "actor": "human",
+            ]
+            let navBody = try JSONSerialization.data(withJSONObject: navPayload)
+            let navData = try await request("/api/browser/sessions/\(bid)/navigate", method: "POST", body: navBody, timeout: 30)
+            if let navJSON = try JSONSerialization.jsonObject(with: navData) as? [String: Any] {
+                let snapDict = (navJSON["browser"] as? [String: Any]) ?? (navJSON["snapshot"] as? [String: Any]) ?? navJSON
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                    Haptics.light()
+                }
+            }
+        } catch {
+            showToastMessage("启动内置浏览器失败: \(error.localizedDescription)")
+        }
+    }
+
+    func browserNavigate(browserId: String, url: String) async {
+        guard !browserId.isEmpty else { return }
+        let payload: [String: Any] = ["url": url, "actor": "human"]
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/navigate", method: "POST", body: body, timeout: 30)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                }
+            }
+        } catch {
+            showToastMessage("网页跳转失败: \(error.localizedDescription)")
+        }
+    }
+
+    func browserHistoryAction(browserId: String, action: String) async {
+        guard !browserId.isEmpty else { return }
+        let act = action.lowercased()
+        if act == "close" {
+            _ = try? await request("/api/browser/sessions/\(browserId)", method: "DELETE")
+            activeBrowserSessions.removeValue(forKey: browserId)
+            for idx in turns.indices {
+                turns[idx].browserSessions.removeAll { $0.browserId == browserId }
+            }
+            Haptics.light()
+            return
+        }
+        do {
+            let payload: [String: Any] = ["action": act, "actor": "human"]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/\(act)", method: "POST", body: body, timeout: 25)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                }
+            }
+        } catch {
+            // Fallback to unified /input endpoint if backend routes back/forward/reload via /input
+            await browserSendInput(browserId: browserId, action: act)
+        }
+    }
+
+    func browserSendInput(
+        browserId: String,
+        action: String,
+        elementId: Int? = nil,
+        x: Int? = nil,
+        y: Int? = nil,
+        text: String = "",
+        submit: Bool = false,
+        deltaY: Int = 320
+    ) async {
+        guard !browserId.isEmpty else { return }
+        var payload: [String: Any] = [
+            "action": action,
+            "actor": "human",
+            "text": text,
+            "submit": submit,
+            "delta_y": deltaY,
+        ]
+        if let elementId = elementId {
+            payload["element_id"] = elementId
+        }
+        if let x = x {
+            payload["x"] = x
+        }
+        if let y = y {
+            payload["y"] = y
+        }
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/input", method: "POST", body: body, timeout: 25)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                }
+            }
+        } catch {
+            showToastMessage("浏览器操作失败: \(error.localizedDescription)")
+        }
+    }
+
+    func browserSetControl(browserId: String, owner: String) async {
+        guard !browserId.isEmpty else { return }
+        let payload: [String: Any] = [
+            "owner": owner,
+            "control_owner": owner,
+        ]
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/control", method: "POST", body: body)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                    Haptics.light()
+                    showToastMessage(owner == "agent" ? "已将浏览器交还给 AI 操作" : "真人已接管浏览器")
+                }
+            }
+        } catch {
+            showToastMessage("切换控制权失败: \(error.localizedDescription)")
+        }
+    }
+
+    func browserScreenshotToChat(browserId: String) async {
+        guard !browserId.isEmpty else { return }
+        do {
+            let payload: [String: Any] = [
+                "session_id": activeSessionId.isEmpty ? "global" : activeSessionId,
+            ]
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/screenshot", method: "POST", body: body)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let rawAtt = (json["attachment"] as? [String: Any]) ?? json
+                if let item = Self.parseAttachmentItem(rawAtt) {
+                    if !pendingAttachments.contains(where: { $0.attId == item.attId }) {
+                        pendingAttachments.append(item)
+                    }
+                    Haptics.success()
+                    showToastMessage("已将浏览器画面插入待发附件")
+                }
+            }
+        } catch {
+            showToastMessage("浏览器截图失败: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Module D: Agent Team Control
+
+    func cancelSubagent(agentId: String) async {
+        guard !activeSessionId.isEmpty, !agentId.isEmpty else { return }
+        Haptics.medium()
+        do {
+            _ = try await request("/api/sessions/\(activeSessionId)/agents/\(agentId)/cancel", method: "POST")
+            for tIdx in turns.indices {
+                if let aIdx = turns[tIdx].teamAgents.firstIndex(where: { $0.agentId == agentId }) {
+                    turns[tIdx].teamAgents[aIdx].status = "cancelled"
+                }
+            }
+            showToastMessage("已取消子代理任务")
+        } catch {
+            showToastMessage("取消子代理失败: \(error.localizedDescription)")
         }
     }
 

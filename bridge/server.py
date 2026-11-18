@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import json
 import logging
 import mimetypes
 import os
@@ -12,7 +13,7 @@ import socket
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # Ensure project root and local .venv site-packages are importable even when launched via system Python (which has Windows Firewall allow rule)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,25 +24,16 @@ if _venv_site.exists() and str(_venv_site) not in sys.path:
     sys.path.insert(0, str(_venv_site))
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from bridge.attachment_service import ONE_BY_ONE_PNG_BASE64, AttachmentService
+from bridge.browser_service import BrowserService
 from bridge.config import VERSION, BridgeConfig, ConfigStore
 from bridge.deepseek_agent import SessionManager
-from bridge.log_service import (
-    collect_pc_diagnostics,
-    get_diagnostics_tracker,
-    get_log_handler,
-    install_log_capture,
-    run_pc_self_check,
-)
-from bridge.plugin_service import PluginService
-from bridge.sandbox_runner import SandboxRunner, audit_untrusted_code
-from bridge.search_service import execute_web_search
-from bridge.tunnel_manager import TunnelManager
 from bridge.fs_service import (
     FileConflictError,
     WorkspaceSecurityError,
@@ -63,6 +55,19 @@ from bridge.fs_service import (
     write_file_content,
     write_pc_file,
 )
+from bridge.log_service import (
+    collect_pc_diagnostics,
+    get_diagnostics_tracker,
+    get_log_handler,
+    install_log_capture,
+    run_pc_self_check,
+)
+from bridge.plugin_service import PluginService
+from bridge.sandbox_runner import SandboxRunner, audit_untrusted_code
+from bridge.search_service import execute_web_search
+from bridge.tunnel_manager import TunnelManager
+from bridge.wallet_service import WalletService
+from bridge.workspace_service import WorkspaceService
 
 mimetypes.add_type("application/manifest+json", ".webmanifest")
 
@@ -90,6 +95,9 @@ class SettingsUpdateRequest(BaseModel):
     search_config: dict[str, Any] | None = None
     appearance_config: dict[str, Any] | None = None
     dsh_profile_dir: str | None = None
+    wallet_rules: dict[str, Any] | None = None
+    model_pricing: dict[str, Any] | None = None
+    browser_policy: dict[str, Any] | None = None
 
 
 class ProviderTestRequest(BaseModel):
@@ -98,6 +106,7 @@ class ProviderTestRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    test_vision: bool = False
 
 
 class SearchTestRequest(BaseModel):
@@ -179,17 +188,77 @@ class AuthorizeWorkspaceRequest(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     workspace: str | None = None
+    workspace_profile_id: str | None = None
     title: str = "New Session"
     approval_mode: str | None = None
     model: str | None = None
     profile_id: str | None = None
 
 
-class SendMessageRequest(BaseModel):
-    prompt: str
+class RenameSessionRequest(BaseModel):
+    title: str
+
+
+class MoveSessionRequest(BaseModel):
+    workspace_profile_id: str
+
+
+class EditTurnRequest(BaseModel):
+    text: str = ""
+    prompt: str = ""
     model: str | None = None
     profile_id: str | None = None
+    attachments: list[str] | None = None
+
+
+class RegenerateTurnRequest(BaseModel):
+    model: str | None = None
+    profile_id: str | None = None
+
+
+class SendMessageRequest(BaseModel):
+    prompt: str = ""
+    model: str | None = None
+    profile_id: str | None = None
+    attachments: list[str] | None = None
     queue_if_busy: bool = True
+
+
+class PCScreenshotRequest(BaseModel):
+    target: str = "full"
+    window_title: str = ""
+    region: list[int] | None = None
+    monitor: int = 0
+    session_id: str | None = None
+
+
+class BrowserSessionCreateRequest(BaseModel):
+    browser_id: str | None = None
+    session_id: str = "global"
+    workspace_profile_id: str = "ws_default"
+    url: str | None = None
+
+
+class BrowserNavigateRequest(BaseModel):
+    url: str
+    actor: Literal["agent", "human"] = "human"
+    engine: str | None = None
+
+
+class BrowserInputRequest(BaseModel):
+    action: str = ""  # click | type | scroll
+    element_id: int | None = None
+    x: int | None = None
+    y: int | None = None
+    text: str | None = None
+    submit: bool = False
+    delta_y: int | None = None
+    actor: Literal["agent", "human"] = "human"
+
+
+class BrowserControlRequest(BaseModel):
+    owner: Literal["agent", "human"]
+    reason: str = ""
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -249,6 +318,38 @@ class PCUploadBase64Request(BaseModel):
     base64_data: str
 
 
+def _extract_multipart_file_bytes(raw_body: bytes, content_type: str) -> tuple[bytes, str]:
+    """Fallback multipart/form-data extractor when python-multipart is not installed."""
+    boundary = ""
+    for part in content_type.split(";"):
+        p = part.strip()
+        if p.lower().startswith("boundary="):
+            boundary = p.split("=", 1)[1].strip().strip('"')
+            break
+    if not boundary:
+        return raw_body, "image.jpg"
+
+    delim = f"--{boundary}".encode("latin1")
+    sections = raw_body.split(delim)
+    for sec in sections:
+        if b"Content-Disposition" not in sec:
+            continue
+        header_end = sec.find(b"\r\n\r\n")
+        if header_end < 0:
+            continue
+        header_bytes = sec[:header_end].decode("utf-8", errors="replace")
+        content = sec[header_end + 4 :]
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+        if not content:
+            continue
+        fname = "image.jpg"
+        if 'filename="' in header_bytes:
+            fname = header_bytes.split('filename="', 1)[1].split('"', 1)[0] or fname
+        return content, fname
+    return raw_body, "image.jpg"
+
+
 def create_app(data_dir: Path | None = None) -> FastAPI:
     install_log_capture()
     diagnostics_tracker = get_diagnostics_tracker()
@@ -259,13 +360,34 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         dsh_profile_dir=dsh_dir,
     )
     sandbox_runner = SandboxRunner(base_dir=config_store.data_dir / "sandbox_runs")
+    attachment_service = AttachmentService(data_dir=config_store.data_dir)
+    workspace_service = WorkspaceService(data_dir=config_store.data_dir, config_store=config_store)
+    wallet_service = WalletService(data_dir=config_store.data_dir, config_store=config_store)
+    browser_service = BrowserService(
+        data_dir=config_store.data_dir,
+        config_store=config_store,
+        attachment_service=attachment_service,
+    )
     session_manager = SessionManager(
         config_store,
         plugin_service=plugin_service,
         sandbox_runner=sandbox_runner,
+        workspace_service=workspace_service,
+        attachment_service=attachment_service,
+        wallet_service=wallet_service,
+        browser_service=browser_service,
     )
+    workspace_service.set_session_manager_getter(lambda: session_manager)
     tunnel_manager = TunnelManager(config_store)
     web_dir = PROJECT_ROOT / "web"
+
+    def _emit_browser_to_session(snap: dict[str, Any]) -> None:
+        sid = str(snap.get("session_id") or "").strip()
+        if sid and sid in session_manager.sessions:
+            try:
+                session_manager.sessions[sid].emit_event("browser_state", snap)
+            except Exception:
+                pass
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -339,6 +461,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     app.state.tunnel_manager = tunnel_manager
     app.state.plugin_service = plugin_service
     app.state.sandbox_runner = sandbox_runner
+    app.state.attachment_service = attachment_service
+    app.state.workspace_service = workspace_service
+    app.state.wallet_service = wallet_service
+    app.state.browser_service = browser_service
 
     app.add_middleware(
         CORSMiddleware,
@@ -579,6 +705,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 new_key_raw = str(raw_p.get("api_key") or "").strip()
                 clear_flag = bool(raw_p.get("clear_api_key", False))
                 final_key = "" if clear_flag else (new_key_raw if new_key_raw else prev_key)
+                model_str = str(raw_p.get("model") or "").strip()
                 cleaned_profiles.append(
                     {
                         "id": pid,
@@ -586,11 +713,17 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                         "provider": str(raw_p.get("provider") or "openai_compatible").strip(),
                         "base_url": str(raw_p.get("base_url") or "").strip().rstrip("/"),
                         "api_key": final_key,
-                        "model": str(raw_p.get("model") or "").strip(),
+                        "model": model_str,
                         "temperature": float(raw_p.get("temperature") if raw_p.get("temperature") is not None else 0.7),
                         "max_tokens": int(raw_p.get("max_tokens") or 8192),
                         "supports_tools": bool(raw_p.get("supports_tools", True)),
                         "supports_reasoning": bool(raw_p.get("supports_reasoning", False)),
+                        "supports_vision": bool(
+                            raw_p.get(
+                                "supports_vision",
+                                any(k in model_str.lower() for k in ("flash", "gpt-4o", "claude", "vision", "vl", "gemini")),
+                            )
+                        ),
                     }
                 )
             if cleaned_profiles:
@@ -615,9 +748,20 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             cfg_data["dsh_profile_dir"] = body.dsh_profile_dir.strip()
             plugin_service.set_paths(dsh_profile_dir=Path(cfg_data["dsh_profile_dir"]))
 
+        if body.wallet_rules is not None and isinstance(body.wallet_rules, dict):
+            cfg_data["wallet_rules"] = wallet_service.update_rules(body.wallet_rules)
+
+        if body.model_pricing is not None and isinstance(body.model_pricing, dict):
+            cfg_data["model_pricing"] = wallet_service.update_pricing(body.model_pricing)
+
+        if body.browser_policy is not None and isinstance(body.browser_policy, dict):
+            old_bp = dict(cfg_data.get("browser_policy") or {})
+            cfg_data["browser_policy"] = {**old_bp, **body.browser_policy}
+
         cfg_obj = BridgeConfig(**cfg_data)
         if body.active_profile_id is not None and body.active_profile_id.strip():
             cfg_obj.apply_active_profile(body.active_profile_id.strip())
+            wallet_service.reset_downgrade()
         elif body.model is not None:
             matched = next(
                 (p.get("id") for p in cfg_obj.model_profiles if p.get("model") == cfg_obj.model),
@@ -625,6 +769,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             )
             if matched:
                 cfg_obj.active_profile_id = str(matched)
+            wallet_service.reset_downgrade()
 
         if body.deepseek_base_url is not None and body.deepseek_base_url.strip():
             clean_url = body.deepseek_base_url.strip().rstrip("/")
@@ -654,7 +799,61 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         started = _time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=12.0, http2=False) as client:
-                if provider == "anthropic":
+                if body.test_vision:
+                    if provider == "anthropic":
+                        url = f"{base_url}/messages" if base_url.endswith("/v1") else f"{base_url}/v1/messages"
+                        resp = await client.post(
+                            url,
+                            headers={
+                                "x-api-key": api_key,
+                                "anthropic-version": "2023-06-01",
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "model": model,
+                                "max_tokens": 8,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {
+                                                "type": "image",
+                                                "source": {
+                                                    "type": "base64",
+                                                    "media_type": "image/png",
+                                                    "data": ONE_BY_ONE_PNG_BASE64,
+                                                },
+                                            },
+                                            {"type": "text", "text": "ping"},
+                                        ],
+                                    }
+                                ],
+                            },
+                        )
+                    else:
+                        resp = await client.post(
+                            f"{base_url}/chat/completions",
+                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            json={
+                                "model": model,
+                                "max_tokens": 8,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": "ping"},
+                                            {
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": f"data:image/png;base64,{ONE_BY_ONE_PNG_BASE64}"
+                                                },
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                        )
+                elif provider == "anthropic":
                     url = f"{base_url}/messages" if base_url.endswith("/v1") else f"{base_url}/v1/messages"
                     resp = await client.post(
                         url,
@@ -682,10 +881,21 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             ms = round((_time.perf_counter() - started) * 1000, 1)
             ok = 200 <= resp.status_code < 300
             detail = f"HTTP {resp.status_code} 连通成功 ({model})" if ok else f"HTTP {resp.status_code}: {resp.text[:300]}"
-            return {"ok": ok, "status_code": resp.status_code, "latency_ms": ms, "detail": detail}
+            result: dict[str, Any] = {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "latency_ms": ms,
+                "detail": detail,
+            }
+            if body.test_vision:
+                result["supports_vision"] = ok
+            return result
         except Exception as exc:
             ms = round((_time.perf_counter() - started) * 1000, 1)
-            return {"ok": False, "status_code": 0, "latency_ms": ms, "detail": str(exc)}
+            res_err: dict[str, Any] = {"ok": False, "status_code": 0, "latency_ms": ms, "detail": str(exc)}
+            if body.test_vision:
+                res_err["supports_vision"] = False
+            return res_err
 
     @app.post("/api/search/test", dependencies=[Depends(require_auth)])
     async def api_test_search(body: SearchTestRequest) -> dict[str, Any]:
@@ -910,6 +1120,375 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             except KeyError:
                 pass
         return updated.to_public_dict()
+
+    # =========================================================================
+    # Module A: Workspace Profiles APIs
+    # =========================================================================
+
+    @app.get("/api/workspace-profiles", dependencies=[Depends(require_auth)])
+    def api_list_workspace_profiles() -> dict[str, Any]:
+        return {"profiles": workspace_service.list_profiles()}
+
+    @app.post("/api/workspace-profiles", dependencies=[Depends(require_auth)])
+    def api_create_workspace_profile(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        try:
+            prof = workspace_service.create_profile(payload)
+            return {"ok": True, "profile": prof, "profiles": workspace_service.list_profiles()}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/workspace-profiles/{profile_id}", dependencies=[Depends(require_auth)])
+    def api_update_workspace_profile(
+        profile_id: str,
+        payload: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        try:
+            prof = workspace_service.update_profile(profile_id, payload)
+            return {"ok": True, "profile": prof, "profiles": workspace_service.list_profiles()}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/workspace-profiles/{profile_id}", dependencies=[Depends(require_auth)])
+    def api_delete_workspace_profile(
+        profile_id: str,
+        delete_sessions: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        try:
+            res = workspace_service.delete_profile(profile_id, delete_sessions=delete_sessions)
+            return {"ok": True, **res, "profiles": workspace_service.list_profiles()}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # =========================================================================
+    # Module B: Attachments & Native PC Screenshot APIs
+    # =========================================================================
+
+    @app.post("/api/attachments", dependencies=[Depends(require_auth)])
+    async def api_upload_attachment(
+        request: Request,
+        filename: str = Query(default="image.jpg"),
+        session_id: str = Query(default="global"),
+    ) -> dict[str, Any]:
+        content_type = (request.headers.get("content-type") or "").lower()
+        try:
+            if "application/json" in content_type:
+                body_json = await request.json()
+                fname = str(body_json.get("filename") or filename or "image.jpg")
+                sid = str(body_json.get("session_id") or session_id or "global")
+                b64_raw = str(body_json.get("base64_data") or body_json.get("data") or "").strip()
+                if b64_raw.startswith("data:") and "," in b64_raw:
+                    b64_raw = b64_raw.split(",", 1)[1]
+                raw_bytes = base64.b64decode(b64_raw)
+            elif "multipart/form-data" in content_type:
+                raw_body = await request.body()
+                raw_bytes, extracted_name = _extract_multipart_file_bytes(raw_body, content_type)
+                fname = filename if filename != "image.jpg" else extracted_name
+                sid = session_id or "global"
+            else:
+                raw_bytes = await request.body()
+                fname = filename or "image.jpg"
+                sid = session_id or "global"
+
+            meta = await asyncio.to_thread(
+                attachment_service.save_image_bytes,
+                raw_bytes,
+                filename=fname,
+                session_id=sid,
+                source="upload",
+            )
+            return {"ok": True, "attachment": meta, **meta}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid attachment upload: {exc}") from exc
+
+    @app.get("/api/attachments/{att_id}", dependencies=[Depends(require_auth)])
+    def api_get_attachment(att_id: str) -> FileResponse:
+        try:
+            file_path, mime = attachment_service.get_file_path(att_id, thumb=False)
+            return FileResponse(path=file_path, media_type=mime, filename=file_path.name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/attachments/{att_id}/thumb", dependencies=[Depends(require_auth)])
+    def api_get_attachment_thumb(att_id: str) -> FileResponse:
+        try:
+            thumb_path, mime = attachment_service.get_file_path(att_id, thumb=True)
+            return FileResponse(path=thumb_path, media_type=mime, filename=thumb_path.name)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/pc/screenshot", dependencies=[Depends(require_auth)])
+    async def api_pc_screenshot(body: PCScreenshotRequest | None = Body(default=None)) -> dict[str, Any]:
+        req = body or PCScreenshotRequest()
+        try:
+            meta = await asyncio.to_thread(
+                attachment_service.take_pc_screenshot,
+                target=req.target,
+                window_title=req.window_title,
+                region=req.region,
+                monitor=req.monitor,
+                session_id=req.session_id or "global",
+            )
+            if req.session_id and req.session_id in session_manager.sessions:
+                session_manager.sessions[req.session_id].emit_event("image_attachment", meta)
+            return {"ok": True, "attachment": meta, **meta}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # =========================================================================
+    # Module E: API Wallet, Usage Ledger & Auto-Downgrade APIs
+    # =========================================================================
+
+    @app.get("/api/wallet/summary", dependencies=[Depends(require_auth)])
+    async def api_wallet_summary(force_balance: bool = Query(default=False)) -> dict[str, Any]:
+        if force_balance:
+            await wallet_service.fetch_balance(force=True)
+        return wallet_service.get_summary()
+
+    @app.get("/api/wallet/usage", dependencies=[Depends(require_auth)])
+    def api_wallet_usage(
+        date_from: str = Query(default=""),
+        date_to: str = Query(default=""),
+        group_by: str = Query(default="model"),
+    ) -> dict[str, Any]:
+        return wallet_service.query_usage(date_from=date_from, date_to=date_to, group_by=group_by)
+
+    @app.put("/api/wallet/rules", dependencies=[Depends(require_auth)])
+    def api_update_wallet_rules(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        rules = wallet_service.update_rules(payload)
+        return {"ok": True, "rules": rules, **wallet_service.get_summary()}
+
+    @app.put("/api/wallet/pricing", dependencies=[Depends(require_auth)])
+    def api_update_wallet_pricing(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        pricing = wallet_service.update_pricing(payload)
+        return {"ok": True, "pricing": pricing, **wallet_service.get_summary()}
+
+    # =========================================================================
+    # Module F: Collaborative Browser APIs & WebSocket
+    # =========================================================================
+
+    @app.post("/api/browser/sessions", dependencies=[Depends(require_auth)])
+    async def api_create_browser_session(
+        body: BrowserSessionCreateRequest | None = Body(default=None),
+    ) -> dict[str, Any]:
+        req = body or BrowserSessionCreateRequest()
+        sess = browser_service.create_or_get_session(
+            browser_id=req.browser_id,
+            session_id=req.session_id,
+            workspace_profile_id=req.workspace_profile_id,
+        )
+        if req.url and req.url.strip() and req.url.strip().lower() != "about:blank":
+            snap = await browser_service.navigate(sess.browser_id, req.url.strip(), actor="human")
+        else:
+            snap = browser_service.snapshot(sess.browser_id, include_frame=True)
+        _emit_browser_to_session(snap)
+        return {"ok": True, **snap}
+
+    @app.get("/api/browser/sessions", dependencies=[Depends(require_auth)])
+    def api_list_browser_sessions(
+        session_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        return {"sessions": browser_service.list_sessions(session_id=session_id)}
+
+    @app.get("/api/browser/sessions/{browser_id}", dependencies=[Depends(require_auth)])
+    def api_get_browser_session(
+        browser_id: str,
+        include_frame: bool = Query(default=True),
+    ) -> dict[str, Any]:
+        return browser_service.snapshot(browser_id, include_frame=include_frame)
+
+    @app.post("/api/browser/sessions/{browser_id}/navigate", dependencies=[Depends(require_auth)])
+    async def api_browser_navigate(
+        browser_id: str,
+        body: BrowserNavigateRequest,
+    ) -> dict[str, Any]:
+        res = await browser_service.navigate(
+            browser_id,
+            body.url,
+            actor=body.actor,
+            engine=body.engine,
+        )
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/back", dependencies=[Depends(require_auth)])
+    async def api_browser_back(browser_id: str) -> dict[str, Any]:
+        res = await browser_service.go_back(browser_id, actor="human")
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/forward", dependencies=[Depends(require_auth)])
+    async def api_browser_forward(browser_id: str) -> dict[str, Any]:
+        res = await browser_service.go_forward(browser_id, actor="human")
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/reload", dependencies=[Depends(require_auth)])
+    async def api_browser_reload(browser_id: str) -> dict[str, Any]:
+        res = await browser_service.reload(browser_id, actor="human")
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/close", dependencies=[Depends(require_auth)])
+    def api_browser_close(browser_id: str) -> dict[str, Any]:
+        closed = browser_service.close_session(browser_id)
+        return {"ok": True, "closed": closed, "browser_id": browser_id}
+
+    @app.post("/api/browser/sessions/{browser_id}/input", dependencies=[Depends(require_auth)])
+    async def api_browser_input(
+        browser_id: str,
+        body: BrowserInputRequest,
+    ) -> dict[str, Any]:
+        act = (body.action or "").strip().lower()
+        actor = body.actor or "human"
+        if act == "type" or (not act and body.text is not None):
+            res = await browser_service.type_text(
+                browser_id,
+                text=body.text or "",
+                element_id=body.element_id,
+                submit=body.submit,
+                actor=actor,
+            )
+        elif act == "scroll" or (
+            not act and body.delta_y is not None and body.element_id is None and body.x is None
+        ):
+            res = await browser_service.scroll(
+                browser_id,
+                delta_y=int(body.delta_y if body.delta_y is not None else 360),
+                actor=actor,
+            )
+        else:
+            res = await browser_service.click(
+                browser_id,
+                element_id=body.element_id,
+                x=body.x,
+                y=body.y,
+                actor=actor,
+            )
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/control", dependencies=[Depends(require_auth)])
+    def api_browser_control(
+        browser_id: str,
+        body: BrowserControlRequest,
+    ) -> dict[str, Any]:
+        res = browser_service.set_control(browser_id, body.owner, reason=body.reason)
+        _emit_browser_to_session(res)
+        return res
+
+    @app.post("/api/browser/sessions/{browser_id}/screenshot", dependencies=[Depends(require_auth)])
+    def api_browser_screenshot(browser_id: str) -> dict[str, Any]:
+        res = browser_service.save_frame_as_attachment(browser_id, attachment_service)
+        bs = browser_service.create_or_get_session(browser_id=browser_id)
+        if bs.session_id in session_manager.sessions:
+            session_manager.sessions[bs.session_id].emit_event("image_attachment", res)
+        return res
+
+    @app.websocket("/ws/browser/{browser_id}")
+    async def ws_browser(
+        websocket: WebSocket,
+        browser_id: str,
+        token: str = Query(default=""),
+    ) -> None:
+        if not _is_valid_token(token):
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        queue = browser_service.subscribe(browser_id)
+        send_lock = asyncio.Lock()
+
+        async def _safe_send(payload: dict[str, Any]) -> bool:
+            try:
+                async with send_lock:
+                    await asyncio.wait_for(websocket.send_json(payload), timeout=10.0)
+                return True
+            except Exception:
+                return False
+
+        async def _sender_loop() -> None:
+            try:
+                while True:
+                    try:
+                        ev = await asyncio.wait_for(queue.get(), timeout=15.0)
+                        if not await _safe_send(ev):
+                            return
+                    except asyncio.TimeoutError:
+                        if not await _safe_send({"type": "ping"}):
+                            return
+            except asyncio.CancelledError:
+                return
+
+        async def _receiver_loop() -> None:
+            try:
+                while True:
+                    raw_msg = await websocket.receive_text()
+                    trimmed = raw_msg.strip()
+                    if trimmed == "ping":
+                        await _safe_send({"type": "pong"})
+                        continue
+                    try:
+                        cmd = json.loads(trimmed)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(cmd, dict):
+                        continue
+                    ctype = str(cmd.get("type") or cmd.get("action") or "").lower()
+                    if ctype == "ping":
+                        await _safe_send({"type": "pong"})
+                    elif ctype == "navigate" and cmd.get("url"):
+                        await browser_service.navigate(browser_id, str(cmd["url"]), actor="human")
+                    elif ctype == "click":
+                        await browser_service.click(
+                            browser_id,
+                            element_id=cmd.get("element_id"),
+                            x=cmd.get("x"),
+                            y=cmd.get("y"),
+                            actor="human",
+                        )
+                    elif ctype == "type":
+                        await browser_service.type_text(
+                            browser_id,
+                            text=str(cmd.get("text") or ""),
+                            element_id=cmd.get("element_id"),
+                            submit=bool(cmd.get("submit", False)),
+                            actor="human",
+                        )
+                    elif ctype == "scroll":
+                        await browser_service.scroll(
+                            browser_id,
+                            delta_y=int(cmd.get("delta_y", 360)),
+                            actor="human",
+                        )
+                    elif ctype == "control" and cmd.get("owner") in ("agent", "human"):
+                        browser_service.set_control(browser_id, cmd["owner"])
+            except Exception:
+                return
+
+        sender_task: asyncio.Task[None] | None = None
+        receiver_task: asyncio.Task[None] | None = None
+        try:
+            init_snap = browser_service.snapshot(browser_id, include_frame=True)
+            if not await _safe_send({"type": "frame", **init_snap}):
+                return
+            sender_task = asyncio.create_task(_sender_loop())
+            receiver_task = asyncio.create_task(_receiver_loop())
+            done, pending = await asyncio.wait(
+                [sender_task, receiver_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+        finally:
+            for t in (sender_task, receiver_task):
+                if t and not t.done():
+                    t.cancel()
+            browser_service.unsubscribe(browser_id, queue)
 
     # =========================================================================
     # Full PC File System Manager APIs (Drives C/D/E, Metadata, Move/Copy/Upload/Download)
@@ -1171,22 +1750,134 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
     # --- Session & DeepSeek Agent APIs ---
 
     @app.get("/api/sessions", dependencies=[Depends(require_auth)])
-    def api_list_sessions() -> dict[str, Any]:
-        return {"sessions": session_manager.list_sessions()}
+    def api_list_sessions(
+        workspace_profile_id: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        return {"sessions": session_manager.list_sessions(workspace_profile_id=workspace_profile_id)}
 
     @app.post("/api/sessions", dependencies=[Depends(require_auth)])
     def api_create_session(body: CreateSessionRequest) -> dict[str, Any]:
-        root = resolve_allowed_workspace(body.workspace)
+        ws_arg = body.workspace
+        if not ws_arg and body.workspace_profile_id:
+            try:
+                wp = workspace_service.get_profile(body.workspace_profile_id)
+                rpaths = wp.get("root_paths") or []
+                if rpaths and Path(rpaths[0]).exists():
+                    ws_arg = rpaths[0]
+            except KeyError:
+                pass
+        root = resolve_allowed_workspace(ws_arg)
         if body.approval_mode and body.approval_mode not in {"ask_commands", "ask_writes", "auto"}:
             raise HTTPException(status_code=400, detail="Invalid approval_mode")
         sess = session_manager.create_session(
             workspace=str(root),
+            workspace_profile_id=body.workspace_profile_id,
             title=body.title,
             approval_mode=body.approval_mode,
             model=body.model,
             profile_id=body.profile_id,
         )
         return sess.summary()
+
+    @app.patch("/api/sessions/{session_id}", dependencies=[Depends(require_auth)])
+    def api_rename_session(session_id: str, body: RenameSessionRequest) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        summary = sess.rename(body.title)
+        return {"ok": True, "session": summary, **summary}
+
+    @app.post("/api/sessions/{session_id}/move", dependencies=[Depends(require_auth)])
+    def api_move_session(session_id: str, body: MoveSessionRequest) -> dict[str, Any]:
+        try:
+            sess = session_manager.move_session(session_id, body.workspace_profile_id)
+            return {"ok": True, "session": sess.summary(), **sess.summary()}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/sessions/{session_id}/turns/{turn_id}", dependencies=[Depends(require_auth)])
+    async def api_delete_turn(session_id: str, turn_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+            summary = await sess.delete_turn(turn_id)
+            return {"ok": True, "turn_id": turn_id, "session": summary}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/turns/{turn_id}/edit", dependencies=[Depends(require_auth)])
+    async def api_edit_turn(
+        session_id: str,
+        turn_id: str,
+        body: EditTurnRequest,
+    ) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+            new_text = body.text if body.text else body.prompt
+            ev = await sess.edit_turn(
+                turn_id,
+                new_text,
+                model=body.model,
+                profile_id=body.profile_id,
+                attachments=body.attachments,
+            )
+            return {
+                "ok": True,
+                "event": ev,
+                "turn_id": ev.get("turn_id"),
+                "session": sess.summary(),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/turns/{turn_id}/regenerate", dependencies=[Depends(require_auth)])
+    async def api_regenerate_turn(
+        session_id: str,
+        turn_id: str,
+        body: RegenerateTurnRequest | None = Body(default=None),
+    ) -> dict[str, Any]:
+        req = body or RegenerateTurnRequest()
+        try:
+            sess = session_manager.get_session(session_id)
+            ev = await sess.regenerate_turn(
+                turn_id,
+                model=req.model,
+                profile_id=req.profile_id,
+            )
+            return {
+                "ok": True,
+                "event": ev,
+                "turn_id": ev.get("turn_id"),
+                "session": sess.summary(),
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/sessions/{session_id}/agents", dependencies=[Depends(require_auth)])
+    def api_list_session_agents(session_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"session_id": session_id, "agents": sess.list_subagents()}
+
+    @app.post("/api/sessions/{session_id}/agents/{agent_id}/cancel", dependencies=[Depends(require_auth)])
+    async def api_cancel_session_agent(session_id: str, agent_id: str) -> dict[str, Any]:
+        try:
+            sess = session_manager.get_session(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        sub = sess.subagents.get(agent_id)
+        if sub is None:
+            raise HTTPException(status_code=404, detail=f"Sub-agent not found: {agent_id}")
+        await sub.cancel_turn()
+        team = sess.list_subagents()
+        sess.emit_event("agent_team_update", {"agents": team})
+        return {"ok": True, "agent_id": agent_id, "status": sub.status, "agents": team}
 
     @app.delete("/api/sessions/{session_id}", dependencies=[Depends(require_auth)])
     async def api_delete_session(session_id: str) -> dict[str, Any]:
@@ -1221,10 +1912,12 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
                 body.prompt,
                 model=body.model,
                 profile_id=body.profile_id,
+                attachments=body.attachments,
                 queue_if_busy=body.queue_if_busy,
             )
             return {
                 "event": ev,
+                "turn_id": ev.get("turn_id"),
                 "queued": bool(ev.get("queued", False)),
                 "queue_item": ev.get("queue_item"),
                 "session": sess.summary(),

@@ -28,14 +28,83 @@ struct FileArtifactItem: Identifiable, Hashable {
     }
 }
 
+struct ChatAttachmentItem: Identifiable, Hashable {
+    var id: String { attId }
+    let attId: String
+    let filename: String
+    let mimeType: String
+    let width: Int
+    let height: Int
+    let size: Int
+    let url: String
+    let thumbURL: String
+    let source: String
+}
+
+struct TurnUsageInfo: Hashable {
+    let promptTokens: Int
+    let cacheHitTokens: Int
+    let completionTokens: Int
+    let reasoningTokens: Int
+    let totalTokens: Int
+    let cost: Double
+    let currency: String
+    let model: String
+    let estimated: Bool
+}
+
+struct BrowserElementItem: Identifiable, Hashable {
+    let id: Int
+    let tag: String
+    let type: String
+    let text: String
+    let href: String
+    let value: String
+    let bbox: [Int]
+}
+
+struct BrowserSessionState: Identifiable, Hashable {
+    var id: String { browserId }
+    let browserId: String
+    var sessionId: String
+    var url: String
+    var title: String
+    var controlOwner: String // "agent" | "human"
+    var humanRequired: Bool
+    var humanReason: String
+    var scrollY: Int
+    var elements: [BrowserElementItem]
+    var textMarkdown: String
+    var frameB64: String
+}
+
+struct TeamSubagentItem: Identifiable, Hashable {
+    var id: String { agentId }
+    let agentId: String
+    var role: String
+    var task: String
+    var status: String // "running" | "done" | "failed" | "cancelled"
+    var model: String
+    var roundsUsed: Int
+    var cost: Double
+    var resultSummary: String
+    var transcriptPreview: String
+}
+
 struct ChatTurnItem: Identifiable, Hashable {
     let id: String
+    var turnId: String = ""
     var userText: String?
+    var attachments: [ChatAttachmentItem] = []
     var thoughtText: String = ""
     var toolCalls: [ToolCallItem] = []
     var artifacts: [FileArtifactItem] = []
+    var browserSessions: [BrowserSessionState] = []
+    var teamAgents: [TeamSubagentItem] = []
     var assistantText: String = ""
     var errorText: String?
+    var usage: TurnUsageInfo? = nil
+    var modelSwitchedNote: String? = nil
 }
 
 struct PendingApprovalItem: Identifiable, Hashable {
@@ -132,6 +201,21 @@ struct SessionSummaryItem: Identifiable, Hashable {
     var title: String
     var status: String
     var model: String
+    var workspaceProfileId: String = "ws_default"
+    var workspace: String = ""
+}
+
+struct WorkspaceProfileItem: Identifiable, Hashable {
+    let id: String
+    var name: String
+    var icon: String
+    var color: String
+    var rootPaths: [String]
+    var defaultProfileId: String
+    var defaultApprovalMode: String
+    var sharedNotes: String
+    var crossSessionRead: Bool
+    var sessionCount: Int
 }
 
 // MARK: - Model Profiles & Search Settings Models
@@ -146,6 +230,7 @@ struct ModelProfileItem: Identifiable, Hashable {
     var maxTokens: Int
     var supportsTools: Bool
     var supportsReasoning: Bool
+    var supportsVision: Bool = false
     var hasAPIKey: Bool
     var apiKeyMasked: String
     var inheritsGlobalKey: Bool
@@ -323,4 +408,64 @@ struct SelfCheckReport {
     let overallStatus: String
     let checkedAt: String
     let checks: [SelfCheckItem]
+}
+
+// MARK: - API Wallet & Token Ledger Models
+
+struct WalletModelUsageItem: Identifiable, Hashable {
+    var id: String { model }
+    let model: String
+    let totalTokens: Int
+    let promptTokens: Int
+    let completionTokens: Int
+    let cost: Double
+    let turns: Int
+}
+
+struct WalletDayItem: Identifiable, Hashable {
+    var id: String { date }
+    let date: String
+    let totalTokens: Int
+    let cost: Double
+    let turns: Int
+}
+
+struct WalletHourItem: Identifiable, Hashable {
+    var id: String { hour }
+    let hour: String
+    let tokens: Int
+    let cost: Double
+}
+
+struct WalletRulesItem: Equatable {
+    var enabled: Bool = true
+    var balanceBelow: Double = 5.0
+    var dailySpendAbove: Double = 20.0
+    var fallbackProfileId: String = "deepseek-flash"
+    var notifyBark: Bool = true
+    var hysteresis: Double = 1.0
+    var manualBalance: Double? = nil
+    var currency: String = "CNY"
+}
+
+struct WalletSummaryData {
+    var balanceAvailable: Bool = false
+    var balanceSource: String = "unavailable"
+    var totalBalance: Double? = nil
+    var grantedBalance: Double = 0
+    var toppedUpBalance: Double = 0
+    var currency: String = "CNY"
+    var todayPromptTokens: Int = 0
+    var todayCacheHitTokens: Int = 0
+    var todayCompletionTokens: Int = 0
+    var todayTotalTokens: Int = 0
+    var todayCost: Double = 0
+    var todayTurns: Int = 0
+    var currentHourTokens: Int = 0
+    var currentHourCost: Double = 0
+    var byModel: [WalletModelUsageItem] = []
+    var last7Days: [WalletDayItem] = []
+    var hourlyToday: [WalletHourItem] = []
+    var rules: WalletRulesItem = WalletRulesItem()
+    var downgradeActive: Bool = false
 }

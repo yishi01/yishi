@@ -320,61 +320,273 @@ struct SessionDrawerSheet: View {
     @EnvironmentObject var client: BridgeClient
     @Environment(\.dismiss) private var dismiss
 
+    @State private var selectedProfileFilter: String = ""
+    @State private var showWorkspaceProfilesManager: Bool = false
+    @State private var renamingSession: SessionSummaryItem?
+    @State private var renameDraftTitle: String = ""
+    @State private var showRenameAlert: Bool = false
+
+    private var filteredSessions: [SessionSummaryItem] {
+        guard !selectedProfileFilter.isEmpty else { return client.sessions }
+        return client.sessions.filter { $0.workspaceProfileId == selectedProfileFilter }
+    }
+
+    private func workspaceName(for profileId: String) -> String {
+        client.workspaceProfiles.first(where: { $0.id == profileId })?.name ?? "默认工作区"
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 LiquidGlassBackdropView()
 
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(client.sessions) { s in
-                            let isCurrent = (s.sessionId == client.activeSessionId)
-                            Button {
-                                Haptics.light()
-                                Task {
-                                    await client.selectSession(s.sessionId)
-                                    dismiss()
-                                }
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image("DSHLogo")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: 32, height: 32)
+                VStack(spacing: 0) {
+                    workspaceFilterHeader
+                        .padding(.horizontal, 16)
+                        .padding(.top, 10)
+                        .padding(.bottom, 6)
 
-                                    VStack(alignment: .leading, spacing: 3) {
-                                        Text(s.title)
-                                            .font(.system(size: 15, weight: isCurrent ? .semibold : .medium))
-                                            .foregroundStyle(Color.dsPrimary)
-                                            .lineLimit(1)
-                                        Text("\(s.model) · \(s.status)")
-                                            .font(.system(size: 12))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer()
-                                    if isCurrent {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.system(size: 18))
-                                            .foregroundStyle(Color.dsAccent)
-                                    }
-                                }
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 12)
-                                .cleanWhiteCard(cornerRadius: 16)
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(filteredSessions) { s in
+                                sessionRow(s)
                             }
-                            .glassPressable(scale: 0.98)
                         }
+                        .padding(16)
                     }
-                    .padding(16)
                 }
             }
             .navigationTitle("对话历史")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        Haptics.light()
+                        showWorkspaceProfilesManager = true
+                    } label: {
+                        Label("工作区档案", systemImage: "folder.badge.gearshape")
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("关闭") { dismiss() }
                 }
             }
+            .alert("修改对话标题", isPresented: $showRenameAlert) {
+                TextField("输入新标题...", text: $renameDraftTitle)
+                Button("取消", role: .cancel) {
+                    renamingSession = nil
+                }
+                Button("保存") {
+                    if let target = renamingSession {
+                        let newTitle = renameDraftTitle
+                        Task { await client.renameSession(target.sessionId, title: newTitle) }
+                    }
+                    renamingSession = nil
+                }
+            } message: {
+                Text("为该对话设置便于检索的名称")
+            }
+            .sheet(isPresented: $showWorkspaceProfilesManager) {
+                WorkspaceProfilesSheet(
+                    profiles: client.workspaceProfiles,
+                    activeProfileId: client.activeWorkspaceProfileId,
+                    authorizedPaths: client.workspaces,
+                    onSelectProfile: { wp in
+                        selectedProfileFilter = wp.id
+                        Task { await client.selectWorkspaceProfile(wp.id) }
+                    },
+                    onCreateProfile: { wp in
+                        Task {
+                            await client.saveWorkspaceProfile(
+                                id: nil,
+                                name: wp.name,
+                                icon: wp.icon,
+                                color: wp.color,
+                                rootPaths: wp.rootPaths,
+                                defaultProfileId: wp.defaultProfileId,
+                                defaultApprovalMode: wp.defaultApprovalMode,
+                                sharedNotes: wp.sharedNotes,
+                                crossSessionRead: wp.crossSessionRead
+                            )
+                        }
+                    },
+                    onUpdateProfile: { wp in
+                        Task {
+                            await client.saveWorkspaceProfile(
+                                id: wp.id,
+                                name: wp.name,
+                                icon: wp.icon,
+                                color: wp.color,
+                                rootPaths: wp.rootPaths,
+                                defaultProfileId: wp.defaultProfileId,
+                                defaultApprovalMode: wp.defaultApprovalMode,
+                                sharedNotes: wp.sharedNotes,
+                                crossSessionRead: wp.crossSessionRead
+                            )
+                        }
+                    },
+                    onDeleteProfile: { pid in
+                        Task { await client.deleteWorkspaceProfile(pid) }
+                    }
+                )
+            }
+        }
+    }
+
+    private var workspaceFilterHeader: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                let allSelected = selectedProfileFilter.isEmpty
+                Button {
+                    Haptics.light()
+                    selectedProfileFilter = ""
+                } label: {
+                    Text("全部对话 (\(client.sessions.count))")
+                        .font(.system(size: 12, weight: allSelected ? .bold : .medium))
+                        .foregroundStyle(allSelected ? .white : Color.dsPrimary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule().fill(allSelected ? Color.dsAccent : Color.white.opacity(0.68))
+                        )
+                }
+                .buttonStyle(SingleTapRowButtonStyle())
+
+                ForEach(client.workspaceProfiles) { wp in
+                    let isSelected = (selectedProfileFilter == wp.id)
+                    Button {
+                        Haptics.light()
+                        selectedProfileFilter = wp.id
+                        Task { await client.selectWorkspaceProfile(wp.id) }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: wp.icon.isEmpty ? "folder.fill" : wp.icon)
+                                .font(.system(size: 11))
+                            Text(wp.name)
+                                .font(.system(size: 12, weight: isSelected ? .bold : .medium))
+                        }
+                        .foregroundStyle(isSelected ? .white : Color.dsPrimary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .background(
+                            Capsule().fill(isSelected ? Color.dsAccent : Color.white.opacity(0.68))
+                        )
+                    }
+                    .buttonStyle(SingleTapRowButtonStyle())
+                }
+
+                Button {
+                    Haptics.light()
+                    showWorkspaceProfilesManager = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "slider.horizontal.3")
+                            .font(.system(size: 11))
+                        Text("管理工作区")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(Color.dsAccent)
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 6)
+                    .cleanWhiteCard(cornerRadius: 999)
+                }
+                .buttonStyle(SingleTapRowButtonStyle())
+            }
+        }
+    }
+
+    private func sessionRow(_ s: SessionSummaryItem) -> some View {
+        let isCurrent = (s.sessionId == client.activeSessionId)
+        return HStack(spacing: 10) {
+            Button {
+                Haptics.light()
+                Task {
+                    await client.selectSession(s.sessionId)
+                    dismiss()
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Image("DSHLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 32, height: 32)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(s.title)
+                            .font(.system(size: 15, weight: isCurrent ? .semibold : .medium))
+                            .foregroundStyle(Color.dsPrimary)
+                            .lineLimit(1)
+                        Text("\(workspaceName(for: s.workspaceProfileId)) · \(s.model) · \(s.status)")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    if isCurrent {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 18))
+                            .foregroundStyle(Color.dsAccent)
+                    }
+                }
+            }
+            .buttonStyle(SingleTapRowButtonStyle())
+
+            Menu {
+                sessionMenuActions(s)
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 18))
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .cleanWhiteCard(cornerRadius: 16)
+        .contextMenu {
+            sessionMenuActions(s)
+        }
+    }
+
+    @ViewBuilder
+    private func sessionMenuActions(_ s: SessionSummaryItem) -> some View {
+        Button {
+            renamingSession = s
+            renameDraftTitle = s.title
+            showRenameAlert = true
+        } label: {
+            Label("修改对话标题", systemImage: "pencil")
+        }
+
+        if !client.workspaceProfiles.isEmpty {
+            Menu {
+                ForEach(client.workspaceProfiles) { wp in
+                    Button {
+                        Task {
+                            await client.moveSessionToWorkspaceProfile(
+                                s.sessionId,
+                                workspaceProfileId: wp.id
+                            )
+                        }
+                    } label: {
+                        HStack {
+                            Label(wp.name, systemImage: wp.icon.isEmpty ? "folder.fill" : wp.icon)
+                            if s.workspaceProfileId == wp.id {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                Label("移动到工作区档案...", systemImage: "folder.badge.plus")
+            }
+        }
+
+        Button(role: .destructive) {
+            Task { await client.deleteSession(s.sessionId) }
+        } label: {
+            Label("删除该对话", systemImage: "trash")
         }
     }
 }

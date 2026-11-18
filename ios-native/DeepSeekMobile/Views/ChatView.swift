@@ -1,4 +1,6 @@
+import PhotosUI
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct ChatView: View {
@@ -14,6 +16,8 @@ struct ChatView: View {
 
     @State private var showChatFileImporter: Bool = false
     @State private var isUploadingAttachment: Bool = false
+    @State private var selectedPhotoItems: [PhotosPickerItem] = []
+    @State private var showWorkspaceProfilesSheet: Bool = false
     @State private var reviewingArtifact: FileArtifactItem?
     @State private var downloadedShareItem: ShareSheetItem?
 
@@ -47,6 +51,28 @@ struct ChatView: View {
                                                 downloadedShareItem = ShareSheetItem(url: url)
                                             }
                                         }
+                                    },
+                                    onCopyText: { text in
+                                        UIPasteboard.general.string = text
+                                        Haptics.light()
+                                        client.showToastMessage("已复制内容")
+                                    },
+                                    onEditTurn: { t in
+                                        let tid = t.turnId.isEmpty ? t.id : t.turnId
+                                        client.editingTurnId = tid
+                                        promptText = t.userText ?? ""
+                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                            isComposerCollapsed = false
+                                        }
+                                        isComposerFocused = true
+                                    },
+                                    onRegenerateTurn: { t in
+                                        let tid = t.turnId.isEmpty ? t.id : t.turnId
+                                        Task { await client.regenerateTurn(tid) }
+                                    },
+                                    onDeleteTurn: { t in
+                                        let tid = t.turnId.isEmpty ? t.id : t.turnId
+                                        Task { await client.deleteTurn(tid) }
                                     }
                                 )
                                 .id(turn.id)
@@ -187,6 +213,70 @@ struct ChatView: View {
         }
         .sheet(item: $downloadedShareItem) { share in
             ActivityViewSheet(items: [share.url])
+        }
+        .sheet(isPresented: $showWorkspaceProfilesSheet) {
+            WorkspaceProfilesSheet(
+                profiles: client.workspaceProfiles,
+                activeProfileId: client.activeWorkspaceProfileId,
+                authorizedPaths: client.workspaces,
+                onSelectProfile: { wp in
+                    Task { await client.selectWorkspaceProfile(wp.id) }
+                },
+                onCreateProfile: { wp in
+                    Task {
+                        await client.saveWorkspaceProfile(
+                            id: nil,
+                            name: wp.name,
+                            icon: wp.icon,
+                            color: wp.color,
+                            rootPaths: wp.rootPaths,
+                            defaultProfileId: wp.defaultProfileId,
+                            defaultApprovalMode: wp.defaultApprovalMode,
+                            sharedNotes: wp.sharedNotes,
+                            crossSessionRead: wp.crossSessionRead
+                        )
+                    }
+                },
+                onUpdateProfile: { wp in
+                    Task {
+                        await client.saveWorkspaceProfile(
+                            id: wp.id,
+                            name: wp.name,
+                            icon: wp.icon,
+                            color: wp.color,
+                            rootPaths: wp.rootPaths,
+                            defaultProfileId: wp.defaultProfileId,
+                            defaultApprovalMode: wp.defaultApprovalMode,
+                            sharedNotes: wp.sharedNotes,
+                            crossSessionRead: wp.crossSessionRead
+                        )
+                    }
+                },
+                onDeleteProfile: { pid in
+                    Task { await client.deleteWorkspaceProfile(pid) }
+                }
+            )
+        }
+        .onChange(of: selectedPhotoItems) { newItems in
+            guard !newItems.isEmpty else { return }
+            let itemsToProcess = newItems
+            selectedPhotoItems = []
+            Task {
+                isUploadingAttachment = true
+                for (index, item) in itemsToProcess.enumerated() {
+                    if let data = try? await item.loadTransferable(type: Data.self) {
+                        _ = await client.uploadImageAttachment(
+                            data: data,
+                            filename: "photo_\(Int(Date().timeIntervalSince1970))_\(index + 1).jpg"
+                        )
+                    }
+                }
+                isUploadingAttachment = false
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                    isComposerCollapsed = false
+                }
+                bumpIdleTimer()
+            }
         }
     }
 
@@ -442,6 +532,10 @@ struct ChatView: View {
         .frame(maxWidth: .infinity)
     }
 
+    private var activeWorkspaceProfileName: String {
+        client.workspaceProfiles.first(where: { $0.id == client.activeWorkspaceProfileId })?.name ?? "默认工作区"
+    }
+
     private var topHeaderBar: some View {
         HStack(spacing: 10) {
             Button {
@@ -458,31 +552,61 @@ struct ChatView: View {
 
             Spacer()
 
-            HStack(spacing: 8) {
-                Image("DSHLogo")
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: 24, height: 24)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(currentSessionTitle)
-                        .font(.system(size: 14.5, weight: .semibold))
-                        .foregroundStyle(Color.dsPrimary)
-                        .lineLimit(1)
-
-                    HStack(spacing: 4) {
-                        Circle()
-                            .fill(client.isConnected ? Color.green : Color.orange)
-                            .frame(width: 5.5, height: 5.5)
-                        Text(client.isConnected ? "DSH 已连接 · \(aiModeShortLabel)" : "正在重连")
-                            .font(.system(size: 10.5, weight: .medium))
-                            .foregroundStyle(.secondary)
+            Menu {
+                Section("切换工作区记忆档案") {
+                    ForEach(client.workspaceProfiles) { wp in
+                        Button {
+                            Task { await client.selectWorkspaceProfile(wp.id) }
+                        } label: {
+                            HStack {
+                                Label(wp.name, systemImage: wp.icon.isEmpty ? "folder.fill" : wp.icon)
+                                if wp.id == client.activeWorkspaceProfileId {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
                     }
                 }
+                Section {
+                    Button {
+                        showWorkspaceProfilesSheet = true
+                    } label: {
+                        Label("管理工作区档案...", systemImage: "folder.badge.gearshape")
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image("DSHLogo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 24, height: 24)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Text(currentSessionTitle)
+                                .font(.system(size: 14.5, weight: .semibold))
+                                .foregroundStyle(Color.dsPrimary)
+                                .lineLimit(1)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 9.5, weight: .bold))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(client.isConnected ? Color.green : Color.orange)
+                                .frame(width: 5.5, height: 5.5)
+                            Text(client.isConnected ? "\(activeWorkspaceProfileName) · \(aiModeShortLabel)" : "正在重连")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .liquidGlass(cornerRadius: 999, prominent: false)
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .liquidGlass(cornerRadius: 999, prominent: false)
 
             Spacer()
 
@@ -621,34 +745,127 @@ struct ChatView: View {
     private var composerBar: some View {
         let isRunning = (client.sessionStatus == "running" || client.sessionStatus == "waiting_input")
         let isEmptyPrompt = promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let canSend = !isEmptyPrompt || !client.pendingAttachments.isEmpty
 
-        return VStack(spacing: 7) {
-            TextField("给 AI 发送消息（运行中发送将自动加入排队）...", text: $promptText, axis: .vertical)
+        return VStack(alignment: .leading, spacing: 7) {
+            if client.editingTurnId != nil {
+                HStack(spacing: 8) {
+                    Text("✏️ 正在编辑历史消息（发送后将截断并重新生成后续回复）")
+                        .font(.system(size: 11.5, weight: .semibold))
+                        .foregroundStyle(Color.orange)
+                        .lineLimit(1)
+                    Spacer()
+                    Button("取消") {
+                        Haptics.light()
+                        client.editingTurnId = nil
+                        promptText = ""
+                    }
+                    .font(.system(size: 11.5, weight: .bold))
+                    .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.orange.opacity(0.14))
+                )
+            }
+
+            if !client.pendingAttachments.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(client.pendingAttachments) { att in
+                            ZStack(alignment: .topTrailing) {
+                                RemoteAttachmentImageView(
+                                    attachment: att,
+                                    useThumbnail: true,
+                                    baseURL: client.normalizedBaseURL,
+                                    authToken: client.authToken,
+                                    contentMode: .fill
+                                )
+                                .frame(width: 58, height: 58)
+                                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .strokeBorder(Color.white.opacity(0.85), lineWidth: 1)
+                                )
+
+                                Button {
+                                    client.removePendingAttachment(att.attId)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 16))
+                                        .foregroundStyle(.white, Color.black.opacity(0.68))
+                                }
+                                .offset(x: 4, y: -4)
+                            }
+                            .padding(.top, 4)
+                            .padding(.trailing, 4)
+                        }
+                    }
+                }
+            }
+
+            TextField("给 AI 发送消息（支持发图/电脑截屏/内置浏览器）...", text: $promptText, axis: .vertical)
                 .focused($isComposerFocused)
                 .lineLimit(1...5)
                 .font(.system(size: theme.scaledFont(15.5)))
                 .padding(.horizontal, 6)
                 .padding(.top, 4)
 
-            HStack(spacing: 8) {
-                // Upload File to PC & Attach to Chat Button
-                Button {
-                    Haptics.light()
-                    showChatFileImporter = true
-                } label: {
+            HStack(spacing: 7) {
+                PhotosPicker(
+                    selection: $selectedPhotoItems,
+                    maxSelectionCount: 6,
+                    matching: .images
+                ) {
                     HStack(spacing: 4) {
-                        Image(systemName: isUploadingAttachment ? "arrow.triangle.2.circlepath" : "paperclip")
+                        Image(systemName: "photo.on.rectangle.angled")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(theme.accentColor)
-                        Text(isUploadingAttachment ? "上传中" : "发文件")
+                        Text("相册")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(Color.dsPrimary)
                     }
-                    .padding(.horizontal, 10)
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 5.5)
                     .cleanWhiteCard(cornerRadius: 999)
                 }
-                .glassPressable(scale: 0.94)
+
+                Menu {
+                    Button {
+                        Haptics.light()
+                        Task { _ = await client.capturePCScreenshot(target: "full") }
+                    } label: {
+                        Label("🖥️ 截电脑屏幕", systemImage: "display")
+                    }
+
+                    Button {
+                        Haptics.light()
+                        Task { await client.openBrowserInChat(url: "https://www.deepseek.com") }
+                    } label: {
+                        Label("🌐 内置浏览器", systemImage: "globe")
+                    }
+
+                    Button {
+                        Haptics.light()
+                        showChatFileImporter = true
+                    } label: {
+                        Label("📎 传电脑文件", systemImage: "paperclip")
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isUploadingAttachment ? "arrow.triangle.2.circlepath" : "plus.circle.fill")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(theme.accentColor)
+                        Text(isUploadingAttachment ? "处理中" : "工具")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(Color.dsPrimary)
+                    }
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5.5)
+                    .cleanWhiteCard(cornerRadius: 999)
+                }
 
                 Menu {
                     if !client.modelProfiles.isEmpty {
@@ -657,7 +874,7 @@ struct ChatView: View {
                                 Task { await client.switchModelProfile(prof) }
                             } label: {
                                 HStack {
-                                    Text(prof.name)
+                                    Text(prof.supportsVision ? "👁️ \(prof.name)" : prof.name)
                                     if prof.id == client.activeProfileId {
                                         Image(systemName: "checkmark")
                                     }
@@ -703,7 +920,7 @@ struct ChatView: View {
 
                 Spacer()
 
-                if isRunning && !isEmptyPrompt {
+                if isRunning && canSend {
                     Button {
                         Haptics.light()
                         let text = promptText
@@ -751,21 +968,21 @@ struct ChatView: View {
                             .frame(width: 34, height: 34)
                             .background(
                                 Circle().fill(
-                                    isEmptyPrompt
+                                    !canSend
                                         ? Color.gray.opacity(0.32)
                                         : Color.dsPrimary
                                 )
                             )
                             .shadow(
-                                color: isEmptyPrompt ? .clear : Color.dsPrimary.opacity(0.22),
+                                color: !canSend ? .clear : Color.dsPrimary.opacity(0.22),
                                 radius: 6,
                                 x: 0,
                                 y: 3
                             )
                     }
-                    .disabled(isEmptyPrompt)
+                    .disabled(!canSend)
                     .glassPressable(scale: 0.90)
-                    .animation(.spring(response: 0.25, dampingFraction: 0.78), value: isEmptyPrompt)
+                    .animation(.spring(response: 0.25, dampingFraction: 0.78), value: canSend)
                 }
             }
         }
@@ -778,9 +995,14 @@ struct ChatView: View {
 }
 
 struct TurnRowView: View {
+    @EnvironmentObject var client: BridgeClient
     let turn: ChatTurnItem
     var onReviewArtifact: (FileArtifactItem) -> Void
     var onDownloadArtifact: (FileArtifactItem) -> Void
+    var onCopyText: (String) -> Void = { _ in }
+    var onEditTurn: (ChatTurnItem) -> Void = { _ in }
+    var onRegenerateTurn: (ChatTurnItem) -> Void = { _ in }
+    var onDeleteTurn: (ChatTurnItem) -> Void = { _ in }
 
     @ObservedObject private var theme = ThemePreferences.shared
     @State private var expandThoughts: Bool = false
@@ -789,6 +1011,17 @@ struct TurnRowView: View {
     var body: some View {
         let radius = CGFloat(theme.bubbleRadius)
         VStack(alignment: .leading, spacing: theme.compactMode ? 7 : 10) {
+            if !turn.attachments.isEmpty {
+                HStack {
+                    Spacer(minLength: 48)
+                    TurnAttachmentsGridView(
+                        attachments: turn.attachments,
+                        baseURL: client.normalizedBaseURL,
+                        authToken: client.authToken
+                    )
+                }
+            }
+
             if let userText = turn.userText, !userText.isEmpty {
                 HStack {
                     Spacer(minLength: 48)
@@ -798,6 +1031,25 @@ struct TurnRowView: View {
                         .padding(.horizontal, 15)
                         .padding(.vertical, theme.compactMode ? 8 : 10.5)
                         .liquidGlass(cornerRadius: radius, prominent: false)
+                        .contextMenu {
+                            Button {
+                                onCopyText(userText)
+                            } label: {
+                                Label("复制消息", systemImage: "doc.on.doc")
+                            }
+
+                            Button {
+                                onEditTurn(turn)
+                            } label: {
+                                Label("编辑并重新发送", systemImage: "pencil")
+                            }
+
+                            Button(role: .destructive) {
+                                onDeleteTurn(turn)
+                            } label: {
+                                Label("删除本轮对话", systemImage: "trash")
+                            }
+                        }
                 }
             }
 
@@ -905,6 +1157,85 @@ struct TurnRowView: View {
                 }
             }
 
+            // Agent Team Collaboration Card
+            if !turn.teamAgents.isEmpty {
+                AgentTeamCardView(
+                    agents: turn.teamAgents,
+                    onCancelAgent: { aid in
+                        Task { await client.cancelSubagent(agentId: aid) }
+                    }
+                )
+            }
+
+            // Inline Collaborative Browser Sessions
+            if !turn.browserSessions.isEmpty {
+                VStack(spacing: 10) {
+                    ForEach(turn.browserSessions) { bState in
+                        let liveState = client.activeBrowserSessions[bState.browserId] ?? bState
+                        BrowserInlineCardView(
+                            state: liveState,
+                            onNavigate: { url in
+                                Task { await client.browserNavigate(browserId: liveState.browserId, url: url) }
+                            },
+                            onBack: {
+                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "back") }
+                            },
+                            onForward: {
+                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "forward") }
+                            },
+                            onReload: {
+                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "reload") }
+                            },
+                            onScreenshot: {
+                                Task { await client.browserScreenshotToChat(browserId: liveState.browserId) }
+                            },
+                            onToggleControl: { owner in
+                                Task { await client.browserSetControl(browserId: liveState.browserId, owner: owner) }
+                            },
+                            onTapCoordinate: { vx, vy in
+                                Task {
+                                    await client.browserSendInput(
+                                        browserId: liveState.browserId,
+                                        action: "click_xy",
+                                        x: vx,
+                                        y: vy
+                                    )
+                                }
+                            },
+                            onClickElement: { elId in
+                                Task {
+                                    await client.browserSendInput(
+                                        browserId: liveState.browserId,
+                                        action: "click",
+                                        elementId: elId
+                                    )
+                                }
+                            },
+                            onTypeText: { elId, txt, sub in
+                                Task {
+                                    await client.browserSendInput(
+                                        browserId: liveState.browserId,
+                                        action: "type",
+                                        elementId: elId,
+                                        text: txt,
+                                        submit: sub
+                                    )
+                                }
+                            },
+                            onScroll: { dy in
+                                Task {
+                                    await client.browserSendInput(
+                                        browserId: liveState.browserId,
+                                        action: "scroll",
+                                        deltaY: dy
+                                    )
+                                }
+                            }
+                        )
+                    }
+                }
+            }
+
             // Claude-Style File Artifact & Review/Download Cards
             if !turn.artifacts.isEmpty {
                 VStack(spacing: 10) {
@@ -924,6 +1255,95 @@ struct TurnRowView: View {
                     .padding(.vertical, theme.compactMode ? 9 : 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .cleanWhiteCard(cornerRadius: radius)
+                    .contextMenu {
+                        Button {
+                            onCopyText(turn.assistantText)
+                        } label: {
+                            Label("复制回复全文", systemImage: "doc.on.doc")
+                        }
+
+                        Button {
+                            onRegenerateTurn(turn)
+                        } label: {
+                            Label("重新生成本轮", systemImage: "arrow.clockwise")
+                        }
+
+                        Button {
+                            onEditTurn(turn)
+                        } label: {
+                            Label("编辑提问并重发", systemImage: "pencil")
+                        }
+
+                        Button(role: .destructive) {
+                            onDeleteTurn(turn)
+                        } label: {
+                            Label("删除本轮对话", systemImage: "trash")
+                        }
+                    }
+            }
+
+            if turn.usage != nil || (turn.modelSwitchedNote?.isEmpty == false) || !turn.assistantText.isEmpty {
+                HStack(alignment: .center, spacing: 8) {
+                    TurnUsageBadgeView(
+                        usage: turn.usage,
+                        modelSwitchedNote: turn.modelSwitchedNote
+                    )
+
+                    Spacer(minLength: 4)
+
+                    if !turn.assistantText.isEmpty {
+                        HStack(spacing: 6) {
+                            Button {
+                                onCopyText(turn.assistantText)
+                            } label: {
+                                Image(systemName: "doc.on.doc")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 26, height: 26)
+                                    .cleanWhiteCard(cornerRadius: 999)
+                            }
+
+                            Button {
+                                onRegenerateTurn(turn)
+                            } label: {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 26, height: 26)
+                                    .cleanWhiteCard(cornerRadius: 999)
+                            }
+
+                            Menu {
+                                Button {
+                                    onCopyText(turn.assistantText)
+                                } label: {
+                                    Label("复制回复全文", systemImage: "doc.on.doc")
+                                }
+                                Button {
+                                    onRegenerateTurn(turn)
+                                } label: {
+                                    Label("重新生成本轮", systemImage: "arrow.clockwise")
+                                }
+                                Button {
+                                    onEditTurn(turn)
+                                } label: {
+                                    Label("编辑提问并重发", systemImage: "pencil")
+                                }
+                                Button(role: .destructive) {
+                                    onDeleteTurn(turn)
+                                } label: {
+                                    Label("删除本轮对话", systemImage: "trash")
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 26, height: 26)
+                                    .cleanWhiteCard(cornerRadius: 999)
+                            }
+                        }
+                    }
+                }
             }
 
             if let err = turn.errorText {

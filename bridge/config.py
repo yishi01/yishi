@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = Path(os.environ.get("PLUGIN_DATA") or (PROJECT_ROOT / "data"))
 
@@ -55,6 +55,7 @@ def default_model_profiles() -> list[dict[str, Any]]:
             "max_tokens": 8192,
             "supports_tools": True,
             "supports_reasoning": False,
+            "supports_vision": False,
         },
         {
             "id": "deepseek-flash",
@@ -67,6 +68,7 @@ def default_model_profiles() -> list[dict[str, Any]]:
             "max_tokens": 8192,
             "supports_tools": True,
             "supports_reasoning": False,
+            "supports_vision": True,
         },
         {
             "id": "deepseek-reasoner",
@@ -79,6 +81,7 @@ def default_model_profiles() -> list[dict[str, Any]]:
             "max_tokens": 8192,
             "supports_tools": True,
             "supports_reasoning": True,
+            "supports_vision": False,
         },
         {
             "id": "openai-gpt4o",
@@ -91,6 +94,7 @@ def default_model_profiles() -> list[dict[str, Any]]:
             "max_tokens": 8192,
             "supports_tools": True,
             "supports_reasoning": False,
+            "supports_vision": True,
         },
         {
             "id": "anthropic-claude",
@@ -103,6 +107,7 @@ def default_model_profiles() -> list[dict[str, Any]]:
             "max_tokens": 8192,
             "supports_tools": True,
             "supports_reasoning": True,
+            "supports_vision": True,
         },
         {
             "id": "openrouter",
@@ -310,6 +315,12 @@ class BridgeConfig(BaseModel):
             "max_tokens": int(prof.get("max_tokens") or 8192),
             "supports_tools": bool(prof.get("supports_tools", True)),
             "supports_reasoning": bool(prof.get("supports_reasoning", False)),
+            "supports_vision": bool(
+                prof.get(
+                    "supports_vision",
+                    any(k in model.lower() for k in ("flash", "gpt-4o", "claude", "vision", "vl", "gemini")),
+                )
+            ),
             "extra_headers": dict(prof.get("extra_headers") or {}),
         }
 
@@ -344,6 +355,15 @@ class BridgeConfig(BaseModel):
                 "max_tokens": int(prof.get("max_tokens") or 8192),
                 "supports_tools": bool(prof.get("supports_tools", True)),
                 "supports_reasoning": bool(prof.get("supports_reasoning", False)),
+                "supports_vision": bool(
+                    prof.get(
+                        "supports_vision",
+                        any(
+                            k in str(prof.get("model") or "").lower()
+                            for k in ("flash", "gpt-4o", "claude", "vision", "vl", "gemini")
+                        ),
+                    )
+                ),
                 "has_api_key": bool(eff_key),
                 "api_key_masked": mask_secret(eff_key),
                 "inherits_global_key": inherits_global,
