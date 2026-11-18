@@ -361,6 +361,22 @@ def test_module_b_attachments_screenshot_and_deepseek_vision(v9_env):
     assert "text" in block_types
     assert "image_url" in block_types
 
+    # 4. Verify AI executing take_screenshot tool emits a file_artifact card with is_image=True & image_url
+    sess.approval_mode = "ask_commands"
+    tool_shot_res = json.loads(
+        asyncio.run(sess._execute_tool("take_screenshot", json.dumps({"target": "full"})))
+    )
+    assert tool_shot_res.get("ok") is True
+    art_card = tool_shot_res.get("artifact")
+    assert isinstance(art_card, dict)
+    assert art_card.get("is_image") is True
+    assert art_card.get("image_url", "").startswith("/api/attachments/")
+    assert art_card.get("width", 0) > 0
+    assert any(
+        e["type"] == "file_artifact" and e["data"].get("is_image") is True
+        for e in sess.events
+    )
+
 
 # =============================================================================
 # 3. Module C: Session Rename & Turn Operations (Delete, Edit, Regenerate)

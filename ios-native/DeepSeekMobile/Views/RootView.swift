@@ -207,7 +207,7 @@ struct RootView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(.spring(response: 0.34, dampingFraction: 0.84), value: activeTab)
+            .animation(AppleMotion.smooth, value: activeTab)
 
             // Floating iOS Liquid Glass Tab Bar with 4 Compact Pills
             HStack(spacing: 3) {
@@ -216,7 +216,7 @@ struct RootView: View {
                     Button {
                         guard activeTab != tab else { return }
                         Haptics.light()
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.80)) {
+                        withAnimation(AppleMotion.snappy) {
                             activeTab = tab
                         }
                     } label: {

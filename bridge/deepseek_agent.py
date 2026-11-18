@@ -32,8 +32,8 @@ from bridge.fs_service import (
 from bridge.sandbox_runner import SandboxRunner, audit_untrusted_code
 from bridge.search_service import execute_web_search
 
-WRITE_TOOLS = {"write_file", "edit_file", "run_command", "run_plugin", "take_screenshot"}
-COMMAND_TOOLS = {"run_command", "run_plugin", "take_screenshot"}
+WRITE_TOOLS = {"write_file", "edit_file", "run_command", "run_plugin"}
+COMMAND_TOOLS = {"run_command", "run_plugin"}
 SUBAGENT_ORCHESTRATION_TOOLS = {"spawn_agents", "wait_agents", "message_agent", "cancel_agent"}
 MAX_TOOL_ROUNDS = 24
 RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -52,6 +52,7 @@ Guidelines:
 - Always inspect relevant files before editing them.
 - Prefer `edit_file` for targeted changes to existing files and `write_file` for creating new files.
 - Whenever the user asks you to send/share/provide a file for download, OR asks to review a newly created or modified file, call `present_file` so a Claude-style interactive File Artifact & Download card is pushed directly to their phone screen.
+- Whenever the user asks to take a screenshot, see the PC screen/desktop/window, or check what is on the computer screen, immediately call `take_screenshot` (target='full', 'window', or 'region'). It will automatically push an interactive Image Artifact Card with live image preview & download to their phone screen.
 - Keep responses concise and clear for mobile reading.
 """
 
@@ -1200,11 +1201,24 @@ class DeepSeekSession:
             title: str = "",
             summary: str = "",
             mode: str = "review",
+            att_meta: dict[str, Any] | None = None,
         ) -> dict[str, Any]:
             st = target_path.stat()
+            ext_lower = target_path.suffix.lower()
+            is_img = ext_lower in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
             preview_text = ""
             is_text = False
-            if st.st_size <= 1_000_000:
+            if is_img and att_meta is None and self.attachment_service and st.st_size <= 15_000_000:
+                try:
+                    att_meta = self.attachment_service.save_image_bytes(
+                        target_path.read_bytes(),
+                        filename=target_path.name,
+                        session_id=self.session_id,
+                        source="artifact",
+                    )
+                except Exception:
+                    att_meta = None
+            elif not is_img and st.st_size <= 1_000_000:
                 try:
                     raw_b = target_path.read_bytes()
                     if b"\x00" not in raw_b[:4096]:
@@ -1213,19 +1227,33 @@ class DeepSeekSession:
                         preview_text = "\n".join(decoded.splitlines()[:120])[:6000]
                 except OSError:
                     pass
+            try:
+                rel_p = to_rel_posix(root, target_path)
+            except Exception:
+                rel_p = target_path.name
             artifact_info = {
-                "id": uuid.uuid4().hex[:10],
+                "id": (att_meta or {}).get("att_id") or uuid.uuid4().hex[:10],
                 "name": target_path.name,
                 "path": str(target_path.resolve()),
-                "rel_path": to_rel_posix(root, target_path),
+                "rel_path": rel_p,
                 "title": title or target_path.name,
-                "summary": summary or ("已为你准备好文件，可直接预览审查或下载到手机" if mode == "review" else "点击下方按钮可将该文件下载到手机本地"),
+                "summary": summary or (
+                    "点击卡片图片可全屏缩放预览或保存下载到手机"
+                    if is_img
+                    else ("已为你准备好文件，可直接预览审查或下载到手机" if mode == "review" else "点击下方按钮可将该文件下载到手机本地")
+                ),
                 "size": st.st_size,
                 "mtime": st.st_mtime,
-                "ext": target_path.suffix.lower(),
+                "ext": ext_lower,
                 "mode": mode,
                 "is_text": is_text,
                 "preview": preview_text,
+                "is_image": bool(is_img or att_meta is not None),
+                "att_id": str((att_meta or {}).get("att_id") or ""),
+                "image_url": str((att_meta or {}).get("url") or ""),
+                "thumb_url": str((att_meta or {}).get("thumb_url") or ""),
+                "width": int((att_meta or {}).get("width") or 0),
+                "height": int((att_meta or {}).get("height") or 0),
             }
             self.emit_event("file_artifact", artifact_info)
             return artifact_info
@@ -1502,8 +1530,18 @@ class DeepSeekSession:
                     region=reg_list,
                     session_id=self.session_id,
                 )
-                self.emit_event("image_attachment", meta)
-                return json.dumps({"ok": True, "attachment": meta}, ensure_ascii=False)
+                try:
+                    img_path, _ = self.attachment_service.get_file_path(meta["att_id"], thumb=False)
+                    art = _build_and_emit_artifact(
+                        img_path,
+                        title=f"电脑屏幕截图 · {meta.get('width', 0)}×{meta.get('height', 0)}",
+                        summary="AI 已执行截图工具，点击卡片内图片可全屏缩放预览或保存到手机相册",
+                        mode="review",
+                        att_meta=meta,
+                    )
+                except Exception:
+                    art = None
+                return json.dumps({"ok": True, "attachment": meta, "artifact": art}, ensure_ascii=False)
 
             # --- Module F: Collaborative Browser Tools ---
             if name.startswith("browser_"):

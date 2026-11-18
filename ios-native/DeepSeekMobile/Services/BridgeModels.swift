@@ -22,9 +22,39 @@ struct FileArtifactItem: Identifiable, Hashable {
     let mode: String // "review" | "download"
     let isText: Bool
     let preview: String
+    var isImage: Bool = false
+    var attId: String = ""
+    var imageURL: String = ""
+    var thumbURL: String = ""
+    var imageWidth: Int = 0
+    var imageHeight: Int = 0
 
     var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+
+    var effectiveIsImage: Bool {
+        if isImage { return true }
+        let lower = ext.lowercased()
+        return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"].contains(lower)
+    }
+
+    var asChatAttachment: ChatAttachmentItem {
+        let fallbackURL = imageURL.isEmpty
+            ? "/api/pc/download?path=\(path.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")"
+            : imageURL
+        let fallbackThumb = thumbURL.isEmpty ? fallbackURL : thumbURL
+        return ChatAttachmentItem(
+            attId: attId.isEmpty ? id : attId,
+            filename: name,
+            mimeType: ext.lowercased() == ".png" ? "image/png" : "image/jpeg",
+            width: imageWidth,
+            height: imageHeight,
+            size: size,
+            url: fallbackURL,
+            thumbURL: fallbackThumb,
+            source: "pc_screenshot"
+        )
     }
 }
 

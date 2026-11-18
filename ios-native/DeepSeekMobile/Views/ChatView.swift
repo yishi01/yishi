@@ -15,10 +15,12 @@ struct ChatView: View {
     @State private var currentNavIndex: Int = 0
 
     @State private var showChatFileImporter: Bool = false
+    @State private var showPhotoPicker: Bool = false
     @State private var isUploadingAttachment: Bool = false
     @State private var selectedPhotoItems: [PhotosPickerItem] = []
     @State private var showWorkspaceProfilesSheet: Bool = false
     @State private var reviewingArtifact: FileArtifactItem?
+    @State private var previewingImageArtifact: ChatAttachmentItem?
     @State private var downloadedShareItem: ShareSheetItem?
 
     private let quickPrompts = [
@@ -43,7 +45,11 @@ struct ChatView: View {
                                 TurnRowView(
                                     turn: turn,
                                     onReviewArtifact: { art in
-                                        reviewingArtifact = art
+                                        if art.effectiveIsImage {
+                                            previewingImageArtifact = art.asChatAttachment
+                                        } else {
+                                            reviewingArtifact = art
+                                        }
                                     },
                                     onDownloadArtifact: { art in
                                         Task {
@@ -61,7 +67,7 @@ struct ChatView: View {
                                         let tid = t.turnId.isEmpty ? t.id : t.turnId
                                         client.editingTurnId = tid
                                         promptText = t.userText ?? ""
-                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                        withAnimation(AppleMotion.smooth) {
                                             isComposerCollapsed = false
                                         }
                                         isComposerFocused = true
@@ -92,8 +98,14 @@ struct ChatView: View {
                 }
                 .simultaneousGesture(
                     DragGesture(minimumDistance: 14).onChanged { _ in
-                        if theme.autoHideComposer && !isComposerFocused && promptText.isEmpty && client.pendingApprovals.isEmpty {
-                            withAnimation(.spring(response: 0.30, dampingFraction: 0.86)) {
+                        if theme.autoHideComposer
+                            && !isComposerFocused
+                            && promptText.isEmpty
+                            && client.pendingAttachments.isEmpty
+                            && client.pendingApprovals.isEmpty
+                            && !showPhotoPicker
+                        {
+                            withAnimation(AppleMotion.smooth) {
                                 isComposerCollapsed = true
                             }
                         }
@@ -128,9 +140,9 @@ struct ChatView: View {
                         }
                     }
                     .padding(.bottom, 64)
-                    .animation(.spring(response: 0.32, dampingFraction: 0.82), value: isComposerCollapsed)
-                    .animation(.spring(response: 0.32, dampingFraction: 0.80), value: client.pendingApprovals.count)
-                    .animation(.spring(response: 0.30, dampingFraction: 0.82), value: client.queuedMessages.count)
+                    .animation(AppleMotion.smooth, value: isComposerCollapsed)
+                    .animation(AppleMotion.smooth, value: client.pendingApprovals.count)
+                    .animation(AppleMotion.snappy, value: client.queuedMessages.count)
                 }
 
                 // Quick Context Up/Down Navigation Bar
@@ -145,7 +157,7 @@ struct ChatView: View {
                 if newCount > 0 {
                     currentNavIndex = max(0, newCount - 1)
                 }
-                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                withAnimation(AppleMotion.smooth) {
                     proxy.scrollTo("chatBottomAnchor", anchor: .bottom)
                 }
             }
@@ -159,7 +171,7 @@ struct ChatView: View {
         .onChange(of: isComposerFocused) { focused in
             if focused {
                 idleTimerTask?.cancel()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                withAnimation(AppleMotion.smooth) {
                     isComposerCollapsed = false
                 }
             } else {
@@ -172,7 +184,7 @@ struct ChatView: View {
         .onChange(of: theme.autoHideComposer) { enabled in
             if !enabled {
                 idleTimerTask?.cancel()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                withAnimation(AppleMotion.smooth) {
                     isComposerCollapsed = false
                 }
             } else {
@@ -185,7 +197,23 @@ struct ChatView: View {
                     ? "请查看或处理电脑文件 `\(path)`："
                     : "\(promptText)\n请查看或处理电脑文件 `\(path)`："
                 client.referencedFilePath = nil
-                withAnimation { isComposerCollapsed = false }
+                withAnimation(AppleMotion.smooth) { isComposerCollapsed = false }
+                bumpIdleTimer()
+            }
+        }
+        .photosPicker(
+            isPresented: $showPhotoPicker,
+            selection: $selectedPhotoItems,
+            maxSelectionCount: 6,
+            matching: .images
+        )
+        .onChange(of: showPhotoPicker) { isOpen in
+            if isOpen {
+                idleTimerTask?.cancel()
+                withAnimation(AppleMotion.smooth) {
+                    isComposerCollapsed = false
+                }
+            } else {
                 bumpIdleTimer()
             }
         }
@@ -210,6 +238,15 @@ struct ChatView: View {
         .sheet(item: $reviewingArtifact) { art in
             ArtifactReviewSheet(artifact: art)
                 .environmentObject(client)
+        }
+        .fullScreenCover(item: $previewingImageArtifact) { att in
+            ImageLightboxSheet(
+                attachments: [att],
+                initialIndex: 0,
+                baseURL: client.normalizedBaseURL,
+                authToken: client.authToken
+            )
+            .environmentObject(client)
         }
         .sheet(item: $downloadedShareItem) { share in
             ActivityViewSheet(items: [share.url])
@@ -272,7 +309,7 @@ struct ChatView: View {
                     }
                 }
                 isUploadingAttachment = false
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                withAnimation(AppleMotion.smooth) {
                     isComposerCollapsed = false
                 }
                 bumpIdleTimer()
@@ -291,8 +328,21 @@ struct ChatView: View {
             try? await Task.sleep(nanoseconds: delayNs)
             guard !Task.isCancelled else { return }
             let empty = promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if theme.autoHideComposer && !isComposerFocused && empty && client.pendingApprovals.isEmpty && client.queuedMessages.isEmpty {
-                withAnimation(.spring(response: 0.34, dampingFraction: 0.84)) {
+            let anyModalOpen = showPhotoPicker
+                || showChatFileImporter
+                || showWorkspaceProfilesSheet
+                || reviewingArtifact != nil
+                || previewingImageArtifact != nil
+                || client.editingTurnId != nil
+            if theme.autoHideComposer
+                && !isComposerFocused
+                && empty
+                && !anyModalOpen
+                && client.pendingAttachments.isEmpty
+                && client.pendingApprovals.isEmpty
+                && client.queuedMessages.isEmpty
+            {
+                withAnimation(AppleMotion.smooth) {
                     isComposerCollapsed = true
                 }
             }
@@ -398,7 +448,7 @@ struct ChatView: View {
 
             Button {
                 Haptics.light()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                withAnimation(AppleMotion.smooth) {
                     isComposerCollapsed = false
                 }
                 bumpIdleTimer()
@@ -806,7 +856,7 @@ struct ChatView: View {
                 }
             }
 
-            TextField("给 AI 发送消息（支持发图/电脑截屏/内置浏览器）...", text: $promptText, axis: .vertical)
+            TextField("给 AI 发送消息（支持发图/内置浏览器/让AI截图）...", text: $promptText, axis: .vertical)
                 .focused($isComposerFocused)
                 .lineLimit(1...5)
                 .font(.system(size: theme.scaledFont(15.5)))
@@ -814,11 +864,11 @@ struct ChatView: View {
                 .padding(.top, 4)
 
             HStack(spacing: 7) {
-                PhotosPicker(
-                    selection: $selectedPhotoItems,
-                    maxSelectionCount: 6,
-                    matching: .images
-                ) {
+                Button {
+                    Haptics.light()
+                    idleTimerTask?.cancel()
+                    showPhotoPicker = true
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "photo.on.rectangle.angled")
                             .font(.system(size: 12, weight: .semibold))
@@ -831,15 +881,9 @@ struct ChatView: View {
                     .padding(.vertical, 5.5)
                     .cleanWhiteCard(cornerRadius: 999)
                 }
+                .glassPressable(scale: 0.94)
 
                 Menu {
-                    Button {
-                        Haptics.light()
-                        Task { _ = await client.capturePCScreenshot(target: "full") }
-                    } label: {
-                        Label("🖥️ 截电脑屏幕", systemImage: "display")
-                    }
-
                     Button {
                         Haptics.light()
                         Task { await client.openBrowserInChat(url: "https://www.deepseek.com") }
@@ -849,6 +893,7 @@ struct ChatView: View {
 
                     Button {
                         Haptics.light()
+                        idleTimerTask?.cancel()
                         showChatFileImporter = true
                     } label: {
                         Label("📎 传电脑文件", systemImage: "paperclip")
@@ -908,7 +953,7 @@ struct ChatView: View {
                     Button {
                         Haptics.light()
                         isComposerFocused = false
-                        withAnimation(.spring(response: 0.30, dampingFraction: 0.84)) {
+                        withAnimation(AppleMotion.smooth) {
                             isComposerCollapsed = true
                         }
                     } label: {
@@ -982,7 +1027,7 @@ struct ChatView: View {
                     }
                     .disabled(!canSend)
                     .glassPressable(scale: 0.90)
-                    .animation(.spring(response: 0.25, dampingFraction: 0.78), value: canSend)
+                    .animation(AppleMotion.snappy, value: canSend)
                 }
             }
         }
@@ -1060,7 +1105,7 @@ struct TurnRowView: View {
                         if !turn.thoughtText.isEmpty {
                             Button {
                                 Haptics.light()
-                                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                withAnimation(AppleMotion.snappy) {
                                     expandThoughts.toggle()
                                 }
                             } label: {
@@ -1086,7 +1131,7 @@ struct TurnRowView: View {
                         if !turn.toolCalls.isEmpty {
                             Button {
                                 Haptics.light()
-                                withAnimation(.spring(response: 0.32, dampingFraction: 0.82)) {
+                                withAnimation(AppleMotion.snappy) {
                                     expandTools.toggle()
                                 }
                             } label: {
@@ -1361,9 +1406,24 @@ struct TurnRowView: View {
 // MARK: - Claude-Style Interactive File Artifact Card
 
 struct FileArtifactCardView: View {
+    @EnvironmentObject var client: BridgeClient
     let artifact: FileArtifactItem
     let onReview: () -> Void
     let onDownload: () -> Void
+
+    private var iconName: String {
+        if artifact.effectiveIsImage {
+            return "photo.on.rectangle.angled"
+        }
+        return artifact.isText ? "doc.text.magnifyingglass" : "arrow.down.doc.fill"
+    }
+
+    private var badgeText: String {
+        if artifact.effectiveIsImage {
+            return "图片预览"
+        }
+        return artifact.mode == "download" ? "供下载" : "供审查"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1372,7 +1432,7 @@ struct FileArtifactCardView: View {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(Color.dsAccent.opacity(0.14))
                         .frame(width: 42, height: 42)
-                    Image(systemName: artifact.isText ? "doc.text.magnifyingglass" : "arrow.down.doc.fill")
+                    Image(systemName: iconName)
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(Color.dsAccent)
                 }
@@ -1384,7 +1444,7 @@ struct FileArtifactCardView: View {
                             .foregroundStyle(Color.dsPrimary)
                             .lineLimit(1)
 
-                        Text(artifact.mode == "download" ? "供下载" : "供审查")
+                        Text(badgeText)
                             .font(.system(size: 10, weight: .bold))
                             .foregroundStyle(Color.dsAccent)
                             .padding(.horizontal, 6)
@@ -1406,7 +1466,43 @@ struct FileArtifactCardView: View {
                     .foregroundStyle(.secondary)
             }
 
-            if artifact.isText && !artifact.preview.isEmpty {
+            if artifact.effectiveIsImage {
+                Button {
+                    Haptics.light()
+                    onReview()
+                } label: {
+                    ZStack(alignment: .bottomTrailing) {
+                        RemoteAttachmentImageView(
+                            attachment: artifact.asChatAttachment,
+                            useThumbnail: false,
+                            baseURL: client.normalizedBaseURL,
+                            authToken: client.authToken,
+                            contentMode: .fit
+                        )
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 150, maxHeight: 240)
+                        .background(Color.black.opacity(0.04))
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(
+                                artifact.imageWidth > 0
+                                    ? "\(artifact.imageWidth)×\(artifact.imageHeight) · 点击全屏缩放"
+                                    : "点击全屏预览"
+                            )
+                            .font(.system(size: 10.5, weight: .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.black.opacity(0.62)))
+                        .padding(8)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else if artifact.isText && !artifact.preview.isEmpty {
                 Text(artifact.preview.split(separator: "\n", omittingEmptySubsequences: false).prefix(6).joined(separator: "\n"))
                     .font(.system(size: 11.5, design: .monospaced))
                     .foregroundStyle(Color.dsPrimary.opacity(0.85))
@@ -1425,9 +1521,9 @@ struct FileArtifactCardView: View {
                     onReview()
                 } label: {
                     HStack(spacing: 5) {
-                        Image(systemName: "eye.fill")
+                        Image(systemName: artifact.effectiveIsImage ? "photo.badge.magnifyingglass" : "eye.fill")
                             .font(.system(size: 12))
-                        Text("审查 / 编辑内容")
+                        Text(artifact.effectiveIsImage ? "全屏预览图片" : "审查 / 编辑内容")
                             .font(.system(size: 12.5, weight: .semibold))
                     }
                     .foregroundStyle(Color.dsPrimary)
@@ -1594,24 +1690,40 @@ struct ArtifactReviewSheet: View {
 struct FormattedMarkdownView: View {
     let markdown: String
     @ObservedObject private var theme = ThemePreferences.shared
+    @State private var cachedAttr: AttributedString?
+    @State private var lastParsedText: String = ""
 
     var body: some View {
         let fSize = theme.scaledFont(15.5)
-        if let attr = try? AttributedString(
-            markdown: markdown,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) {
-            Text(attr)
-                .font(.system(size: fSize))
-                .lineSpacing(theme.compactMode ? 3.5 : 5)
-                .foregroundStyle(Color.dsPrimary)
-                .textSelection(.enabled)
-        } else {
-            Text(markdown)
-                .font(.system(size: fSize))
-                .lineSpacing(theme.compactMode ? 3.5 : 5)
-                .foregroundStyle(Color.dsPrimary)
-                .textSelection(.enabled)
+        Group {
+            if let attr = cachedAttr {
+                Text(attr)
+            } else {
+                Text(markdown)
+            }
         }
+        .font(.system(size: fSize))
+        .lineSpacing(theme.compactMode ? 3.5 : 5)
+        .foregroundStyle(Color.dsPrimary)
+        .textSelection(.enabled)
+        .onAppear {
+            parseIfNeeded(markdown)
+        }
+        .onChange(of: markdown) { newText in
+            parseIfNeeded(newText)
+        }
+    }
+
+    private func parseIfNeeded(_ text: String) {
+        guard text != lastParsedText else { return }
+        lastParsedText = text
+        guard text.count <= 4500 else {
+            cachedAttr = nil
+            return
+        }
+        cachedAttr = try? AttributedString(
+            markdown: text,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )
     }
 }

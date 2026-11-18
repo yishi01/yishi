@@ -111,6 +111,14 @@ final class BridgeClient: ObservableObject {
     private var failoverTask: Task<String?, Never>?
     private var pcDirToken: UInt64 = 0
 
+    // High-Frame-Rate Streaming Token Coalescing Buffer & Deduplicated LiveActivity State
+    private var streamFlushTask: Task<Void, Never>?
+    private var pendingTurnIdForBuffer: String = ""
+    private var bufferedThoughtText: String?
+    private var bufferedAssistantText: String?
+    private var lastNotifiedIslandPhase: DeepSeekIslandPhase?
+    private var lastNotifiedToolCount: Int = -1
+
     private let pathMonitor = NWPathMonitor()
     private var lastNetworkSignature: String = ""
 
@@ -1134,6 +1142,9 @@ final class BridgeClient: ObservableObject {
     }
 
     func selectSession(_ sessionId: String) async {
+        flushStreamingBufferImmediate()
+        lastNotifiedIslandPhase = nil
+        lastNotifiedToolCount = -1
         activeSessionId = sessionId
         editingTurnId = nil
         turns = []
@@ -1244,10 +1255,45 @@ final class BridgeClient: ObservableObject {
         }
     }
 
+    private func flushStreamingBufferImmediate() {
+        streamFlushTask?.cancel()
+        streamFlushTask = nil
+        guard bufferedThoughtText != nil || bufferedAssistantText != nil else { return }
+        let thought = bufferedThoughtText
+        let assistant = bufferedAssistantText
+        let targetTid = pendingTurnIdForBuffer
+        bufferedThoughtText = nil
+        bufferedAssistantText = nil
+        pendingTurnIdForBuffer = ""
+
+        var tx = Transaction(animation: nil)
+        tx.disablesAnimations = true
+        withTransaction(tx) {
+            let tIdx = activeTurnIndex(for: targetTid)
+            if let thought = thought {
+                turns[tIdx].thoughtText = thought
+            }
+            if let assistant = assistant {
+                turns[tIdx].assistantText = assistant
+            }
+        }
+    }
+
+    private func scheduleStreamBufferFlush() {
+        guard streamFlushTask == nil else { return }
+        streamFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 36_000_000)
+            guard !Task.isCancelled, let self = self else { return }
+            self.streamFlushTask = nil
+            self.flushStreamingBufferImmediate()
+        }
+    }
+
     private func handleSocketPayload(_ msg: [String: Any]) {
         guard let type = msg["type"] as? String else { return }
         if type == "ping" || type == "pong" { return }
         if type == "sync_complete" {
+            flushStreamingBufferImmediate()
             wsSynced = true
             isConnected = true
             consecutiveWSErrors = 0
@@ -1268,6 +1314,9 @@ final class BridgeClient: ObservableObject {
 
         switch type {
         case "user_message":
+            flushStreamingBufferImmediate()
+            lastNotifiedIslandPhase = nil
+            lastNotifiedToolCount = -1
             let text = (d["text"] as? String) ?? ""
             let atts = Self.parseAttachmentItems((d["attachments"] as? [[String: Any]]) ?? [])
             if !turnId.isEmpty, let existingIdx = turns.firstIndex(where: { $0.turnId == turnId || $0.id == turnId }) {
@@ -1290,12 +1339,14 @@ final class BridgeClient: ObservableObject {
             }
 
         case "turn_deleted":
+            flushStreamingBufferImmediate()
             let tid = (d["turn_id"] as? String) ?? turnId
             if !tid.isEmpty {
                 turns.removeAll { $0.turnId == tid || $0.id == tid }
             }
 
         case "turns_truncated":
+            flushStreamingBufferImmediate()
             if let removed = d["removed_turn_ids"] as? [String], !removed.isEmpty {
                 turns.removeAll { removed.contains($0.turnId) || removed.contains($0.id) }
             } else if let fromTid = d["from_turn_id"] as? String,
@@ -1325,6 +1376,7 @@ final class BridgeClient: ObservableObject {
             }
 
         case "image_attachment":
+            flushStreamingBufferImmediate()
             let rawAtt = (d["attachment"] as? [String: Any]) ?? d
             if let att = Self.parseAttachmentItem(rawAtt) {
                 let tIdx = activeTurnIndex(for: turnId)
@@ -1334,6 +1386,7 @@ final class BridgeClient: ObservableObject {
             }
 
         case "browser_state":
+            flushStreamingBufferImmediate()
             let rawBrowser = (d["browser"] as? [String: Any]) ?? (d["snapshot"] as? [String: Any]) ?? d
             if let state = Self.parseBrowserSessionState(rawBrowser) {
                 activeBrowserSessions[state.browserId] = state
@@ -1346,12 +1399,14 @@ final class BridgeClient: ObservableObject {
             }
 
         case "agent_team_update":
+            flushStreamingBufferImmediate()
             let rawAgents = (d["agents"] as? [[String: Any]]) ?? (d["subagents"] as? [[String: Any]]) ?? []
             let agents = Self.parseTeamAgents(rawAgents)
             let tIdx = activeTurnIndex(for: turnId)
             turns[tIdx].teamAgents = agents
 
         case "model_auto_switched":
+            flushStreamingBufferImmediate()
             let tIdx = activeTurnIndex(for: turnId)
             turns[tIdx].modelSwitchedNote = (d["reason"] as? String) ?? (d["message"] as? String) ?? "已自动切换模型"
             if let newModel = (d["to_model"] as? String) ?? (d["model"] as? String), !newModel.isEmpty {
@@ -1362,21 +1417,37 @@ final class BridgeClient: ObservableObject {
             }
 
         case "thought_delta":
+            if !turnId.isEmpty && !pendingTurnIdForBuffer.isEmpty && turnId != pendingTurnIdForBuffer {
+                flushStreamingBufferImmediate()
+            }
             let tIdx = activeTurnIndex(for: turnId)
+            if !turnId.isEmpty {
+                pendingTurnIdForBuffer = turnId
+            }
             if let full = d["full_text"] as? String {
-                turns[tIdx].thoughtText = full
+                bufferedThoughtText = full
             } else if let delta = d["text"] as? String {
-                turns[tIdx].thoughtText += delta
+                let base = bufferedThoughtText ?? turns[tIdx].thoughtText
+                bufferedThoughtText = base + delta
             }
             if wsSynced {
-                LiveActivityController.shared.notifyPhaseChanged(
-                    .thinking,
-                    toolCount: turns[tIdx].toolCalls.count,
-                    queuedCount: queuedMessages.count
-                )
+                scheduleStreamBufferFlush()
+                let curTools = turns[tIdx].toolCalls.count
+                if lastNotifiedIslandPhase != .thinking || lastNotifiedToolCount != curTools {
+                    lastNotifiedIslandPhase = .thinking
+                    lastNotifiedToolCount = curTools
+                    LiveActivityController.shared.notifyPhaseChanged(
+                        .thinking,
+                        toolCount: curTools,
+                        queuedCount: queuedMessages.count
+                    )
+                }
+            } else {
+                flushStreamingBufferImmediate()
             }
 
         case "tool_call":
+            flushStreamingBufferImmediate()
             let tIdx = activeTurnIndex(for: turnId)
             let tcId = (d["id"] as? String) ?? UUID().uuidString
             let name = (d["name"] as? String) ?? "tool"
@@ -1389,6 +1460,8 @@ final class BridgeClient: ObservableObject {
             )
             if wsSynced {
                 Haptics.light()
+                lastNotifiedIslandPhase = .callingTool
+                lastNotifiedToolCount = idx
                 LiveActivityController.shared.notifyPhaseChanged(
                     .callingTool,
                     toolCount: idx,
@@ -1397,6 +1470,7 @@ final class BridgeClient: ObservableObject {
             }
 
         case "tool_result":
+            flushStreamingBufferImmediate()
             let tIdx = activeTurnIndex(for: turnId)
             let tcId = (d["id"] as? String) ?? ""
             let errStr = d["error"] as? String
@@ -1407,6 +1481,7 @@ final class BridgeClient: ObservableObject {
             }
 
         case "file_artifact":
+            flushStreamingBufferImmediate()
             let tIdx = activeTurnIndex(for: turnId)
             let art = FileArtifactItem(
                 id: (d["id"] as? String) ?? UUID().uuidString,
@@ -1418,7 +1493,13 @@ final class BridgeClient: ObservableObject {
                 ext: (d["ext"] as? String) ?? "",
                 mode: (d["mode"] as? String) ?? "review",
                 isText: (d["is_text"] as? Bool) ?? false,
-                preview: (d["preview"] as? String) ?? ""
+                preview: (d["preview"] as? String) ?? "",
+                isImage: (d["is_image"] as? Bool) ?? false,
+                attId: (d["att_id"] as? String) ?? "",
+                imageURL: (d["image_url"] as? String) ?? "",
+                thumbURL: (d["thumb_url"] as? String) ?? "",
+                imageWidth: (d["width"] as? NSNumber)?.intValue ?? (d["width"] as? Int) ?? 0,
+                imageHeight: (d["height"] as? NSNumber)?.intValue ?? (d["height"] as? Int) ?? 0
             )
             if let existingIdx = turns[tIdx].artifacts.firstIndex(where: { $0.path == art.path }) {
                 turns[tIdx].artifacts[existingIdx] = art
@@ -1428,21 +1509,37 @@ final class BridgeClient: ObservableObject {
             if wsSynced { Haptics.light() }
 
         case "text_delta":
+            if !turnId.isEmpty && !pendingTurnIdForBuffer.isEmpty && turnId != pendingTurnIdForBuffer {
+                flushStreamingBufferImmediate()
+            }
             let tIdx = activeTurnIndex(for: turnId)
+            if !turnId.isEmpty {
+                pendingTurnIdForBuffer = turnId
+            }
             if let full = d["full_text"] as? String {
-                turns[tIdx].assistantText = full
+                bufferedAssistantText = full
             } else if let delta = d["text"] as? String {
-                turns[tIdx].assistantText += delta
+                let base = bufferedAssistantText ?? turns[tIdx].assistantText
+                bufferedAssistantText = base + delta
             }
             if wsSynced {
-                LiveActivityController.shared.notifyPhaseChanged(
-                    .answering,
-                    toolCount: turns[tIdx].toolCalls.count,
-                    queuedCount: queuedMessages.count
-                )
+                scheduleStreamBufferFlush()
+                let curTools = turns[tIdx].toolCalls.count
+                if lastNotifiedIslandPhase != .answering || lastNotifiedToolCount != curTools {
+                    lastNotifiedIslandPhase = .answering
+                    lastNotifiedToolCount = curTools
+                    LiveActivityController.shared.notifyPhaseChanged(
+                        .answering,
+                        toolCount: curTools,
+                        queuedCount: queuedMessages.count
+                    )
+                }
+            } else {
+                flushStreamingBufferImmediate()
             }
 
         case "approval_request":
+            flushStreamingBufferImmediate()
             if wsSynced {
                 Haptics.warning()
                 let first = pendingApprovals.first
@@ -1450,6 +1547,7 @@ final class BridgeClient: ObservableObject {
                 let tool = (d["tool_name"] as? String) ?? first?.toolName ?? "tool"
                 let risk = (d["risk_level"] as? String) ?? first?.riskLevel ?? "medium"
                 let summary = (d["review_summary"] as? String) ?? first?.reviewSummary ?? (first?.argsJSON ?? "")
+                lastNotifiedIslandPhase = .waitingApproval
                 LiveActivityController.shared.notifyPhaseChanged(
                     .waitingApproval,
                     toolCount: turns.last?.toolCalls.count ?? 0,
@@ -1472,6 +1570,9 @@ final class BridgeClient: ObservableObject {
             }
 
         case "turn_done":
+            flushStreamingBufferImmediate()
+            lastNotifiedIslandPhase = nil
+            lastNotifiedToolCount = -1
             if let u = (d["usage"] as? [String: Any]) ?? (msg["usage"] as? [String: Any]) {
                 let tIdx = activeTurnIndex(for: turnId)
                 turns[tIdx].usage = Self.parseTurnUsage(u)
@@ -1484,6 +1585,9 @@ final class BridgeClient: ObservableObject {
             }
 
         case "error":
+            flushStreamingBufferImmediate()
+            lastNotifiedIslandPhase = nil
+            lastNotifiedToolCount = -1
             let tIdx = activeTurnIndex(for: turnId)
             turns[tIdx].errorText = (d["message"] as? String) ?? "连接中断，请重试"
             sessionStatus = "error"

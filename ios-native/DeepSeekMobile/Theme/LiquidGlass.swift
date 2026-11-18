@@ -96,6 +96,10 @@ final class ThemePreferences: ObservableObject {
 }
 
 enum Haptics {
+    private static let lightGen = UIImpactFeedbackGenerator(style: .light)
+    private static let mediumGen = UIImpactFeedbackGenerator(style: .medium)
+    private static let notifyGen = UINotificationFeedbackGenerator()
+
     private static var enabled: Bool {
         if let v = UserDefaults.standard.object(forKey: "ds_theme_haptics") as? Bool {
             return v
@@ -105,23 +109,36 @@ enum Haptics {
 
     static func light() {
         guard enabled else { return }
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        lightGen.impactOccurred()
     }
 
     static func medium() {
         guard enabled else { return }
-        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        mediumGen.impactOccurred()
     }
 
     static func success() {
         guard enabled else { return }
-        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        notifyGen.notificationOccurred(.success)
     }
 
     static func warning() {
         guard enabled else { return }
-        UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        notifyGen.notificationOccurred(.warning)
     }
+}
+
+// MARK: - Apple HIG & WWDC23 Fluid Spring Motion Presets
+
+enum AppleMotion {
+    /// Micro-interactions, button presses, pill switches — crisp, zero overshoot (HIG Snappy)
+    static let snappy = Animation.spring(response: 0.25, dampingFraction: 0.90, blendDuration: 0.08)
+    /// Cards, composer expand/collapse, sheet transitions — critically damped fluid deceleration (HIG Smooth)
+    static let smooth = Animation.spring(response: 0.34, dampingFraction: 0.92, blendDuration: 0.12)
+    /// Floating badges & Dynamic Island accents — subtle organic elasticity (HIG Bouncy)
+    static let bouncy = Animation.spring(response: 0.38, dampingFraction: 0.80, blendDuration: 0.12)
+    /// Interactive gesture tracking & scroll snapping
+    static let interactive = Animation.interactiveSpring(response: 0.22, dampingFraction: 0.88, blendDuration: 0.06)
 }
 
 // MARK: - Ambient Light Backdrop (Reactive to Theme Accent & Glass Intensity)
@@ -192,6 +209,7 @@ struct LiquidGlassBackdropView: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
+            .drawingGroup()
         }
         .ignoresSafeArea()
         .allowsHitTesting(false)
@@ -303,8 +321,8 @@ struct LiquidGlassPressButtonStyle: ButtonStyle {
         configuration.label
             .contentShape(Rectangle())
             .scaleEffect(configuration.isPressed ? scaleAmount : 1.0)
-            .brightness(configuration.isPressed ? 0.03 : 0.0)
-            .animation(.spring(response: 0.24, dampingFraction: 0.78), value: configuration.isPressed)
+            .opacity(configuration.isPressed ? 0.88 : 1.0)
+            .animation(AppleMotion.interactive, value: configuration.isPressed)
     }
 }
 
@@ -317,13 +335,47 @@ struct SingleTapRowButtonStyle: ButtonStyle {
     }
 }
 
+/// High-performance GPU-friendly card surface for scrolling list items & chat bubbles
+/// (avoids per-cell UIVisualEffectView Gaussian backdrop blur stalls at 120Hz ProMotion).
+struct CleanSurfaceCardModifier: ViewModifier {
+    var cornerRadius: CGFloat = 18
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(
+                shape.fill(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(0.92),
+                            Color(red: 0.965, green: 0.980, blue: 1.0).opacity(0.86),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .allowsHitTesting(false)
+            )
+            .overlay(
+                shape.strokeBorder(Color.white.opacity(0.92), lineWidth: 1.0)
+                    .allowsHitTesting(false)
+            )
+            .shadow(
+                color: Color(red: 0.12, green: 0.22, blue: 0.45).opacity(0.055),
+                radius: 8,
+                x: 0,
+                y: 3
+            )
+    }
+}
+
 extension View {
     func liquidGlass(cornerRadius: CGFloat = 24, prominent: Bool = true) -> some View {
         modifier(LiquidGlassCapsuleModifier(cornerRadius: cornerRadius, tintOpacity: 0.52, prominent: prominent))
     }
 
     func cleanWhiteCard(cornerRadius: CGFloat = 18) -> some View {
-        modifier(LiquidGlassCapsuleModifier(cornerRadius: cornerRadius, tintOpacity: 0.60, prominent: false))
+        modifier(CleanSurfaceCardModifier(cornerRadius: cornerRadius))
     }
 
     func glassPressable(scale: CGFloat = 0.96) -> some View {

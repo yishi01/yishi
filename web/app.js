@@ -1138,6 +1138,116 @@ function renderTurnAttachmentsGrid(rawAttachments) {
   return grid.children.length > 0 ? grid : null;
 }
 
+function renderFileArtifactCard(art, turnId = "") {
+  const box = $("chat-messages");
+  if (!box || !art) return;
+  const ext = String(art.ext || "").toLowerCase();
+  const isImg =
+    Boolean(art.is_image) ||
+    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"].includes(ext) ||
+    String(art.mime_type || "").startsWith("image/");
+  const imgRawUrl =
+    art.image_url ||
+    art.url ||
+    (art.att_id ? `/api/attachments/${encodeURIComponent(art.att_id)}` : "") ||
+    (art.path ? `/api/pc/download?path=${encodeURIComponent(art.path)}` : "");
+  const fullSrc = imgRawUrl ? authUrl(imgRawUrl) : "";
+  const titleText = art.title || art.name || art.filename || (isImg ? "图片预览" : "文件产物");
+  const sizeBadge =
+    isImg && art.width && art.height
+      ? `${art.width}×${art.height}`
+      : art.size
+        ? formatBytes(art.size)
+        : "";
+
+  const card = document.createElement("div");
+  card.className = "browser-chat-card";
+  card.style.margin = "8px 0";
+  if (turnId) card.dataset.turnId = turnId;
+
+  const header = document.createElement("div");
+  header.className = "browser-card-header";
+  header.innerHTML = `
+    <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+      <span>${isImg ? "🖼️" : "📄"}</span>
+      <strong style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(titleText)}</strong>
+    </div>
+    ${sizeBadge ? `<span class="state-pill">${escapeHtml(sizeBadge)}</span>` : ""}
+  `;
+  card.appendChild(header);
+
+  if (art.summary) {
+    const sum = document.createElement("div");
+    sum.style.fontSize = "12.5px";
+    sum.style.opacity = "0.78";
+    sum.style.margin = "4px 12px 8px";
+    sum.textContent = art.summary;
+    card.appendChild(sum);
+  }
+
+  if (isImg && fullSrc) {
+    const imgWrap = document.createElement("div");
+    imgWrap.style.margin = "4px 12px 10px";
+    imgWrap.style.borderRadius = "12px";
+    imgWrap.style.overflow = "hidden";
+    imgWrap.style.background = "rgba(0,0,0,0.06)";
+    imgWrap.style.cursor = "zoom-in";
+
+    const imgEl = document.createElement("img");
+    imgEl.src = fullSrc;
+    imgEl.alt = titleText;
+    imgEl.loading = "lazy";
+    imgEl.style.display = "block";
+    imgEl.style.width = "100%";
+    imgEl.style.maxHeight = "320px";
+    imgEl.style.objectFit = "contain";
+    imgEl.addEventListener("click", () => openLightbox(fullSrc, titleText));
+    imgWrap.appendChild(imgEl);
+    card.appendChild(imgWrap);
+  } else if (art.is_text && art.preview) {
+    const pre = document.createElement("pre");
+    pre.style.margin = "4px 12px 10px";
+    pre.style.padding = "10px";
+    pre.style.borderRadius = "10px";
+    pre.style.background = "rgba(0,0,0,0.05)";
+    pre.style.fontSize = "11.5px";
+    pre.style.maxHeight = "160px";
+    pre.style.overflow = "auto";
+    pre.textContent = String(art.preview).split("\n").slice(0, 8).join("\n");
+    card.appendChild(pre);
+  }
+
+  const actions = document.createElement("div");
+  actions.style.display = "flex";
+  actions.style.gap = "8px";
+  actions.style.padding = "0 12px 10px";
+
+  if (isImg && fullSrc) {
+    const prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "chip-btn action-chip";
+    prevBtn.textContent = "🔍 全屏预览图片";
+    prevBtn.addEventListener("click", () => openLightbox(fullSrc, titleText));
+    actions.appendChild(prevBtn);
+  }
+
+  if (art.path || fullSrc) {
+    const dlUrl = art.path
+      ? authUrl(`/api/pc/download?path=${encodeURIComponent(art.path)}`)
+      : fullSrc;
+    const dlLink = document.createElement("a");
+    dlLink.className = "chip-btn action-chip";
+    dlLink.href = dlUrl;
+    dlLink.download = art.name || art.filename || "download";
+    dlLink.textContent = "⬇️ 下载";
+    dlLink.style.textDecoration = "none";
+    actions.appendChild(dlLink);
+  }
+
+  card.appendChild(actions);
+  box.appendChild(card);
+}
+
 function renderEvent(ev) {
   const box = $("chat-messages");
   const d = ev.data || {};
@@ -1199,6 +1309,13 @@ function renderEvent(ev) {
   // Module D agent team update card
   if (ev.type === "agent_team_update") {
     renderOrUpdateAgentTeamCard(d, turnId);
+    scrollChatBottom();
+    return;
+  }
+
+  // Module B / Artifact Card (including AI take_screenshot & present_file image previews)
+  if (ev.type === "file_artifact" || ev.type === "image_attachment") {
+    renderFileArtifactCard(d, turnId);
     scrollChatBottom();
     return;
   }
@@ -1498,30 +1615,6 @@ function readFileAsBase64(file) {
     reader.readAsDataURL(file);
   });
 }
-
-$("pc-screenshot-btn")?.addEventListener("click", async () => {
-  const btn = $("pc-screenshot-btn");
-  if (btn) btn.disabled = true;
-  try {
-    const res = await api("/api/pc/screenshot", {
-      method: "POST",
-      body: JSON.stringify({
-        target: "full",
-        session_id: state.activeSessionId || "global",
-      }),
-    });
-    const meta = res.attachment || res;
-    if (meta?.att_id) {
-      state.pendingAttachments.push(meta);
-      renderPendingAttachments();
-      showToast("🖥️ 已抓取电脑屏幕并添加至待发附件");
-    }
-  } catch (err) {
-    showToast(`电脑截屏失败: ${err.message}`);
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-});
 
 function openLightbox(imgSrc, caption = "图片预览") {
   const modal = $("image-lightbox-modal");
