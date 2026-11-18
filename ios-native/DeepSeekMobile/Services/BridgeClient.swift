@@ -417,8 +417,8 @@ final class BridgeClient: ObservableObject {
         let session = probeSession
 
         enum ProbeOutcome: Sendable {
-            case success(url: String, data: Data, latencyMs: Double)
-            case failure(url: String, reason: String)
+            case success(url: String, data: Data, latencyMs: Double, resolved: [String])
+            case failure(url: String, reason: String, resolved: [String])
         }
 
         var winningURL: String?
@@ -431,26 +431,21 @@ final class BridgeClient: ObservableObject {
                 group.addTask {
                     let item = await Self.probeVerifyCandidate(candidate, body: body, session: session)
                     if item.ok, let d = item.data {
-                        return .success(url: item.url, data: d, latencyMs: item.latencyMs)
+                        return .success(url: item.url, data: d, latencyMs: item.latencyMs, resolved: [])
                     }
-                    return .failure(url: item.url, reason: item.reason)
+                    return .failure(url: item.url, reason: item.reason, resolved: [])
                 }
             }
             if !gistID.isEmpty {
-                group.addTask { [weak self, candidates, gistID, effectiveToken, body, session] in
+                group.addTask { [candidates, gistID, effectiveToken, body, session] in
                     let resolved = await Self.fetchRendezvousURLs(gistID: gistID, token: effectiveToken, session: session)
-                    await MainActor.run {
-                        if !resolved.isEmpty {
-                            self?.rendezvousResolvedURLs = resolved
-                            self?.rendezvousStatus = "已解析 (\(resolved.count) 链路)"
-                            if let pub = resolved.first(where: { $0.contains("trycloudflare.com") }) {
-                                self?.savedPublicURL = pub
-                            }
-                        }
-                    }
                     let extra = resolved.filter { !candidates.contains($0) }
                     if extra.isEmpty {
-                        return .failure(url: "固定解析器", reason: resolved.isEmpty ? "GitHub 暂不可达" : "路由已覆盖")
+                        return .failure(
+                            url: "固定解析器",
+                            reason: resolved.isEmpty ? "GitHub 暂不可达" : "路由已覆盖",
+                            resolved: resolved
+                        )
                     }
                     var bestHit: ProbeOutcome?
                     var lastErr = "均不可达"
@@ -462,7 +457,7 @@ final class BridgeClient: ObservableObject {
                         }
                         for await item in sub {
                             if item.ok, let d = item.data {
-                                bestHit = .success(url: item.url, data: d, latencyMs: item.latencyMs)
+                                bestHit = .success(url: item.url, data: d, latencyMs: item.latencyMs, resolved: resolved)
                                 sub.cancelAll()
                                 break
                             } else {
@@ -470,18 +465,20 @@ final class BridgeClient: ObservableObject {
                             }
                         }
                     }
-                    return bestHit ?? .failure(url: extra.first ?? "固定解析器", reason: lastErr)
+                    return bestHit ?? .failure(url: extra.first ?? "固定解析器", reason: lastErr, resolved: resolved)
                 }
             }
 
             for await outcome in group {
                 switch outcome {
-                case .success(let okURL, let okData, let ms):
+                case .success(let okURL, let okData, let ms, let resolved):
+                    self.applyResolvedRendezvous(resolved)
                     winningURL = okURL
                     winningData = okData
                     winningLatency = ms
                     group.cancelAll()
-                case .failure(let badURL, let reason):
+                case .failure(let badURL, let reason, let resolved):
+                    self.applyResolvedRendezvous(resolved)
                     failures.append((badURL, reason))
                 }
                 if winningURL != nil { break }
@@ -539,6 +536,15 @@ final class BridgeClient: ObservableObject {
 
     // MARK: - Single-Flight Automatic Route Failover & Hardened HTTP Request
 
+    private func applyResolvedRendezvous(_ resolved: [String]) {
+        guard !resolved.isEmpty else { return }
+        rendezvousResolvedURLs = resolved
+        rendezvousStatus = "已解析 (\(resolved.count) 链路)"
+        if let pub = resolved.first(where: { $0.contains("trycloudflare.com") }) {
+            savedPublicURL = pub
+        }
+    }
+
     func attemptRouteFailover() async -> String? {
         if let existing = failoverTask {
             return await existing.value
@@ -557,30 +563,27 @@ final class BridgeClient: ObservableObject {
                 candidates.insert(current, at: 0)
             }
 
+            struct FailoverProbe: Sendable {
+                let hit: (url: String, latencyMs: Double)?
+                let resolved: [String]
+            }
+
             let session = self.probeSession
             let gistID = self.effectiveRendezvousGistID
             let tok = self.authToken
             var chosen: (url: String, latencyMs: Double)?
-            await withTaskGroup(of: (String, Double)?.self) { group in
+            await withTaskGroup(of: FailoverProbe.self) { group in
                 for cand in candidates {
                     group.addTask {
-                        await Self.probeHealthCandidate(cand, session: session)
+                        let hit = await Self.probeHealthCandidate(cand, session: session)
+                        return FailoverProbe(hit: hit, resolved: [])
                     }
                 }
                 if !gistID.isEmpty && !tok.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    group.addTask { [weak self, candidates, gistID, tok, session] in
+                    group.addTask { [candidates, gistID, tok, session] in
                         let resolved = await Self.fetchRendezvousURLs(gistID: gistID, token: tok, session: session)
-                        await MainActor.run {
-                            if !resolved.isEmpty {
-                                self?.rendezvousResolvedURLs = resolved
-                                self?.rendezvousStatus = "已解析 (\(resolved.count) 链路)"
-                                if let pub = resolved.first(where: { $0.contains("trycloudflare.com") }) {
-                                    self?.savedPublicURL = pub
-                                }
-                            }
-                        }
                         let extra = resolved.filter { !candidates.contains($0) }
-                        guard !extra.isEmpty else { return nil }
+                        guard !extra.isEmpty else { return FailoverProbe(hit: nil, resolved: resolved) }
                         var found: (String, Double)?
                         await withTaskGroup(of: (url: String, latencyMs: Double)?.self) { sub in
                             for ex in extra {
@@ -594,11 +597,12 @@ final class BridgeClient: ObservableObject {
                                 }
                             }
                         }
-                        return found
+                        return FailoverProbe(hit: found, resolved: resolved)
                     }
                 }
-                for await hit in group {
-                    if let hit = hit {
+                for await outcome in group {
+                    self.applyResolvedRendezvous(outcome.resolved)
+                    if let hit = outcome.hit {
                         chosen = hit
                         group.cancelAll()
                         break

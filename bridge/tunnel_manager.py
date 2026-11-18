@@ -239,6 +239,7 @@ class TunnelManager:
 
     def _collect_route_urls(self, cfg: Any) -> tuple[list[str], list[str]]:
         cgnat = ipaddress.ip_network("100.64.0.0/10")
+        tun_bench = ipaddress.ip_network("198.18.0.0/15")
         lan_urls: list[str] = []
         tailscale_urls: list[str] = [str(u).strip().rstrip("/") for u in (cfg.tailscale_urls or []) if str(u).strip()]
         seen_lan: set[str] = set()
@@ -251,6 +252,8 @@ class TunnelManager:
                 try:
                     ip_obj = ipaddress.ip_address(ip_str)
                 except ValueError:
+                    continue
+                if ip_obj in tun_bench:
                     continue
                 candidate = f"http://{ip_str}:{cfg.port}"
                 if ip_obj in cgnat:

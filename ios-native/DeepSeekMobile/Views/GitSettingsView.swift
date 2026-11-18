@@ -831,7 +831,7 @@ struct GitSettingsView: View {
                 HStack {
                     Label("固定外网域名", systemImage: "lock.shield")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.dsSecondary)
+                        .foregroundStyle(.secondary)
                     Spacer()
                     Text("https://dsh-pc.tail1e24af.ts.net")
                         .font(.system(size: 11, design: .monospaced))
@@ -840,7 +840,7 @@ struct GitSettingsView: View {
                 HStack {
                     Label("固定路由解析器", systemImage: "arrow.triangle.2.circlepath")
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(Color.dsSecondary)
+                        .foregroundStyle(.secondary)
                     Spacer()
                     Text(client.rendezvousStatus)
                         .font(.system(size: 11, weight: .semibold))
