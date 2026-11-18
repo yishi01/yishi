@@ -22,7 +22,10 @@ final class AppLogger: ObservableObject {
     private let maxEntries = 350
 
     private init() {
-        log("INFO", category: "Lifecycle", "DeepSeek Go v0.8.0 initialized")
+        let info = Bundle.main.infoDictionary
+        let ver = (info?["CFBundleShortVersionString"] as? String) ?? "0.9.0"
+        let build = (info?["CFBundleVersion"] as? String) ?? "16"
+        log("INFO", category: "Lifecycle", "DeepSeek Go v\(ver) (Build \(build)) initialized")
     }
 
     func log(_ level: String, category: String, _ message: String) {

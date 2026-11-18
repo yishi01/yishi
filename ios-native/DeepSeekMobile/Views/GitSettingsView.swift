@@ -530,9 +530,12 @@ struct GitSettingsView: View {
                 Image(systemName: "waveform.path.ecg")
                     .foregroundStyle(theme.accentColor)
                 VStack(alignment: .leading, spacing: 2) {
+                    let info = Bundle.main.infoDictionary
+                    let appVer = (info?["CFBundleShortVersionString"] as? String) ?? "0.9.0"
+                    let appBuild = (info?["CFBundleVersion"] as? String) ?? "16"
                     Text("版本信息与双端运行状态")
                         .font(.system(size: 15.5, weight: .semibold))
-                    Text("iOS Client v0.8.0 (Build 11) · PC Bridge v\(client.pcDiagnostics?.version ?? client.serverVersion)")
+                    Text("iOS Client v\(appVer) (Build \(appBuild)) · PC Bridge v\(client.pcDiagnostics?.version ?? client.serverVersion)")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
