@@ -1390,6 +1390,15 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             session_manager.sessions[bs.session_id].emit_event("image_attachment", res)
         return res
 
+    @app.post("/api/browser/sessions/{browser_id}/rpc_result", dependencies=[Depends(require_auth)])
+    def api_browser_rpc_result(browser_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        cmd_id = str(body.get("cmd_id") or "").strip()
+        snap = browser_service.resolve_mobile_rpc(browser_id, cmd_id, body)
+        if not cmd_id:
+            # Unsolicited human browsing update from iPhone WKWebView: sync to chat stream
+            _emit_browser_to_session(snap)
+        return {"ok": True, **snap}
+
     @app.websocket("/ws/browser/{browser_id}")
     async def ws_browser(
         websocket: WebSocket,
@@ -2017,6 +2026,7 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         session_id: str,
         token: str = Query(default=""),
         after_seq: int = Query(default=0),
+        client_browser: int = Query(default=0),
     ) -> None:
         if not _is_valid_token(token):
             await websocket.close(code=4401)
@@ -2030,6 +2040,13 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         await websocket.accept()
         diagnostics_tracker.ws_connected(is_reconnect=after_seq > 0)
         queue = sess.subscribe()
+        mobile_dispatch_fn = (
+            (lambda payload: sess.emit_event("browser_rpc", payload, persist=False))
+            if client_browser > 0
+            else None
+        )
+        if mobile_dispatch_fn is not None:
+            browser_service.add_mobile_executor(session_id, mobile_dispatch_fn)
         send_lock = asyncio.Lock()
         disconnect_reason = "closed"
 
@@ -2114,6 +2131,8 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
         except asyncio.CancelledError:
             disconnect_reason = "cancelled"
         finally:
+            if mobile_dispatch_fn is not None:
+                browser_service.remove_mobile_executor(session_id, mobile_dispatch_fn)
             for t in (sender_task, receiver_task):
                 if t and not t.done():
                     t.cancel()

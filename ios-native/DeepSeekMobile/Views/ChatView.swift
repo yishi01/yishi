@@ -1212,69 +1212,15 @@ struct TurnRowView: View {
                 )
             }
 
-            // Inline Collaborative Browser Sessions
+            // Compact X/Telegram-style Web Link Cards (tap to slide up full-screen native WKWebView)
             if !turn.browserSessions.isEmpty {
-                VStack(spacing: 10) {
+                VStack(spacing: 8) {
                     ForEach(turn.browserSessions) { bState in
                         let liveState = client.activeBrowserSessions[bState.browserId] ?? bState
-                        BrowserInlineCardView(
+                        BrowserLinkCardView(
                             state: liveState,
-                            onNavigate: { url in
-                                Task { await client.browserNavigate(browserId: liveState.browserId, url: url) }
-                            },
-                            onBack: {
-                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "back") }
-                            },
-                            onForward: {
-                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "forward") }
-                            },
-                            onReload: {
-                                Task { await client.browserHistoryAction(browserId: liveState.browserId, action: "reload") }
-                            },
-                            onScreenshot: {
-                                Task { await client.browserScreenshotToChat(browserId: liveState.browserId) }
-                            },
-                            onToggleControl: { owner in
-                                Task { await client.browserSetControl(browserId: liveState.browserId, owner: owner) }
-                            },
-                            onTapCoordinate: { vx, vy in
-                                Task {
-                                    await client.browserSendInput(
-                                        browserId: liveState.browserId,
-                                        action: "click_xy",
-                                        x: vx,
-                                        y: vy
-                                    )
-                                }
-                            },
-                            onClickElement: { elId in
-                                Task {
-                                    await client.browserSendInput(
-                                        browserId: liveState.browserId,
-                                        action: "click",
-                                        elementId: elId
-                                    )
-                                }
-                            },
-                            onTypeText: { elId, txt, sub in
-                                Task {
-                                    await client.browserSendInput(
-                                        browserId: liveState.browserId,
-                                        action: "type",
-                                        elementId: elId,
-                                        text: txt,
-                                        submit: sub
-                                    )
-                                }
-                            },
-                            onScroll: { dy in
-                                Task {
-                                    await client.browserSendInput(
-                                        browserId: liveState.browserId,
-                                        action: "scroll",
-                                        deltaY: dy
-                                    )
-                                }
+                            onOpen: {
+                                client.presentBrowser(liveState.browserId)
                             }
                         )
                     }

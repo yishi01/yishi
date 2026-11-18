@@ -264,6 +264,38 @@ struct RootView: View {
             .liquidGlass(cornerRadius: 999, prominent: true)
             .padding(.bottom, 6)
 
+            if let presentedBid = client.presentedBrowserId {
+                let bState = client.activeBrowserSessions[presentedBid] ?? BrowserSessionState(
+                    browserId: presentedBid,
+                    sessionId: client.activeSessionId,
+                    url: "about:blank",
+                    title: "内置浏览器",
+                    controlOwner: "human",
+                    humanRequired: false,
+                    humanReason: "",
+                    scrollY: 0,
+                    elements: [],
+                    textMarkdown: "",
+                    frameB64: ""
+                )
+                TwitterStyleBrowserOverlay(
+                    state: bState,
+                    tab: MobileBrowserManager.shared.tab(for: presentedBid),
+                    sessionTitle: client.sessions.first(where: { $0.sessionId == client.activeSessionId })?.title ?? "DeepSeek Go",
+                    lastSnippet: client.turns.last?.assistantText ?? "",
+                    onClose: { client.dismissPresentedBrowser() },
+                    onNavigate: { url in Task { await client.browserNavigate(browserId: presentedBid, url: url) } },
+                    onBack: { Task { await client.browserHistoryAction(browserId: presentedBid, action: "back") } },
+                    onForward: { Task { await client.browserHistoryAction(browserId: presentedBid, action: "forward") } },
+                    onReload: { Task { await client.browserHistoryAction(browserId: presentedBid, action: "reload") } },
+                    onScreenshot: { Task { await client.browserScreenshotToChat(browserId: presentedBid) } },
+                    onToggleControl: { owner in Task { await client.browserSetControl(browserId: presentedBid, owner: owner) } },
+                    onCloseTab: { Task { await client.browserHistoryAction(browserId: presentedBid, action: "close") } }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(40)
+            }
+
             if let toast = client.globalToast {
                 VStack {
                     Text(toast)

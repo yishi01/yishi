@@ -1564,7 +1564,7 @@ class DeepSeekSession:
                     return json.dumps(_strip_browser_frame_for_llm(res), ensure_ascii=False)
 
                 if name == "browser_snapshot":
-                    snap = self.browser_service.snapshot(browser_id, include_frame=True)
+                    snap = await self.browser_service.remote_snapshot(browser_id, actor="agent")
                     self.emit_event("browser_state", snap)
                     return json.dumps(_strip_browser_frame_for_llm(snap), ensure_ascii=False)
 
@@ -1609,7 +1609,7 @@ class DeepSeekSession:
                     return json.dumps(_strip_browser_frame_for_llm(res), ensure_ascii=False)
 
                 if name == "browser_extract":
-                    snap = self.browser_service.snapshot(browser_id, include_frame=True)
+                    snap = await self.browser_service.remote_snapshot(browser_id, actor="agent")
                     self.emit_event("browser_state", snap)
                     return json.dumps(
                         {
@@ -1624,13 +1624,28 @@ class DeepSeekSession:
                     )
 
                 if name == "browser_screenshot":
-                    att_res = self.browser_service.save_frame_as_attachment(
+                    att_res = await self.browser_service.remote_screenshot(
                         browser_id,
                         self.attachment_service,
+                        actor="agent",
                     )
-                    snap = self.browser_service.snapshot(browser_id, include_frame=True)
+                    snap = self.browser_service.snapshot(browser_id, include_frame=(att_res.get("mode") != "mobile_wkwebview"))
                     self.emit_event("browser_state", snap)
-                    self.emit_event("image_attachment", att_res)
+                    att_id = str(att_res.get("att_id") or "")
+                    if att_id and self.attachment_service:
+                        try:
+                            img_path, _ = self.attachment_service.get_file_path(att_id, thumb=False)
+                            _build_and_emit_artifact(
+                                img_path,
+                                title=f"网页截图 · {snap.get('title') or snap.get('url') or '浏览器'}",
+                                summary="点击卡片内图片可全屏缩放预览或保存",
+                                mode="review",
+                                att_meta=att_res,
+                            )
+                        except Exception:
+                            self.emit_event("image_attachment", att_res)
+                    else:
+                        self.emit_event("image_attachment", att_res)
                     return json.dumps(att_res, ensure_ascii=False)
 
             # --- Module D: Sub-Agent Team Orchestration Tools ---

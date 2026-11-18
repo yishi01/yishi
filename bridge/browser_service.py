@@ -661,6 +661,9 @@ class BrowserSession:
     raw_html: str = field(default="", repr=False)
     last_frame_bytes: bytes = field(default=b"", repr=False)
     engine: str = "fast"
+    mode: str = "fast"  # "fast" | "mobile_wkwebview"
+    mobile_can_go_back: bool = False
+    mobile_can_go_forward: bool = False
 
     @property
     def frame_b64(self) -> str:
@@ -688,6 +691,126 @@ class BrowserService:
         self.attachment_service = attachment_service
         self.http_fetcher = http_fetcher
         self._sessions: dict[str, BrowserSession] = {}
+        self._mobile_executors: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+        self._pending_rpcs: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+    def add_mobile_executor(self, session_id: str, dispatch_fn: Callable[[dict[str, Any]], None]) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            lst = self._mobile_executors.setdefault(session_id, [])
+            if dispatch_fn not in lst:
+                lst.append(dispatch_fn)
+
+    def remove_mobile_executor(self, session_id: str, dispatch_fn: Callable[[dict[str, Any]], None]) -> None:
+        if not session_id:
+            return
+        with self._lock:
+            lst = self._mobile_executors.get(session_id)
+            if not lst:
+                return
+            self._mobile_executors[session_id] = [fn for fn in lst if fn is not dispatch_fn]
+            if not self._mobile_executors[session_id]:
+                self._mobile_executors.pop(session_id, None)
+
+    def has_mobile_executor(self, session_id: str) -> bool:
+        with self._lock:
+            return bool(self._mobile_executors.get(session_id))
+
+    def apply_mobile_state(self, browser_id: str, state: dict[str, Any]) -> dict[str, Any]:
+        sess = self.create_or_get_session(
+            browser_id=browser_id,
+            session_id=str(state.get("session_id") or "global"),
+            workspace_profile_id=str(state.get("workspace_profile_id") or "ws_default"),
+        )
+        with self._lock:
+            sess.mode = "mobile_wkwebview"
+            if state.get("url"):
+                sess.url = str(state["url"])
+            if state.get("title") is not None:
+                sess.title = str(state["title"]) or sess.url
+            if isinstance(state.get("elements"), list):
+                sess.elements = state["elements"][:MAX_INTERACTIVE_ELEMENTS]
+            if state.get("text_markdown") is not None:
+                sess.text_markdown = str(state["text_markdown"])
+            if "can_go_back" in state:
+                sess.mobile_can_go_back = bool(state["can_go_back"])
+            if "can_go_forward" in state:
+                sess.mobile_can_go_forward = bool(state["can_go_forward"])
+            if "scroll_y" in state and state["scroll_y"] is not None:
+                sess.scroll_y = int(state["scroll_y"])
+            if "human_required" in state:
+                sess.human_required = bool(state["human_required"])
+                if sess.human_required:
+                    sess.control_owner = "human"
+                    sess.human_reason = str(state.get("human_reason") or "检测到登录或人机验证，需真人操作")
+                elif state.get("control_owner") in ("agent", "human"):
+                    sess.control_owner = state["control_owner"]
+                    sess.human_reason = str(state.get("human_reason") or "")
+            elif state.get("control_owner") in ("agent", "human"):
+                sess.control_owner = state["control_owner"]
+                if state.get("human_reason") is not None:
+                    sess.human_reason = str(state.get("human_reason") or "")
+            sess.updated_at = _utc_now_iso()
+        self._broadcast(sess, "snapshot")
+        return self.snapshot(sess.browser_id, include_frame=False)
+
+    def resolve_mobile_rpc(self, browser_id: str, cmd_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        snap = self.apply_mobile_state(browser_id, payload)
+        if cmd_id:
+            fut = self._pending_rpcs.pop(cmd_id, None)
+            if fut is not None and not fut.done():
+                fut.set_result(dict(payload))
+        return snap
+
+    async def _execute_via_mobile(
+        self,
+        sess: BrowserSession,
+        action: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = 14.0,
+    ) -> dict[str, Any]:
+        with self._lock:
+            execs = list(self._mobile_executors.get(sess.session_id) or [])
+        if not execs:
+            raise RuntimeError("No active mobile executor for session")
+        dispatch_fn = execs[-1]
+        cmd_id = "rpc_" + uuid.uuid4().hex[:10]
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        self._pending_rpcs[cmd_id] = fut
+        try:
+            dispatch_fn(
+                {
+                    "cmd_id": cmd_id,
+                    "browser_id": sess.browser_id,
+                    "session_id": sess.session_id,
+                    "action": action,
+                    **params,
+                }
+            )
+            res = await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            return {
+                "ok": False,
+                "mobile_timeout": True,
+                "error": "手机端原生浏览器未在前台响应（App 可能在后台），请切回 DeepSeek Go 前台后再试。",
+                **self.snapshot(sess.browser_id, include_frame=False),
+            }
+        finally:
+            self._pending_rpcs.pop(cmd_id, None)
+
+        snap = self.apply_mobile_state(sess.browser_id, res)
+        out: dict[str, Any] = {
+            "ok": bool(res.get("ok", True)),
+            **snap,
+        }
+        if res.get("error"):
+            out["error"] = str(res["error"])
+        if res.get("screenshot_att_id"):
+            out["screenshot_att_id"] = str(res["screenshot_att_id"])
+        return out
 
     @property
     def sessions(self) -> dict[str, BrowserSession]:
@@ -1091,8 +1214,10 @@ class BrowserService:
                 url="about:blank",
                 title="空白页",
                 text_markdown="# 空白页\n\n等待导航指令或输入网址。",
+                mode="mobile_wkwebview" if self.has_mobile_executor(session_id or "global") else "fast",
             )
-            self._render_viewport_jpeg(sess)
+            if sess.mode != "mobile_wkwebview":
+                self._render_viewport_jpeg(sess)
             self._sessions[new_id] = sess
             return sess
 
@@ -1138,13 +1263,14 @@ class BrowserService:
         else:
             sess.human_reason = reason or sess.human_reason or "真人已接管浏览器"
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        if sess.mode != "mobile_wkwebview":
+            self._render_viewport_jpeg(sess)
         self._broadcast(
             sess,
             "control_changed",
             {"control_owner": sess.control_owner, "human_required": sess.human_required, "human_reason": sess.human_reason},
         )
-        return {"ok": True, **self.snapshot(sess.browser_id, include_frame=True)}
+        return {"ok": True, **self.snapshot(sess.browser_id, include_frame=(sess.mode != "mobile_wkwebview"))}
 
     def _ensure_actor_allowed(
         self,
@@ -1225,8 +1351,11 @@ class BrowserService:
                 "ok": False,
                 "blocked": True,
                 "error": policy_check.reason,
-                **self.snapshot(sess.browser_id, include_frame=True),
+                **self.snapshot(sess.browser_id, include_frame=(sess.mode != "mobile_wkwebview")),
             }
+
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "navigate", {"url": target_url})
 
         if target_url.lower() == "about:blank":
             sess.url = "about:blank"
@@ -1323,6 +1452,9 @@ class BrowserService:
         if blocked is not None:
             return blocked
 
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "back", {})
+
         if sess.history_index <= 0 or not sess.history:
             return {
                 "ok": False,
@@ -1345,6 +1477,9 @@ class BrowserService:
         if blocked is not None:
             return blocked
 
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "forward", {})
+
         if sess.history_index < 0 or sess.history_index >= len(sess.history) - 1:
             return {
                 "ok": False,
@@ -1366,6 +1501,9 @@ class BrowserService:
         blocked = self._ensure_actor_allowed(sess, actor)
         if blocked is not None:
             return blocked
+
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "reload", {})
 
         if sess.url and sess.url.lower() != "about:blank":
             return await self.navigate(browser_id, sess.url, actor=actor, record_history=False)
@@ -1422,6 +1560,13 @@ class BrowserService:
         blocked = self._ensure_actor_allowed(sess, actor)
         if blocked is not None:
             return blocked
+
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(
+                sess,
+                "click",
+                {"element_id": element_id, "x": x, "y": y},
+            )
 
         target = self._find_element(sess, element_id=element_id, x=x, y=y)
         if target is None:
@@ -1491,6 +1636,13 @@ class BrowserService:
         if blocked is not None:
             return blocked
 
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(
+                sess,
+                "type",
+                {"element_id": element_id, "text": text, "submit": submit},
+            )
+
         target: dict[str, Any] | None = None
         if element_id is not None:
             target = self._find_element(sess, element_id=element_id)
@@ -1554,6 +1706,9 @@ class BrowserService:
         if blocked is not None:
             return blocked
 
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "scroll", {"delta_y": int(delta_y)})
+
         max_scroll = max(2400, sess.content_height - sess.viewport_height + 240)
         sess.scroll_y = max(0, min(sess.scroll_y + int(delta_y), max_scroll))
         sess.updated_at = _utc_now_iso()
@@ -1561,21 +1716,49 @@ class BrowserService:
         self._broadcast(sess, "frame")
         return {"ok": True, **self.snapshot(sess.browser_id, include_frame=True)}
 
+    async def remote_snapshot(self, browser_id: str, *, actor: Literal["agent", "human"] = "agent") -> dict[str, Any]:
+        sess = self.create_or_get_session(browser_id=browser_id)
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            return await self._execute_via_mobile(sess, "snapshot", {})
+        return self.snapshot(browser_id, include_frame=(sess.mode != "mobile_wkwebview"))
+
+    async def remote_screenshot(
+        self,
+        browser_id: str,
+        attachment_service: Any | None = None,
+        *,
+        actor: Literal["agent", "human"] = "agent",
+    ) -> dict[str, Any]:
+        sess = self.create_or_get_session(browser_id=browser_id)
+        if actor == "agent" and self.has_mobile_executor(sess.session_id):
+            res = await self._execute_via_mobile(sess, "screenshot", {})
+            att_id = str(res.get("screenshot_att_id") or "").strip()
+            svc = attachment_service or self.attachment_service
+            if att_id and svc is not None and hasattr(svc, "get_metadata"):
+                try:
+                    meta = svc.get_metadata(att_id)
+                    return {"ok": True, "browser_id": sess.browser_id, **meta}
+                except Exception:
+                    pass
+            return res
+        return self.save_frame_as_attachment(browser_id, attachment_service)
+
     def snapshot(self, browser_id: str, *, include_frame: bool = True) -> dict[str, Any]:
         sess = self.create_or_get_session(browser_id=browser_id)
-        if include_frame and not sess.last_frame_b64:
+        if include_frame and sess.mode != "mobile_wkwebview" and not sess.last_frame_b64:
             self._render_viewport_jpeg(sess)
 
         data: dict[str, Any] = {
             "browser_id": sess.browser_id,
             "session_id": sess.session_id,
             "workspace_profile_id": sess.workspace_profile_id,
+            "mode": sess.mode,
             "url": sess.url,
             "title": sess.title,
             "history": list(sess.history),
             "history_index": sess.history_index,
-            "can_go_back": sess.history_index > 0,
-            "can_go_forward": 0 <= sess.history_index < len(sess.history) - 1,
+            "can_go_back": sess.mobile_can_go_back if sess.mode == "mobile_wkwebview" else (sess.history_index > 0),
+            "can_go_forward": sess.mobile_can_go_forward if sess.mode == "mobile_wkwebview" else (0 <= sess.history_index < len(sess.history) - 1),
             "control_owner": sess.control_owner,
             "human_required": sess.human_required,
             "human_reason": sess.human_reason,
@@ -1587,7 +1770,7 @@ class BrowserService:
             "last_status_code": sess.last_status_code,
             "updated_at": sess.updated_at,
         }
-        if include_frame:
+        if include_frame and sess.mode != "mobile_wkwebview":
             data["frame_b64"] = sess.last_frame_b64
             data["last_frame_b64"] = sess.last_frame_b64
         return data

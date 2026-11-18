@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import WebKit
 
 // MARK: - 1. Image Attachment Cache, Grid & Full-Screen Lightbox
 
@@ -629,425 +630,429 @@ private struct LightboxZoomablePage: View {
     }
 }
 
-// MARK: - 2. Inline Collaborative Browser Window (BrowserInlineCardView)
+// MARK: - 2. X / Twitter-Style Native WKWebView Browser & Compact Chat Link Card
 
-struct BrowserInlineCardView: View {
-    let state: BrowserSessionState
-    var onNavigate: (String) -> Void = { _ in }
-    var onBack: () -> Void = {}
-    var onForward: () -> Void = {}
-    var onReload: () -> Void = {}
-    var onScreenshot: () -> Void = {}
-    var onToggleControl: (String) -> Void = { _ in }
-    var onTapCoordinate: (Int, Int) -> Void = { _, _ in }
-    var onClickElement: (Int) -> Void = { _ in }
-    var onTypeText: (Int, String, Bool) -> Void = { _, _, _ in }
-    var onScroll: (Int) -> Void = { _ in }
+struct NativeWKWebViewContainer: UIViewRepresentable {
+    let webView: WKWebView
 
-    @State private var isExpanded: Bool = false
-    @State private var urlDraft: String = ""
-    @State private var activeInputElement: BrowserElementItem?
-    @State private var elementTextDraft: String = ""
-    @State private var lastTapMarker: CGPoint?
-
-    private var viewportHeight: CGFloat {
-        isExpanded ? 430 : 230
+    func makeUIView(context: Context) -> UIView {
+        let host = UIView()
+        host.backgroundColor = .white
+        attachWebView(to: host)
+        return host
     }
 
-    private var decodedFrameImage: UIImage? {
-        let raw = state.frameB64.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return nil }
-        let clean: String
-        if let commaRange = raw.range(of: ";base64,") {
-            clean = String(raw[commaRange.upperBound...])
-        } else {
-            clean = raw
+    func updateUIView(_ uiView: UIView, context: Context) {
+        if webView.superview !== uiView {
+            attachWebView(to: uiView)
         }
-        guard let data = Data(base64Encoded: clean, options: .ignoreUnknownCharacters) else {
-            return nil
+    }
+
+    private func attachWebView(to host: UIView) {
+        webView.removeFromSuperview()
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(webView)
+        NSLayoutConstraint.activate([
+            webView.topAnchor.constraint(equalTo: host.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            webView.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+        ])
+    }
+}
+
+struct BrowserLinkCardView: View {
+    let state: BrowserSessionState
+    var onOpen: () -> Void
+
+    private var domainLabel: String {
+        if let u = URL(string: state.url), let host = u.host, !host.isEmpty {
+            return host.replacingOccurrences(of: "www.", with: "")
         }
-        return UIImage(data: data)
+        return state.url == "about:blank" || state.url.isEmpty ? "新建网页标签" : state.url
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            headerBar
-            navigationToolbar
-            viewportCanvas
-            if let inputEl = activeInputElement {
-                elementInputBar(for: inputEl)
-            }
-            if !state.elements.isEmpty {
-                interactiveElementsStrip
-            }
-        }
-        .padding(12)
-        .liquidGlass(cornerRadius: 20, prominent: true)
-        .onAppear {
-            urlDraft = state.url
-        }
-        .onChange(of: state.url) { newURL in
-            if !newURL.isEmpty {
-                urlDraft = newURL
-            }
-        }
-    }
+        Button {
+            Haptics.light()
+            onOpen()
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            state.humanRequired
+                                ? Color.red.opacity(0.14)
+                                : (state.controlOwner == "human" ? Color.orange.opacity(0.14) : Color.dsAccent.opacity(0.14))
+                        )
+                        .frame(width: 42, height: 42)
+                    Image(systemName: state.humanRequired ? "exclamationmark.shield.fill" : "safari.fill")
+                        .font(.system(size: 19, weight: .semibold))
+                        .foregroundStyle(
+                            state.humanRequired
+                                ? .red
+                                : (state.controlOwner == "human" ? .orange : Color.dsAccent)
+                        )
+                }
 
-    private var headerBar: some View {
-        HStack(spacing: 8) {
-            statusPill
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(state.title.isEmpty ? domainLabel : state.title)
+                            .font(.system(size: 14.5, weight: .semibold))
+                            .foregroundStyle(Color.dsPrimary)
+                            .lineLimit(1)
 
-            Spacer(minLength: 4)
+                        Text(state.humanRequired ? "需验证" : (state.controlOwner == "human" ? "真人" : "AI"))
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(
+                                state.humanRequired ? .red : (state.controlOwner == "human" ? .orange : Color.dsAccent)
+                            )
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(
+                                Capsule().fill(
+                                    (state.humanRequired ? Color.red : (state.controlOwner == "human" ? Color.orange : Color.dsAccent)).opacity(0.13)
+                                )
+                            )
+                    }
 
-            Button {
-                Haptics.medium()
-                let nextOwner = state.controlOwner == "human" ? "agent" : "human"
-                onToggleControl(nextOwner)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: state.controlOwner == "human" ? "cpu" : "hand.raised.fill")
-                        .font(.system(size: 11, weight: .bold))
-                    Text(state.controlOwner == "human" ? "交还 AI" : "真人接管")
-                        .font(.system(size: 11.5, weight: .semibold))
+                    Text(domainLabel)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 6)
+
+                HStack(spacing: 3) {
+                    Text(state.humanRequired ? "去处理" : "打开")
+                        .font(.system(size: 12, weight: .semibold))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10.5, weight: .bold))
                 }
                 .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5.5)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 6.5)
                 .background(
-                    Capsule().fill(state.controlOwner == "human" ? Color.dsAccent : Color.orange)
+                    Capsule().fill(state.humanRequired ? Color.red : Color.dsPrimary)
                 )
             }
-            .glassPressable(scale: 0.95)
-
-            Button {
-                Haptics.light()
-                withAnimation(.spring(response: 0.30, dampingFraction: 0.82)) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(spacing: 3) {
-                    Image(systemName: isExpanded ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                        .font(.system(size: 11, weight: .semibold))
-                    Text(isExpanded ? "收起" : "展开")
-                        .font(.system(size: 11.5, weight: .medium))
-                }
-                .foregroundStyle(Color.dsPrimary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 5.5)
-                .cleanWhiteCard(cornerRadius: 999)
-            }
-            .glassPressable(scale: 0.95)
+            .padding(12)
+            .cleanWhiteCard(cornerRadius: 18)
         }
+        .buttonStyle(SingleTapRowButtonStyle())
+    }
+}
+
+/// Twitter / X style native iOS in-app browser sheet:
+/// Full-bleed WKWebView above, floating `[X] [domain ⋮] [↻]` capsule bar, and bottom conversation peek drawer.
+struct TwitterStyleBrowserOverlay: View {
+    let state: BrowserSessionState
+    @ObservedObject var tab: BrowserTabController
+    let sessionTitle: String
+    let lastSnippet: String
+    var onClose: () -> Void
+    var onNavigate: (String) -> Void
+    var onBack: () -> Void
+    var onForward: () -> Void
+    var onReload: () -> Void
+    var onScreenshot: () -> Void
+    var onToggleControl: (String) -> Void
+    var onCloseTab: () -> Void
+
+    @State private var showURLPrompt: Bool = false
+    @State private var urlInputDraft: String = ""
+    @State private var dragOffsetY: CGFloat = 0
+
+    private var activeURL: String {
+        tab.currentURL.isEmpty ? state.url : tab.currentURL
     }
 
-    @ViewBuilder
-    private var statusPill: some View {
+    private var domainText: String {
+        if let u = URL(string: activeURL), let host = u.host, !host.isEmpty {
+            return host.replacingOccurrences(of: "www.", with: "")
+        }
+        return activeURL == "about:blank" || activeURL.isEmpty ? "新建网页" : activeURL
+    }
+
+    private var bottomStatusCopy: String {
         if state.humanRequired {
-            let reason = state.humanReason.isEmpty ? "需验证或登录" : state.humanReason
-            Text("⚠️ 需真人操作: \(reason)")
-                .font(.system(size: 11.5, weight: .bold))
-                .foregroundStyle(.white)
-                .lineLimit(1)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(Color.red.opacity(0.88)))
-        } else if state.controlOwner == "human" {
-            Text("🖐️ 真人操控中")
-                .font(.system(size: 11.5, weight: .bold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(Color.orange))
-        } else {
-            Text("🤖 AI 浏览中")
-                .font(.system(size: 11.5, weight: .bold))
-                .foregroundStyle(Color.dsAccent)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(Color.dsAccent.opacity(0.14)))
+            return "⚠️ \(state.humanReason.isEmpty ? "请完成人机验证或登录，完成后点右侧「交还 AI」" : state.humanReason)"
+        }
+        if state.controlOwner == "human" {
+            return "🖐️ 你正在操作页面 · 完成后可交还 AI 继续"
+        }
+        if !lastSnippet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return lastSnippet.replacingOccurrences(of: "\n", with: " ")
+        }
+        return "🤖 AI 正在协同浏览 · 可随时直接触摸接管"
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            // Native WKWebView fills everything above the bottom peek sheet
+            VStack(spacing: 0) {
+                if tab.isLoading {
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Rectangle()
+                                .fill(Color.gray.opacity(0.15))
+                            Rectangle()
+                                .fill(Color.dsAccent)
+                                .frame(width: max(18, geo.size.width * CGFloat(tab.estimatedProgress)))
+                                .animation(.linear(duration: 0.15), value: tab.estimatedProgress)
+                        }
+                    }
+                    .frame(height: 2.5)
+                }
+
+                NativeWKWebViewContainer(webView: tab.webView)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                // Reserve space matching the bottom peek drawer
+                Color.white
+                    .frame(height: 82)
+            }
+            .background(Color.white)
+            .ignoresSafeArea(.container, edges: .bottom)
+
+            // Floating Twitter/X Browser Control Row + Bottom Peek Drawer
+            VStack(spacing: 12) {
+                floatingPillToolbar
+                    .padding(.horizontal, 16)
+
+                bottomConversationPeekDrawer
+            }
+            .offset(y: max(0, dragOffsetY))
+        }
+        .alert("打开网址", isPresented: $showURLPrompt) {
+            TextField("https://", text: $urlInputDraft)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("取消", role: .cancel) {}
+            Button("前往") {
+                let trimmed = urlInputDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    onNavigate(trimmed)
+                }
+            }
         }
     }
 
-    private var navigationToolbar: some View {
-        HStack(spacing: 6) {
+    private var floatingPillToolbar: some View {
+        HStack(spacing: 12) {
+            // Left Circular Close Button
             Button {
                 Haptics.light()
-                onBack()
+                onClose()
             } label: {
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 12.5, weight: .semibold))
+                Image(systemName: "xmark")
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.dsPrimary)
-                    .frame(width: 28, height: 28)
-                    .cleanWhiteCard(cornerRadius: 8)
+                    .frame(width: 44, height: 44)
+                    .liquidGlass(cornerRadius: 999, prominent: true)
             }
+            .glassPressable(scale: 0.92)
 
-            Button {
-                Haptics.light()
-                onForward()
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(Color.dsPrimary)
-                    .frame(width: 28, height: 28)
-                    .cleanWhiteCard(cornerRadius: 8)
+            // Center Domain Pill with Triple-Dot Menu
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(
+                        state.humanRequired
+                            ? Color.red
+                            : (state.controlOwner == "human" ? Color.orange : Color.green)
+                    )
+                    .frame(width: 7, height: 7)
+
+                Button {
+                    urlInputDraft = activeURL == "about:blank" ? "https://" : activeURL
+                    showURLPrompt = true
+                } label: {
+                    Text(domainText)
+                        .font(.system(size: 14.5, weight: .semibold))
+                        .foregroundStyle(Color.dsPrimary)
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+
+                Menu {
+                    Button {
+                        onBack()
+                    } label: {
+                        Label("后退", systemImage: "chevron.left")
+                    }
+                    .disabled(!tab.canGoBack)
+
+                    Button {
+                        onForward()
+                    } label: {
+                        Label("前进", systemImage: "chevron.right")
+                    }
+                    .disabled(!tab.canGoForward)
+
+                    Button {
+                        urlInputDraft = activeURL == "about:blank" ? "https://" : activeURL
+                        showURLPrompt = true
+                    } label: {
+                        Label("输入网址前往...", systemImage: "globe")
+                    }
+
+                    Divider()
+
+                    Button {
+                        Haptics.medium()
+                        onScreenshot()
+                    } label: {
+                        Label("📸 截图发给 AI", systemImage: "camera.viewfinder")
+                    }
+
+                    Button {
+                        Haptics.medium()
+                        onToggleControl(state.controlOwner == "human" ? "agent" : "human")
+                    } label: {
+                        Label(
+                            state.controlOwner == "human" ? "🤖 交还 AI 操作" : "🖐️ 切换为真人操控",
+                            systemImage: state.controlOwner == "human" ? "cpu" : "hand.raised"
+                        )
+                    }
+
+                    Button {
+                        UIPasteboard.general.string = activeURL
+                    } label: {
+                        Label("复制网址", systemImage: "doc.on.doc")
+                    }
+
+                    Divider()
+
+                    Button(role: .destructive) {
+                        onCloseTab()
+                    } label: {
+                        Label("关闭此网页标签", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(Color.dsPrimary.opacity(0.75))
+                        .frame(width: 26, height: 28)
+                }
             }
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .liquidGlass(cornerRadius: 999, prominent: true)
 
+            // Right Circular Reload / Stop Button
             Button {
                 Haptics.light()
                 onReload()
             } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(systemName: tab.isLoading ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(Color.dsPrimary)
-                    .frame(width: 28, height: 28)
-                    .cleanWhiteCard(cornerRadius: 8)
+                    .frame(width: 44, height: 44)
+                    .liquidGlass(cornerRadius: 999, prominent: true)
             }
-
-            TextField("输入网址...", text: $urlDraft)
-                .font(.system(size: 12, design: .monospaced))
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.go)
-                .onSubmit {
-                    let target = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !target.isEmpty {
-                        onNavigate(target)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5.5)
-                .background(
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color.white.opacity(0.72))
-                )
-
-            Button {
-                Haptics.light()
-                let target = urlDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !target.isEmpty {
-                    onNavigate(target)
-                }
-            } label: {
-                Text("前往")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.dsPrimary))
-            }
-
-            Button {
-                Haptics.medium()
-                onScreenshot()
-            } label: {
-                Text("📸 截图")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(Color.dsPrimary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .cleanWhiteCard(cornerRadius: 999)
-            }
+            .glassPressable(scale: 0.92)
         }
     }
 
-    private var viewportCanvas: some View {
-        GeometryReader { geo in
-            let containerSize = geo.size
-            let aspect: CGFloat = 960.0 / 640.0
-            let fitWidth = min(containerSize.width, containerSize.height * aspect)
-            let fitHeight = fitWidth / aspect
-            let originX = (containerSize.width - fitWidth) / 2.0
-            let originY = (containerSize.height - fitHeight) / 2.0
+    private var bottomConversationPeekDrawer: some View {
+        VStack(spacing: 8) {
+            Capsule()
+                .fill(Color.gray.opacity(0.32))
+                .frame(width: 38, height: 4.5)
+                .padding(.top, 9)
 
-            ZStack {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(Color(red: 0.10, green: 0.12, blue: 0.16))
+            HStack(spacing: 11) {
+                Image("DSHLogo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 34, height: 34)
+                    .clipShape(Circle())
 
-                if let uiImage = decodedFrameImage {
-                    Image(uiImage: uiImage)
-                        .resizable()
-                        .frame(width: fitWidth, height: fitHeight)
-                        .position(x: containerSize.width / 2.0, y: containerSize.height / 2.0)
-                        .contentShape(Rectangle())
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onEnded { value in
-                                    let loc = value.location
-                                    let localX = loc.x - originX
-                                    let localY = loc.y - originY
-                                    guard fitWidth > 1, fitHeight > 1 else { return }
-                                    let clampedX = min(max(0, localX), fitWidth)
-                                    let clampedY = min(max(0, localY), fitHeight)
-                                    let vx = Int((clampedX / fitWidth) * 960.0)
-                                    let vy = Int((clampedY / fitHeight) * 640.0)
-                                    Haptics.light()
-                                    withAnimation(.easeOut(duration: 0.2)) {
-                                        lastTapMarker = CGPoint(x: originX + clampedX, y: originY + clampedY)
-                                    }
-                                    onTapCoordinate(vx, vy)
-                                }
-                        )
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text(sessionTitle.isEmpty ? "DeepSeek Go" : sessionTitle)
+                            .font(.system(size: 13.5, weight: .bold))
+                            .foregroundStyle(Color.dsPrimary)
+                            .lineLimit(1)
+
+                        Text(state.controlOwner == "human" ? "真人接管中" : "AI 协同中")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(bottomStatusCopy)
+                        .font(.system(size: 12))
+                        .foregroundStyle(state.humanRequired ? .red : .secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                if state.controlOwner == "human" {
+                    Button {
+                        Haptics.medium()
+                        onToggleControl("agent")
+                    } label: {
+                        Text("交还 AI")
+                            .font(.system(size: 12.5, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 13)
+                            .padding(.vertical, 7)
+                            .background(Capsule().fill(Color.dsPrimary))
+                    }
+                    .glassPressable(scale: 0.94)
                 } else {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "globe")
-                                .foregroundStyle(Color.dsAccent)
-                            Text(state.title.isEmpty ? (state.url.isEmpty ? "就绪" : state.url) : state.title)
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                        }
-                        if !state.textMarkdown.isEmpty {
-                            ScrollView {
-                                Text(state.textMarkdown.prefix(900))
-                                    .font(.system(size: 11.5, design: .monospaced))
-                                    .foregroundStyle(.white.opacity(0.85))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                        } else {
-                            Spacer()
-                            HStack {
-                                Spacer()
-                                Text("点击上方「前往」或操作按钮实时渲染页面画面")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.white.opacity(0.65))
-                                Spacer()
-                            }
-                            Spacer()
-                        }
-                    }
-                    .padding(12)
-                }
-
-                if let marker = lastTapMarker {
-                    Circle()
-                        .strokeBorder(Color.orange, lineWidth: 2.5)
-                        .background(Circle().fill(Color.orange.opacity(0.28)))
-                        .frame(width: 26, height: 26)
-                        .position(marker)
-                        .allowsHitTesting(false)
-                }
-
-                // Floating Scroll Up / Down controls on the right edge
-                VStack(spacing: 8) {
                     Button {
                         Haptics.light()
-                        onScroll(-320)
+                        onClose()
                     } label: {
-                        Image(systemName: "chevron.up")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 30, height: 30)
-                            .background(Circle().fill(Color.black.opacity(0.58)))
+                        Text("回对话")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(Color.dsPrimary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(Capsule().fill(Color.gray.opacity(0.12)))
                     }
-
-                    Button {
-                        Haptics.light()
-                        onScroll(320)
-                    } label: {
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 30, height: 30)
-                            .background(Circle().fill(Color.black.opacity(0.58)))
-                    }
-                }
-                .padding(.trailing, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-        }
-        .frame(height: viewportHeight)
-    }
-
-    private func isTextInputElement(_ el: BrowserElementItem) -> Bool {
-        let tag = el.tag.lowercased()
-        let typ = el.type.lowercased()
-        if tag == "textarea" { return true }
-        if tag == "input" {
-            let nonText = ["submit", "button", "checkbox", "radio", "file", "image", "reset", "hidden"]
-            return !nonText.contains(typ)
-        }
-        return false
-    }
-
-    private var interactiveElementsStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(state.elements.prefix(12)) { el in
-                    let isInput = isTextInputElement(el)
-                    let label = el.text.isEmpty ? (el.value.isEmpty ? el.tag : el.value) : el.text
-                    Button {
-                        Haptics.light()
-                        if isInput {
-                            activeInputElement = el
-                            elementTextDraft = el.value
-                        } else {
-                            onClickElement(el.id)
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: isInput ? "character.cursor.ibeam" : "hand.point.up.left.fill")
-                                .font(.system(size: 10))
-                                .foregroundStyle(isInput ? Color.orange : Color.dsAccent)
-                            Text("[\(el.id)] \(label)")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundStyle(Color.dsPrimary)
-                                .lineLimit(1)
-                        }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .background(
-                            Capsule().fill(Color.white.opacity(0.75))
-                        )
-                    }
-                    .buttonStyle(SingleTapRowButtonStyle())
+                    .glassPressable(scale: 0.94)
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
-    }
-
-    private func elementInputBar(for element: BrowserElementItem) -> some View {
-        HStack(spacing: 8) {
-            Text("输入 [\(element.id)]")
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(Color.dsAccent)
-
-            TextField(element.text.isEmpty ? "输入文本内容..." : element.text, text: $elementTextDraft)
-                .font(.system(size: 12.5))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.white.opacity(0.85))
-                )
-                .onSubmit {
-                    onTypeText(element.id, elementTextDraft, true)
-                    activeInputElement = nil
+        .frame(maxWidth: .infinity)
+        .background(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 24,
+                bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: 24,
+                style: .continuous
+            )
+            .fill(Color.white)
+            .shadow(color: Color.black.opacity(0.10), radius: 14, x: 0, y: -4)
+            .ignoresSafeArea(.container, edges: .bottom)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onClose()
+        }
+        .gesture(
+            DragGesture(minimumDistance: 12)
+                .onChanged { val in
+                    if val.translation.height > 0 {
+                        dragOffsetY = val.translation.height
+                    }
                 }
-
-            Button {
-                Haptics.medium()
-                onTypeText(element.id, elementTextDraft, true)
-                activeInputElement = nil
-            } label: {
-                Text("填入并提交")
-                    .font(.system(size: 11.5, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5.5)
-                    .background(Capsule().fill(Color.dsAccent))
-            }
-
-            Button {
-                activeInputElement = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(8)
-        .cleanWhiteCard(cornerRadius: 12)
+                .onEnded { val in
+                    if val.translation.height > 55 {
+                        onClose()
+                    }
+                    withAnimation(AppleMotion.snappy) {
+                        dragOffsetY = 0
+                    }
+                }
+        )
     }
 }
 

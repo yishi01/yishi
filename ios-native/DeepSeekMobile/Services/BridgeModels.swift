@@ -103,6 +103,9 @@ struct BrowserSessionState: Identifiable, Hashable {
     var humanRequired: Bool
     var humanReason: String
     var scrollY: Int
+    var canGoBack: Bool = false
+    var canGoForward: Bool = false
+    var mode: String = "mobile_wkwebview"
     var elements: [BrowserElementItem]
     var textMarkdown: String
     var frameB64: String

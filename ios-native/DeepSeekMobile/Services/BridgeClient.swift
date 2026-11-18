@@ -69,6 +69,8 @@ final class BridgeClient: ObservableObject {
     // v0.9.0 Wallet & Built-in Collaborative Browser
     @Published var walletSummary: WalletSummaryData = WalletSummaryData()
     @Published var activeBrowserSessions: [String: BrowserSessionState] = [:]
+    @Published var presentedBrowserId: String? = nil
+    private var userDismissedBrowserIds: Set<String> = []
 
     // Full PC File Manager State
     @Published var pcDrives: [PCDriveItem] = []
@@ -317,6 +319,12 @@ final class BridgeClient: ObservableObject {
             }
         }
         pathMonitor.start(queue: DispatchQueue(label: "com.agy.deepseek.nwmonitor"))
+        MobileBrowserManager.shared.onHumanNavigationSettled = { [weak self] browserId, snap in
+            Task { @MainActor [weak self] in
+                guard let self = self, self.isAuthenticated else { return }
+                await self.syncMobileBrowserSnapshot(browserId: browserId, snapshot: snap)
+            }
+        }
     }
 
     func showToastMessage(_ text: String) {
@@ -1173,7 +1181,7 @@ final class BridgeClient: ObservableObject {
             .replacingOccurrences(of: "http://", with: "")
         let after = reset ? 0 : lastSeq
         let encodedToken = authToken.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? authToken
-        let urlStr = "\(wsScheme)\(hostPart)/ws/sessions/\(activeSessionId)?token=\(encodedToken)&after_seq=\(after)"
+        let urlStr = "\(wsScheme)\(hostPart)/ws/sessions/\(activeSessionId)?token=\(encodedToken)&after_seq=\(after)&client_browser=1"
         guard let url = URL(string: urlStr) else { return }
 
         wsSynced = false
@@ -1395,6 +1403,45 @@ final class BridgeClient: ObservableObject {
                     turns[tIdx].browserSessions[bIdx] = state
                 } else {
                     turns[tIdx].browserSessions.append(state)
+                }
+                if state.humanRequired {
+                    userDismissedBrowserIds.remove(state.browserId)
+                    withAnimation(AppleMotion.smooth) {
+                        presentedBrowserId = state.browserId
+                    }
+                }
+            }
+
+        case "browser_rpc":
+            let cmdId = (d["cmd_id"] as? String) ?? ""
+            let bid = (d["browser_id"] as? String) ?? ""
+            let action = (d["action"] as? String) ?? "snapshot"
+            if !cmdId.isEmpty && !bid.isEmpty {
+                if (action == "navigate" || action == "open"), !userDismissedBrowserIds.contains(bid) {
+                    withAnimation(AppleMotion.smooth) {
+                        presentedBrowserId = bid
+                    }
+                }
+                let paramsCopy = d
+                Task { @MainActor [weak self] in
+                    guard let self = self else { return }
+                    var rpcRes = await MobileBrowserManager.shared.executeRPC(
+                        browserId: bid,
+                        action: action,
+                        params: paramsCopy,
+                        uploadScreenshot: { jpegData, fname in
+                            await self.uploadImageAttachment(data: jpegData, filename: fname, addToPending: false)
+                        }
+                    )
+                    rpcRes["cmd_id"] = cmdId
+                    rpcRes["session_id"] = self.activeSessionId.isEmpty ? "global" : self.activeSessionId
+                    await self.submitMobileBrowserRPCResult(browserId: bid, payload: rpcRes)
+                    if (rpcRes["human_required"] as? Bool) == true {
+                        self.userDismissedBrowserIds.remove(bid)
+                        withAnimation(AppleMotion.smooth) {
+                            self.presentedBrowserId = bid
+                        }
+                    }
                 }
             }
 
@@ -1691,6 +1738,9 @@ final class BridgeClient: ObservableObject {
             humanRequired: (raw["human_required"] as? Bool) ?? false,
             humanReason: (raw["human_reason"] as? String) ?? "",
             scrollY: (raw["scroll_y"] as? NSNumber)?.intValue ?? 0,
+            canGoBack: (raw["can_go_back"] as? Bool) ?? false,
+            canGoForward: (raw["can_go_forward"] as? Bool) ?? false,
+            mode: (raw["mode"] as? String) ?? "mobile_wkwebview",
             elements: els,
             textMarkdown: (raw["text_markdown"] as? String) ?? "",
             frameB64: (raw["frame_b64"] as? String) ?? (raw["last_frame_b64"] as? String) ?? ""
@@ -2097,7 +2147,7 @@ final class BridgeClient: ObservableObject {
     // MARK: - Module B: Attachments & PC Screenshots
 
     @discardableResult
-    func uploadImageAttachment(data: Data, filename: String = "photo.jpg") async -> ChatAttachmentItem? {
+    func uploadImageAttachment(data: Data, filename: String = "photo.jpg", addToPending: Bool = true) async -> ChatAttachmentItem? {
         let b64 = data.base64EncodedString()
         let payload: [String: Any] = [
             "filename": filename,
@@ -2112,7 +2162,7 @@ final class BridgeClient: ObservableObject {
             if let json = try JSONSerialization.jsonObject(with: resp) as? [String: Any] {
                 let rawAtt = (json["attachment"] as? [String: Any]) ?? json
                 if let item = Self.parseAttachmentItem(rawAtt) {
-                    if !pendingAttachments.contains(where: { $0.attId == item.attId }) {
+                    if addToPending && !pendingAttachments.contains(where: { $0.attId == item.attId }) {
                         pendingAttachments.append(item)
                     }
                     Haptics.light()
@@ -2271,7 +2321,50 @@ final class BridgeClient: ObservableObject {
         }
     }
 
-    // MARK: - Module F: Built-in Collaborative Browser
+    // MARK: - Module F: Mobile Native WKWebView Collaborative Browser
+
+    func presentBrowser(_ browserId: String) {
+        userDismissedBrowserIds.remove(browserId)
+        withAnimation(AppleMotion.smooth) {
+            presentedBrowserId = browserId
+        }
+        // Ensure local WKWebView loads the session URL if currently blank
+        if let state = activeBrowserSessions[browserId] {
+            let tab = MobileBrowserManager.shared.tab(for: browserId)
+            if tab.currentURL.isEmpty && !state.url.isEmpty && state.url != "about:blank" {
+                Task { _ = await tab.loadURL(state.url, waitForSettle: false) }
+            }
+        }
+    }
+
+    func dismissPresentedBrowser() {
+        if let bid = presentedBrowserId {
+            userDismissedBrowserIds.insert(bid)
+        }
+        withAnimation(AppleMotion.smooth) {
+            presentedBrowserId = nil
+        }
+    }
+
+    private func submitMobileBrowserRPCResult(browserId: String, payload: [String: Any]) async {
+        do {
+            let body = try JSONSerialization.data(withJSONObject: payload)
+            let data = try await request("/api/browser/sessions/\(browserId)/rpc_result", method: "POST", body: body, timeout: 15)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
+                if let state = Self.parseBrowserSessionState(snapDict) {
+                    upsertBrowserStateInChat(state)
+                }
+            }
+        } catch {}
+    }
+
+    func syncMobileBrowserSnapshot(browserId: String, snapshot: [String: Any]) async {
+        var payload = snapshot
+        payload["cmd_id"] = ""
+        payload["session_id"] = activeSessionId.isEmpty ? "global" : activeSessionId
+        await submitMobileBrowserRPCResult(browserId: browserId, payload: payload)
+    }
 
     private func upsertBrowserStateInChat(_ state: BrowserSessionState) {
         activeBrowserSessions[state.browserId] = state
@@ -2298,19 +2391,29 @@ final class BridgeClient: ObservableObject {
             let bid = (rawBrowser["browser_id"] as? String) ?? (createJSON["browser_id"] as? String) ?? ""
             guard !bid.isEmpty else { return }
 
-            let navPayload: [String: Any] = [
-                "url": url,
-                "actor": "human",
-            ]
-            let navBody = try JSONSerialization.data(withJSONObject: navPayload)
-            let navData = try await request("/api/browser/sessions/\(bid)/navigate", method: "POST", body: navBody, timeout: 30)
-            if let navJSON = try JSONSerialization.jsonObject(with: navData) as? [String: Any] {
-                let snapDict = (navJSON["browser"] as? [String: Any]) ?? (navJSON["snapshot"] as? [String: Any]) ?? navJSON
-                if let state = Self.parseBrowserSessionState(snapDict) {
-                    upsertBrowserStateInChat(state)
-                    Haptics.light()
-                }
-            }
+            let initial = BrowserSessionState(
+                browserId: bid,
+                sessionId: activeSessionId.isEmpty ? "global" : activeSessionId,
+                url: url,
+                title: URL(string: url)?.host ?? "正在加载...",
+                controlOwner: "human",
+                humanRequired: false,
+                humanReason: "",
+                scrollY: 0,
+                canGoBack: false,
+                canGoForward: false,
+                mode: "mobile_wkwebview",
+                elements: [],
+                textMarkdown: "",
+                frameB64: ""
+            )
+            upsertBrowserStateInChat(initial)
+            presentBrowser(bid)
+            Haptics.light()
+
+            let tab = MobileBrowserManager.shared.tab(for: bid)
+            let snap = await tab.loadURL(url, waitForSettle: true)
+            await syncMobileBrowserSnapshot(browserId: bid, snapshot: snap)
         } catch {
             showToastMessage("启动内置浏览器失败: \(error.localizedDescription)")
         }
@@ -2318,92 +2421,46 @@ final class BridgeClient: ObservableObject {
 
     func browserNavigate(browserId: String, url: String) async {
         guard !browserId.isEmpty else { return }
-        let payload: [String: Any] = ["url": url, "actor": "human"]
-        do {
-            let body = try JSONSerialization.data(withJSONObject: payload)
-            let data = try await request("/api/browser/sessions/\(browserId)/navigate", method: "POST", body: body, timeout: 30)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
-                if let state = Self.parseBrowserSessionState(snapDict) {
-                    upsertBrowserStateInChat(state)
-                }
-            }
-        } catch {
-            showToastMessage("网页跳转失败: \(error.localizedDescription)")
-        }
+        let tab = MobileBrowserManager.shared.tab(for: browserId)
+        let snap = await tab.loadURL(url, waitForSettle: true)
+        await syncMobileBrowserSnapshot(browserId: browserId, snapshot: snap)
     }
 
     func browserHistoryAction(browserId: String, action: String) async {
         guard !browserId.isEmpty else { return }
         let act = action.lowercased()
         if act == "close" {
-            _ = try? await request("/api/browser/sessions/\(browserId)", method: "DELETE")
+            MobileBrowserManager.shared.removeTab(browserId)
+            _ = try? await request("/api/browser/sessions/\(browserId)/close", method: "POST")
             activeBrowserSessions.removeValue(forKey: browserId)
+            if presentedBrowserId == browserId {
+                presentedBrowserId = nil
+            }
             for idx in turns.indices {
                 turns[idx].browserSessions.removeAll { $0.browserId == browserId }
             }
             Haptics.light()
             return
         }
-        do {
-            let payload: [String: Any] = ["action": act, "actor": "human"]
-            let body = try JSONSerialization.data(withJSONObject: payload)
-            let data = try await request("/api/browser/sessions/\(browserId)/\(act)", method: "POST", body: body, timeout: 25)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
-                if let state = Self.parseBrowserSessionState(snapDict) {
-                    upsertBrowserStateInChat(state)
-                }
-            }
-        } catch {
-            // Fallback to unified /input endpoint if backend routes back/forward/reload via /input
-            await browserSendInput(browserId: browserId, action: act)
+        let tab = MobileBrowserManager.shared.tab(for: browserId)
+        let snap: [String: Any]
+        if act == "back" {
+            snap = await tab.goBack(waitForSettle: true)
+        } else if act == "forward" {
+            snap = await tab.goForward(waitForSettle: true)
+        } else {
+            snap = await tab.reload(waitForSettle: true)
         }
-    }
-
-    func browserSendInput(
-        browserId: String,
-        action: String,
-        elementId: Int? = nil,
-        x: Int? = nil,
-        y: Int? = nil,
-        text: String = "",
-        submit: Bool = false,
-        deltaY: Int = 320
-    ) async {
-        guard !browserId.isEmpty else { return }
-        var payload: [String: Any] = [
-            "action": action,
-            "actor": "human",
-            "text": text,
-            "submit": submit,
-            "delta_y": deltaY,
-        ]
-        if let elementId = elementId {
-            payload["element_id"] = elementId
-        }
-        if let x = x {
-            payload["x"] = x
-        }
-        if let y = y {
-            payload["y"] = y
-        }
-        do {
-            let body = try JSONSerialization.data(withJSONObject: payload)
-            let data = try await request("/api/browser/sessions/\(browserId)/input", method: "POST", body: body, timeout: 25)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let snapDict = (json["browser"] as? [String: Any]) ?? (json["snapshot"] as? [String: Any]) ?? json
-                if let state = Self.parseBrowserSessionState(snapDict) {
-                    upsertBrowserStateInChat(state)
-                }
-            }
-        } catch {
-            showToastMessage("浏览器操作失败: \(error.localizedDescription)")
-        }
+        await syncMobileBrowserSnapshot(browserId: browserId, snapshot: snap)
     }
 
     func browserSetControl(browserId: String, owner: String) async {
         guard !browserId.isEmpty else { return }
+        if owner == "agent" {
+            let tab = MobileBrowserManager.shared.tab(for: browserId)
+            let freshSnap = await tab.runSnapshotJS()
+            await syncMobileBrowserSnapshot(browserId: browserId, snapshot: freshSnap)
+        }
         let payload: [String: Any] = [
             "owner": owner,
             "control_owner": owner,
@@ -2426,25 +2483,14 @@ final class BridgeClient: ObservableObject {
 
     func browserScreenshotToChat(browserId: String) async {
         guard !browserId.isEmpty else { return }
-        do {
-            let payload: [String: Any] = [
-                "session_id": activeSessionId.isEmpty ? "global" : activeSessionId,
-            ]
-            let body = try JSONSerialization.data(withJSONObject: payload)
-            let data = try await request("/api/browser/sessions/\(browserId)/screenshot", method: "POST", body: body)
-            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let rawAtt = (json["attachment"] as? [String: Any]) ?? json
-                if let item = Self.parseAttachmentItem(rawAtt) {
-                    if !pendingAttachments.contains(where: { $0.attId == item.attId }) {
-                        pendingAttachments.append(item)
-                    }
-                    Haptics.success()
-                    showToastMessage("已将浏览器画面插入待发附件")
-                }
-            }
-        } catch {
-            showToastMessage("浏览器截图失败: \(error.localizedDescription)")
+        let tab = MobileBrowserManager.shared.tab(for: browserId)
+        if let jpeg = await tab.captureSnapshotJPEG(),
+           let att = await uploadImageAttachment(data: jpeg, filename: "web_\(Int(Date().timeIntervalSince1970)).jpg", addToPending: true) {
+            Haptics.success()
+            showToastMessage("已将网页截图 (\(att.width)×\(att.height)) 加入待发附件")
+            return
         }
+        showToastMessage("网页截图失败")
     }
 
     // MARK: - Module D: Agent Team Control

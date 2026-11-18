@@ -815,3 +815,78 @@ def test_module_f_collaborative_browser_and_security_gate(v9_env):
         ws.send_text("ping")
         pong = ws.receive_json()
         assert pong["type"] == "pong"
+
+
+def test_module_f_mobile_wkwebview_reverse_rpc(v9_env):
+    import concurrent.futures
+
+    client, ws_a, _ws_b, _data_dir = v9_env
+    sid = client.post(
+        "/api/sessions",
+        json={"workspace": str(ws_a), "title": "Mobile Browser RPC Session"},
+        headers=_headers(),
+    ).json()["session_id"]
+
+    browser_svc = client.app.state.browser_service
+    assert browser_svc.has_mobile_executor(sid) is False
+
+    with client.websocket_connect(f"/ws/sessions/{sid}?token={AUTH_TOKEN}&client_browser=1") as ws:
+        sync = ws.receive_json()
+        assert sync["type"] == "sync_complete"
+        assert browser_svc.has_mobile_executor(sid) is True
+
+        bid = f"br_{sid}"
+        client.post(
+            "/api/browser/sessions",
+            json={"browser_id": bid, "session_id": sid},
+            headers=_headers(),
+        )
+        init_ev = ws.receive_json()
+        assert init_ev["type"] == "browser_state"
+
+        # Agent navigates -> dispatches browser_rpc over session WS -> phone WKWebView resolves via /rpc_result
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(
+                lambda: client.post(
+                    f"/api/browser/sessions/{bid}/navigate",
+                    json={"url": "https://openai.com", "actor": "agent"},
+                    headers=_headers(),
+                )
+            )
+            rpc_ev = ws.receive_json()
+            assert rpc_ev["type"] == "browser_rpc"
+            rpc_d = rpc_ev["data"]
+            assert rpc_d["action"] == "navigate"
+            assert rpc_d["url"] == "https://openai.com"
+            cmd_id = rpc_d["cmd_id"]
+
+            r_res = client.post(
+                f"/api/browser/sessions/{bid}/rpc_result",
+                json={
+                    "cmd_id": cmd_id,
+                    "ok": True,
+                    "url": "https://openai.com",
+                    "title": "OpenAI",
+                    "can_go_back": True,
+                    "can_go_forward": False,
+                    "elements": [{"id": 1, "tag": "a", "type": "link", "text": "Introducing", "href": "/index", "value": "", "bbox": [0, 0, 100, 30]}],
+                    "text_markdown": "OpenAI Intro",
+                    "human_required": True,
+                    "human_reason": "检测到 Cloudflare / 人机验证，需真人点击确认",
+                },
+                headers=_headers(),
+            )
+            assert r_res.status_code == 200
+            nav_resp = fut.result(timeout=10)
+
+        assert nav_resp.status_code == 200
+        body = nav_resp.json()
+        assert body["mode"] == "mobile_wkwebview"
+        assert body["title"] == "OpenAI"
+        assert body["can_go_back"] is True
+        assert body["human_required"] is True
+        assert body["control_owner"] == "human"
+        assert "frame_b64" not in body
+
+    assert browser_svc.has_mobile_executor(sid) is False
+
