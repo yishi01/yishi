@@ -16,10 +16,14 @@ import subprocess
 import sys
 import time
 
+if os.name == "nt":
+    import msvcrt
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 WATCHDOG_PID_FILE = DATA_DIR / "watchdog.pid"
+WATCHDOG_LOCK_FILE = DATA_DIR / "watchdog.lock"
 WATCHDOG_LOG_FILE = DATA_DIR / "watchdog.log"
 PYTHON_EXE = Path(r"C:\Python313\python.exe") if Path(r"C:\Python313\python.exe").exists() else Path(sys.executable)
 SERVER_SCRIPT = PROJECT_ROOT / "bridge" / "server.py"
@@ -36,14 +40,17 @@ def _log(msg: str) -> None:
         pass
 
 
-def _is_pid_running(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+def _acquire_singleton_lock():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(WATCHDOG_LOCK_FILE, "a+", encoding="utf-8")
+    if os.name == "nt":
+        try:
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            fh.close()
+            return None
+    return fh
 
 
 def _port_open(port: int = 8765) -> bool:
@@ -53,15 +60,12 @@ def _port_open(port: int = 8765) -> bool:
 
 
 def main() -> None:
+    os.chdir(str(PROJECT_ROOT))
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if WATCHDOG_PID_FILE.exists():
-        try:
-            old_pid = int(WATCHDOG_PID_FILE.read_text(encoding="utf-8").strip())
-            if old_pid != os.getpid() and _is_pid_running(old_pid):
-                _log(f"Another watchdog (PID {old_pid}) is already running; exiting.")
-                return
-        except Exception:
-            pass
+    lock_fh = _acquire_singleton_lock()
+    if lock_fh is None:
+        _log("Another watchdog instance holds watchdog.lock; exiting.")
+        return
 
     WATCHDOG_PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     _log(f"Watchdog started (PID {os.getpid()}) supervising {SERVER_SCRIPT} via {PYTHON_EXE}")
@@ -102,6 +106,10 @@ def main() -> None:
                     WATCHDOG_PID_FILE.unlink()
             except OSError:
                 pass
+        try:
+            lock_fh.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

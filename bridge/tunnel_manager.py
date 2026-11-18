@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -14,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from bridge.config import PROJECT_ROOT, ConfigStore
+from bridge.rendezvous import publish_route_to_gist
 
 logger = logging.getLogger("bridge.tunnel")
 
@@ -41,6 +44,9 @@ class TunnelManager:
         self.last_error: str = ""
         self.recent_logs: list[str] = []
         self.restarts: int = 0
+        self.rendezvous_status: str = "idle"
+        self.rendezvous_last_error: str = ""
+        self.rendezvous_updated_at: int = 0
 
     def _find_binary(self) -> Path | None:
         local_bin = PROJECT_ROOT / "tools" / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
@@ -60,6 +66,11 @@ class TunnelManager:
                 "restarts": self.restarts,
                 "last_error": self.last_error,
                 "recent_logs": list(self.recent_logs[-8:]),
+                "rendezvous_gist_id": cfg.rendezvous_gist_id,
+                "rendezvous_status": self.rendezvous_status,
+                "rendezvous_last_error": self.rendezvous_last_error,
+                "rendezvous_updated_at": self.rendezvous_updated_at,
+                "tailscale_urls": list(cfg.tailscale_urls),
             }
 
     async def start(self) -> None:
@@ -68,6 +79,8 @@ class TunnelManager:
             return
 
         cfg = self.config_store.config
+        if cfg.rendezvous_gist_id.strip():
+            threading.Thread(target=self.publish_rendezvous_sync, daemon=True).start()
         if not cfg.enable_tunnel:
             self.status = "disabled"
             return
@@ -189,8 +202,9 @@ class TunnelManager:
                     self.last_error = str(exc)
 
     async def _supervisor_loop(self) -> None:
-        """Keep cloudflared alive automatically across transient network drops or crashes."""
+        """Keep cloudflared alive automatically across transient network drops, boot delays, or crashes."""
         backoff = 2.0
+        starting_since = time.time()
         while not self._stop_requested:
             await asyncio.sleep(3.0)
             if self._stop_requested:
@@ -199,16 +213,97 @@ class TunnelManager:
             if not cfg.enable_tunnel:
                 break
             proc = self.proc
-            if proc is None or proc.poll() is not None:
-                logger.warning("Cloudflare Tunnel exited (%s). Restarting in %.1fs...", self.last_error, backoff)
+            stalled_at_boot = (
+                self.status == "starting"
+                and not self.live_url
+                and (time.time() - starting_since) > 45.0
+            )
+            if proc is None or proc.poll() is not None or stalled_at_boot:
+                reason = "boot/network handshake timeout" if stalled_at_boot else (self.last_error or "process exited")
+                logger.warning("Cloudflare Tunnel restarting (%s) in %.1fs...", reason, backoff)
+                if proc is not None and proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
                 await asyncio.sleep(backoff)
                 if self._stop_requested:
                     break
                 self.restarts += 1
                 backoff = min(30.0, backoff * 1.6)
+                starting_since = time.time()
                 await asyncio.to_thread(self._spawn_process_sync)
             elif self.status == "connected":
                 backoff = 2.0
+                starting_since = time.time()
+
+    def _collect_route_urls(self, cfg: Any) -> tuple[list[str], list[str]]:
+        cgnat = ipaddress.ip_network("100.64.0.0/10")
+        lan_urls: list[str] = []
+        tailscale_urls: list[str] = [str(u).strip().rstrip("/") for u in (cfg.tailscale_urls or []) if str(u).strip()]
+        seen_lan: set[str] = set()
+        seen_ts: set[str] = set(tailscale_urls)
+        try:
+            for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip_str = item[4][0]
+                if not ip_str or ip_str.startswith("127.") or ip_str.startswith("169.254."):
+                    continue
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                except ValueError:
+                    continue
+                candidate = f"http://{ip_str}:{cfg.port}"
+                if ip_obj in cgnat:
+                    if candidate not in seen_ts:
+                        seen_ts.add(candidate)
+                        tailscale_urls.append(candidate)
+                elif candidate not in seen_lan:
+                    seen_lan.add(candidate)
+                    lan_urls.append(candidate)
+        except OSError:
+            pass
+        return lan_urls, tailscale_urls
+
+    def publish_rendezvous_sync(self, url: str | None = None) -> dict[str, Any]:
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            return {"ok": False, "skipped": "pytest"}
+        try:
+            cfg = self.config_store.config
+            target_url = (url or self.live_url or cfg.public_url or "").strip().rstrip("/")
+            if not cfg.auth_token.strip():
+                raise RuntimeError("auth_token is empty")
+            lan_urls, tailscale_urls = self._collect_route_urls(cfg)
+            new_gist_id = publish_route_to_gist(
+                gist_id=cfg.rendezvous_gist_id,
+                auth_token=cfg.auth_token,
+                public_url=target_url,
+                lan_urls=lan_urls,
+                tailscale_urls=tailscale_urls,
+            )
+            if new_gist_id and new_gist_id != cfg.rendezvous_gist_id:
+                cfg.rendezvous_gist_id = new_gist_id
+                self.config_store.save(cfg)
+            now_ts = int(time.time())
+            with self._lock:
+                self.rendezvous_status = "synced"
+                self.rendezvous_last_error = ""
+                self.rendezvous_updated_at = now_ts
+            logger.info("Encrypted fixed rendezvous synced (gist=%s)", cfg.rendezvous_gist_id or new_gist_id)
+            return {
+                "ok": True,
+                "gist_id": cfg.rendezvous_gist_id or new_gist_id,
+                "updated_at": now_ts,
+                "public_url": target_url,
+                "lan_urls": lan_urls,
+                "tailscale_urls": tailscale_urls,
+            }
+        except Exception as exc:
+            err_msg = str(exc)[:200]
+            with self._lock:
+                self.rendezvous_status = "error"
+                self.rendezvous_last_error = err_msg
+            logger.warning("Rendezvous publish failed: %s", err_msg)
+            return {"ok": False, "error": err_msg}
 
     def _persist_public_url(self, url: str) -> None:
         try:
@@ -216,6 +311,26 @@ class TunnelManager:
             cfg.public_url = url
             self.config_store.save(cfg)
             (self.config_store.data_dir / "tunnel_url.txt").write_text(url, encoding="utf-8")
+            if not os.environ.get("PYTEST_CURRENT_TEST"):
+                threading.Thread(
+                    target=self.publish_rendezvous_sync,
+                    args=(url,),
+                    daemon=True,
+                ).start()
+            bark = cfg.bark_url.strip().rstrip("/")
+            if bark:
+                import urllib.parse
+                import urllib.request
+
+                def _notify_bark() -> None:
+                    try:
+                        title = urllib.parse.quote("DeepSeek 电脑已上线", safe="")
+                        body = urllib.parse.quote(url, safe="")
+                        urllib.request.urlopen(f"{bark}/{title}/{body}?group=deepseek", timeout=4)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_notify_bark, daemon=True).start()
         except Exception:
             pass
 

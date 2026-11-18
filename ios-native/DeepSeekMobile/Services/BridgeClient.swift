@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Network
 import SwiftUI
@@ -5,15 +6,17 @@ import SwiftUI
 @MainActor
 final class BridgeClient: ObservableObject {
     static let defaultToken = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
+    static let rendezvousGistID = "746a49e639b95bb92001cd6d864b1631"
     static let initialCloudflareURL = "https://shuttle-hepatitis-attending-documentary.trycloudflare.com"
     static let defaultPresetURLs: [(label: String, url: String)] = [
-        ("Wi-Fi 局域网直连", "http://192.168.31.190:8765"),
-        ("Tailscale 直连 IP", "http://100.88.121.40:8765"),
-        ("Tailscale HTTPS", "https://dsh-pc.tail1e24af.ts.net"),
+        ("固定局域网直连", "http://192.168.31.190:8765"),
+        ("固定域名 (Tailscale HTTPS)", "https://dsh-pc.tail1e24af.ts.net"),
+        ("Tailscale 固定 IP", "http://100.88.121.40:8765"),
     ]
 
     @AppStorage("ds_server_url") var serverURL: String = "http://192.168.31.190:8765"
     @AppStorage("ds_public_url") var savedPublicURL: String = ""
+    @AppStorage("ds_rendezvous_gist_id") var savedRendezvousGistID: String = ""
     @AppStorage("ds_auth_token") var authToken: String = "_44dVxHP8puOv1RjHTb-uWrgb5LY4k6s"
     @AppStorage("ds_active_workspace") var activeWorkspace: String = ""
     @AppStorage("ds_active_session_id") var activeSessionId: String = ""
@@ -46,6 +49,8 @@ final class BridgeClient: ObservableObject {
     @Published var enableTunnel: Bool = true
     @Published var hasCloudflaredToken: Bool = false
     @Published var tunnelStatus: String = ""
+    @Published var rendezvousStatus: String = "自动解析"
+    @Published var rendezvousResolvedURLs: [String] = []
     @Published var searchConfig: SearchConfigItem = SearchConfigItem()
     @Published var dshProfileDir: String = ""
 
@@ -101,6 +106,11 @@ final class BridgeClient: ObservableObject {
     private let pathMonitor = NWPathMonitor()
     private var lastNetworkSignature: String = ""
 
+    var effectiveRendezvousGistID: String {
+        let trimmed = savedRendezvousGistID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? Self.rendezvousGistID : trimmed
+    }
+
     var effectivePresetURLs: [(label: String, url: String)] {
         var list: [(label: String, url: String)] = []
         var seen = Set<String>()
@@ -115,12 +125,20 @@ final class BridgeClient: ObservableObject {
             }
         }
 
-        // Always probe both bundled live Cloudflare URL and any cached public URL
-        appendUnique("Cloudflare 外网(内置最新)", Self.initialCloudflareURL)
-        appendUnique("Cloudflare 外网(缓存)", savedPublicURL)
+        // Fixed addresses first (LAN IP, Tailscale HTTPS domain, Tailscale IP)
         for item in Self.defaultPresetURLs {
             appendUnique(item.label, item.url)
         }
+        // Dynamically decrypted fixed-rendezvous routes (updates on every PC boot)
+        for url in rendezvousResolvedURLs {
+            let label = url.contains("trycloudflare.com")
+                ? "固定解析 · 公网隧道"
+                : (url.contains("ts.net") || url.contains("100.")) ? "固定解析 · Tailscale" : "固定解析 · 局域网"
+            appendUnique(label, url)
+        }
+        // Cached or bundled public URL fallback
+        appendUnique("Cloudflare 缓存地址", savedPublicURL)
+        appendUnique("Cloudflare 外网(内置)", Self.initialCloudflareURL)
         return list
     }
 
@@ -146,7 +164,7 @@ final class BridgeClient: ObservableObject {
         Self.normalizeURL(serverURL)
     }
 
-    static func normalizeURL(_ raw: String) -> String {
+    nonisolated static func normalizeURL(_ raw: String) -> String {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.isEmpty { s = "http://192.168.31.190:8765" }
         if !s.lowercased().hasPrefix("http://") && !s.lowercased().hasPrefix("https://") {
@@ -154,6 +172,96 @@ final class BridgeClient: ObservableObject {
         }
         while s.hasSuffix("/") { s.removeLast() }
         return s
+    }
+
+    nonisolated static func decryptRendezvousEnvelope(_ envelopeString: String, token: String) -> [String] {
+        guard let envData = envelopeString.data(using: .utf8),
+              let env = try? JSONSerialization.jsonObject(with: envData) as? [String: Any],
+              (env["v"] as? Int) == 1,
+              let nB64 = env["n"] as? String,
+              let cB64 = env["c"] as? String,
+              let mB64 = env["m"] as? String,
+              let nonce = Data(base64Encoded: nB64),
+              let ct = Data(base64Encoded: cB64),
+              let tag = Data(base64Encoded: mB64) else {
+            return []
+        }
+
+        let trimmedTok = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let seedData = ("ds-route-v1:" + trimmedTok).data(using: .utf8) else { return [] }
+        let keyData = Data(SHA256.hash(data: seedData))
+        let symKey = SymmetricKey(data: keyData)
+
+        var macInput = Data(nonce)
+        macInput.append(ct)
+        guard HMAC<SHA256>.isValidAuthenticationCode(tag, authenticating: macInput, using: symKey) else {
+            return []
+        }
+
+        var plain = Data(capacity: ct.count)
+        var counter: UInt32 = 0
+        var offset = 0
+        while offset < ct.count {
+            var blockInput = Data(keyData)
+            blockInput.append(nonce)
+            var beCounter = counter.bigEndian
+            withUnsafeBytes(of: &beCounter) { blockInput.append(contentsOf: $0) }
+            let keystream = Data(SHA256.hash(data: blockInput))
+            let end = min(offset + 32, ct.count)
+            for i in offset..<end {
+                plain.append(ct[i] ^ keystream[i - offset])
+            }
+            counter &+= 1
+            offset = end
+        }
+
+        guard let payload = try? JSONSerialization.jsonObject(with: plain) as? [String: Any] else {
+            return []
+        }
+        var out: [String] = []
+        if let lan = payload["lan_urls"] as? [String] {
+            out.append(contentsOf: lan)
+        }
+        if let ts = payload["tailscale_urls"] as? [String] {
+            out.append(contentsOf: ts)
+        }
+        if let pub = payload["public_url"] as? String, !pub.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            out.append(pub)
+        }
+        var unique: [String] = []
+        for raw in out {
+            let norm = normalizeURL(raw)
+            if !norm.isEmpty && !unique.contains(norm) {
+                unique.append(norm)
+            }
+        }
+        return unique
+    }
+
+    nonisolated static func fetchRendezvousURLs(gistID: String, token: String, session: URLSession) async -> [String] {
+        let cleanID = gistID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanID.isEmpty,
+              let url = URL(string: "https://api.github.com/gists/\(cleanID)") else {
+            return []
+        }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 5.5
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("DeepSeekMobile", forHTTPHeaderField: "User-Agent")
+        do {
+            let (data, resp) = try await session.data(for: req)
+            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let files = root["files"] as? [String: Any] else {
+                return []
+            }
+            let fileObj = (files["endpoint.enc"] as? [String: Any]) ?? (files.values.first as? [String: Any])
+            guard let content = fileObj?["content"] as? String else { return [] }
+            return decryptRendezvousEnvelope(content, token: token)
+        } catch {
+            return []
+        }
     }
 
     init() {
@@ -205,9 +313,60 @@ final class BridgeClient: ObservableObject {
         }
     }
 
+    private nonisolated static func probeVerifyCandidate(
+        _ candidate: String,
+        body: Data,
+        session: URLSession
+    ) async -> (ok: Bool, url: String, data: Data?, latencyMs: Double, reason: String) {
+        guard let endpoint = URL(string: candidate + "/api/auth/verify") else {
+            return (false, candidate, nil, 0, "无效地址")
+        }
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 8.5
+        req.httpBody = body
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let t0 = Date()
+        do {
+            let (data, resp) = try await session.data(for: req)
+            let ms = Date().timeIntervalSince(t0) * 1000.0
+            if let http = resp as? HTTPURLResponse {
+                if http.statusCode == 200 {
+                    return (true, candidate, data, ms, "")
+                } else if http.statusCode == 401 {
+                    return (false, candidate, nil, ms, "Auth Token 错误 (401)")
+                } else {
+                    return (false, candidate, nil, ms, "HTTP \(http.statusCode)")
+                }
+            }
+            return (false, candidate, nil, ms, "响应无效")
+        } catch {
+            return (false, candidate, nil, 0, error.localizedDescription)
+        }
+    }
+
+    private nonisolated static func probeHealthCandidate(
+        _ cand: String,
+        session: URLSession
+    ) async -> (url: String, latencyMs: Double)? {
+        guard let u = URL(string: cand + "/api/health") else { return nil }
+        var req = URLRequest(url: u)
+        req.timeoutInterval = 8.0
+        let t0 = Date()
+        if let (_, resp) = try? await session.data(for: req),
+           let http = resp as? HTTPURLResponse,
+           http.statusCode == 200 {
+            return (cand, Date().timeIntervalSince(t0) * 1000.0)
+        }
+        return nil
+    }
+
     func bootstrap() async {
         if authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             authToken = Self.defaultToken
+        }
+        if savedRendezvousGistID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            savedRendezvousGistID = Self.rendezvousGistID
         }
         // Clear stale temporary trycloudflare.com URLs cached from older app builds
         let curBuild = (Bundle.main.infoDictionary?["CFBundleVersion"] as? String) ?? ""
@@ -216,10 +375,10 @@ final class BridgeClient: ObservableObject {
             if savedPublicURL.contains("trycloudflare.com") {
                 savedPublicURL = Self.initialCloudflareURL
             }
-            if serverURL.contains("trycloudflare.com") {
-                serverURL = Self.initialCloudflareURL
+            if serverURL.contains("trycloudflare.com") || serverURL == "http://dsh-pc" {
+                serverURL = "https://dsh-pc.tail1e24af.ts.net"
             }
-            AppLogger.shared.info("Lifecycle", "检测到版本更新 Build \(curBuild)，已刷新预设外网隧道地址")
+            AppLogger.shared.info("Lifecycle", "检测到版本更新 Build \(curBuild)，已启用固定域名与加密路由解析")
         }
         if hasPairedOnce && !authToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             isAuthenticated = true
@@ -238,6 +397,7 @@ final class BridgeClient: ObservableObject {
         let rawTok = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveToken = rawTok.isEmpty ? Self.defaultToken : rawTok
         self.authToken = effectiveToken
+        let gistID = effectiveRendezvousGistID
 
         var candidates: [String] = [rawURL]
         for item in effectivePresetURLs {
@@ -269,31 +429,48 @@ final class BridgeClient: ObservableObject {
         await withTaskGroup(of: ProbeOutcome.self) { group in
             for candidate in candidates {
                 group.addTask {
-                    guard let endpoint = URL(string: candidate + "/api/auth/verify") else {
-                        return .failure(url: candidate, reason: "无效地址")
+                    let item = await Self.probeVerifyCandidate(candidate, body: body, session: session)
+                    if item.ok, let d = item.data {
+                        return .success(url: item.url, data: d, latencyMs: item.latencyMs)
                     }
-                    var req = URLRequest(url: endpoint)
-                    req.httpMethod = "POST"
-                    req.timeoutInterval = 8.5
-                    req.httpBody = body
-                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    let t0 = Date()
-                    do {
-                        let (data, resp) = try await session.data(for: req)
-                        let ms = Date().timeIntervalSince(t0) * 1000.0
-                        if let http = resp as? HTTPURLResponse {
-                            if http.statusCode == 200 {
-                                return .success(url: candidate, data: data, latencyMs: ms)
-                            } else if http.statusCode == 401 {
-                                return .failure(url: candidate, reason: "Auth Token 错误 (401)")
-                            } else {
-                                return .failure(url: candidate, reason: "HTTP \(http.statusCode)")
+                    return .failure(url: item.url, reason: item.reason)
+                }
+            }
+            if !gistID.isEmpty {
+                group.addTask { [weak self, candidates, gistID, effectiveToken, body, session] in
+                    let resolved = await Self.fetchRendezvousURLs(gistID: gistID, token: effectiveToken, session: session)
+                    await MainActor.run {
+                        if !resolved.isEmpty {
+                            self?.rendezvousResolvedURLs = resolved
+                            self?.rendezvousStatus = "已解析 (\(resolved.count) 链路)"
+                            if let pub = resolved.first(where: { $0.contains("trycloudflare.com") }) {
+                                self?.savedPublicURL = pub
                             }
                         }
-                        return .failure(url: candidate, reason: "响应无效")
-                    } catch {
-                        return .failure(url: candidate, reason: error.localizedDescription)
                     }
+                    let extra = resolved.filter { !candidates.contains($0) }
+                    if extra.isEmpty {
+                        return .failure(url: "固定解析器", reason: resolved.isEmpty ? "GitHub 暂不可达" : "路由已覆盖")
+                    }
+                    var bestHit: ProbeOutcome?
+                    var lastErr = "均不可达"
+                    await withTaskGroup(of: (ok: Bool, url: String, data: Data?, latencyMs: Double, reason: String).self) { sub in
+                        for ex in extra {
+                            sub.addTask {
+                                await Self.probeVerifyCandidate(ex, body: body, session: session)
+                            }
+                        }
+                        for await item in sub {
+                            if item.ok, let d = item.data {
+                                bestHit = .success(url: item.url, data: d, latencyMs: item.latencyMs)
+                                sub.cancelAll()
+                                break
+                            } else {
+                                lastErr = item.reason
+                            }
+                        }
+                    }
+                    return bestHit ?? .failure(url: extra.first ?? "固定解析器", reason: lastErr)
                 }
             }
 
@@ -381,20 +558,43 @@ final class BridgeClient: ObservableObject {
             }
 
             let session = self.probeSession
+            let gistID = self.effectiveRendezvousGistID
+            let tok = self.authToken
             var chosen: (url: String, latencyMs: Double)?
             await withTaskGroup(of: (String, Double)?.self) { group in
                 for cand in candidates {
                     group.addTask {
-                        guard let u = URL(string: cand + "/api/health") else { return nil }
-                        var req = URLRequest(url: u)
-                        req.timeoutInterval = 8.0
-                        let t0 = Date()
-                        if let (_, resp) = try? await session.data(for: req),
-                           let http = resp as? HTTPURLResponse,
-                           http.statusCode == 200 {
-                            return (cand, Date().timeIntervalSince(t0) * 1000.0)
+                        await Self.probeHealthCandidate(cand, session: session)
+                    }
+                }
+                if !gistID.isEmpty && !tok.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    group.addTask { [weak self, candidates, gistID, tok, session] in
+                        let resolved = await Self.fetchRendezvousURLs(gistID: gistID, token: tok, session: session)
+                        await MainActor.run {
+                            if !resolved.isEmpty {
+                                self?.rendezvousResolvedURLs = resolved
+                                self?.rendezvousStatus = "已解析 (\(resolved.count) 链路)"
+                                if let pub = resolved.first(where: { $0.contains("trycloudflare.com") }) {
+                                    self?.savedPublicURL = pub
+                                }
+                            }
                         }
-                        return nil
+                        let extra = resolved.filter { !candidates.contains($0) }
+                        guard !extra.isEmpty else { return nil }
+                        var found: (String, Double)?
+                        await withTaskGroup(of: (url: String, latencyMs: Double)?.self) { sub in
+                            for ex in extra {
+                                sub.addTask { await Self.probeHealthCandidate(ex, session: session) }
+                            }
+                            for await hit in sub {
+                                if let hit = hit {
+                                    found = hit
+                                    sub.cancelAll()
+                                    break
+                                }
+                            }
+                        }
+                        return found
                     }
                 }
                 for await hit in group {
@@ -561,6 +761,9 @@ final class BridgeClient: ObservableObject {
         if let pub = json["public_url"] as? String, !pub.isEmpty {
             savedPublicURL = pub
         }
+        if let gid = json["rendezvous_gist_id"] as? String, !gid.isEmpty {
+            savedRendezvousGistID = gid
+        }
         if let et = json["enable_tunnel"] as? Bool {
             enableTunnel = et
         }
@@ -611,8 +814,39 @@ final class BridgeClient: ObservableObject {
                 if let url = json["live_url"] as? String, !url.isEmpty {
                     savedPublicURL = url
                 }
+                if let gid = json["rendezvous_gist_id"] as? String, !gid.isEmpty {
+                    savedRendezvousGistID = gid
+                }
+                if let rs = json["rendezvous_status"] as? String, !rs.isEmpty {
+                    rendezvousStatus = rs == "synced" ? "已加密同步" : rs
+                }
             }
         } catch {}
+    }
+
+    func syncRendezvousOnPC() async {
+        do {
+            let data = try await request("/api/tunnel/sync_rendezvous", method: "POST")
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let tun = json["tunnel"] as? [String: Any] {
+                if let url = tun["live_url"] as? String, !url.isEmpty {
+                    savedPublicURL = url
+                }
+                if let gid = tun["rendezvous_gist_id"] as? String, !gid.isEmpty {
+                    savedRendezvousGistID = gid
+                }
+                let res = json["result"] as? [String: Any]
+                if (res?["ok"] as? Bool) == true {
+                    rendezvousStatus = "已加密同步"
+                    showToastMessage("固定路由已加密同步到云端解析器")
+                    Haptics.success()
+                } else if let err = res?["error"] as? String {
+                    rendezvousStatus = "同步失败: \(err)"
+                }
+            }
+        } catch {
+            rendezvousStatus = "请求失败"
+        }
     }
 
     func restartTunnel(cloudflaredToken: String = "") async {
@@ -631,6 +865,9 @@ final class BridgeClient: ObservableObject {
                 tunnelStatus = (json["status"] as? String) ?? ""
                 if let url = json["live_url"] as? String, !url.isEmpty {
                     savedPublicURL = url
+                }
+                if let gid = json["rendezvous_gist_id"] as? String, !gid.isEmpty {
+                    savedRendezvousGistID = gid
                 }
                 Haptics.success()
             }

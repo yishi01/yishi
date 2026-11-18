@@ -818,7 +818,7 @@ struct GitSettingsView: View {
             HStack {
                 Image(systemName: "globe.asia.australia.fill")
                     .foregroundStyle(theme.accentColor)
-                Text("Cloudflare 公网穿透隧道")
+                Text("固定远程连接与穿透隧道")
                     .font(.system(size: 15.5, weight: .semibold))
                 Spacer()
                 let isTunnelOnline = (client.tunnelStatus == "connected" || client.tunnelStatus == "running")
@@ -826,6 +826,33 @@ struct GitSettingsView: View {
                     .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(isTunnelOnline ? .green : .orange)
             }
+
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Label("固定外网域名", systemImage: "lock.shield")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.dsSecondary)
+                    Spacer()
+                    Text("https://dsh-pc.tail1e24af.ts.net")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Color.dsPrimary)
+                }
+                HStack {
+                    Label("固定路由解析器", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.dsSecondary)
+                    Spacer()
+                    Text(client.rendezvousStatus)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(client.rendezvousStatus.contains("已") ? .green : Color.dsPrimary)
+                    Button("同步路由") {
+                        Task { await client.syncRendezvousOnPC() }
+                    }
+                    .font(.system(size: 11, weight: .semibold))
+                }
+            }
+            .padding(9)
+            .cleanWhiteCard(cornerRadius: 12)
 
             if !client.savedPublicURL.isEmpty {
                 HStack {
@@ -845,7 +872,7 @@ struct GitSettingsView: View {
             }
 
             HStack(spacing: 8) {
-                SecureField(client.hasCloudflaredToken ? "已配置固定 Tunnel Token（留空使用免费临时域名）" : "可选：绑定 Cloudflare 固定隧道 Token", text: $cfTokenInput)
+                SecureField(client.hasCloudflaredToken ? "已配置固定 Tunnel Token（已绑定固定域名）" : "可选：绑定 Cloudflare 固定域名 Token", text: $cfTokenInput)
                     .font(.system(size: 12))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 8)

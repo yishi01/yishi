@@ -185,6 +185,10 @@ class BridgeConfig(BaseModel):
     enable_tunnel: bool = True
     cloudflared_token: str = ""
     public_url: str = ""
+    rendezvous_gist_id: str = ""
+    tailscale_urls: list[str] = Field(
+        default_factory=lambda: ["https://dsh-pc.tail1e24af.ts.net", "http://100.88.121.40:8765"]
+    )
 
     # v0.8.0 extensions
     active_profile_id: str = ""
@@ -373,6 +377,8 @@ class BridgeConfig(BaseModel):
             "enable_tunnel": self.enable_tunnel,
             "has_cloudflared_token": bool(self.cloudflared_token.strip()),
             "public_url": self.public_url,
+            "rendezvous_gist_id": self.rendezvous_gist_id,
+            "tailscale_urls": list(self.tailscale_urls),
             "active_profile_id": self.active_profile_id,
             "model_profiles": masked_profiles,
             "search_config": sc_public,

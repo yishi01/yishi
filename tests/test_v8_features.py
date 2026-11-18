@@ -346,3 +346,33 @@ def test_diagnostics_logs_and_selfcheck(v8_env):
     logs = client.get("/api/diagnostics/logs?limit=50", headers=_headers())
     assert logs.status_code == 200
     assert isinstance(logs.json()["logs"], list)
+
+
+def test_rendezvous_encrypt_decrypt_roundtrip():
+    import base64
+    import json as _json
+    import pytest
+    from bridge.rendezvous import decrypt_route_payload, encrypt_route_payload
+
+    token = "test-secret-token-v81"
+    payload = {
+        "public_url": "https://example.trycloudflare.com",
+        "lan_urls": ["http://192.168.31.190:8765"],
+        "tailscale_urls": ["https://dsh-pc.tail1e24af.ts.net", "http://100.88.121.40:8765"],
+    }
+    envelope = encrypt_route_payload(payload, token)
+    parsed = decrypt_route_payload(envelope, token)
+    assert parsed["public_url"] == payload["public_url"]
+    assert parsed["lan_urls"] == payload["lan_urls"]
+    assert parsed["tailscale_urls"] == payload["tailscale_urls"]
+
+    with pytest.raises(ValueError):
+        decrypt_route_payload(envelope, "wrong-token")
+
+    env_obj = _json.loads(envelope)
+    raw_ct = bytearray(base64.b64decode(env_obj["c"]))
+    raw_ct[0] ^= 0xFF
+    env_obj["c"] = base64.b64encode(bytes(raw_ct)).decode("ascii")
+    with pytest.raises(ValueError):
+        decrypt_route_payload(_json.dumps(env_obj), token)
+

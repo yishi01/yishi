@@ -83,6 +83,8 @@ class SettingsUpdateRequest(BaseModel):
     enable_tunnel: bool | None = None
     cloudflared_token: str | None = None
     public_url: str | None = None
+    rendezvous_gist_id: str | None = None
+    tailscale_urls: list[str] | None = None
     active_profile_id: str | None = None
     model_profiles: list[dict[str, Any]] | None = None
     search_config: dict[str, Any] | None = None
@@ -428,6 +430,11 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             await asyncio.sleep(0.5)
         return tunnel_manager.info()
 
+    @app.post("/api/tunnel/sync_rendezvous", dependencies=[Depends(require_auth)])
+    async def api_tunnel_sync_rendezvous() -> dict[str, Any]:
+        res = await asyncio.to_thread(tunnel_manager.publish_rendezvous_sync)
+        return {"result": res, "tunnel": tunnel_manager.info()}
+
     @app.get("/install.mobileconfig")
     def install_mobileconfig(url: str = Query(default="http://dsh-pc/")) -> Response:
         target_url = url.strip() or "http://dsh-pc/"
@@ -550,6 +557,10 @@ def create_app(data_dir: Path | None = None) -> FastAPI:
             cfg_data["cloudflared_token"] = body.cloudflared_token.strip()
         if body.public_url is not None:
             cfg_data["public_url"] = body.public_url.strip().rstrip("/")
+        if body.rendezvous_gist_id is not None:
+            cfg_data["rendezvous_gist_id"] = body.rendezvous_gist_id.strip()
+        if body.tailscale_urls is not None:
+            cfg_data["tailscale_urls"] = [str(u).strip().rstrip("/") for u in body.tailscale_urls if str(u).strip()]
 
         if body.model_profiles is not None:
             old_map = {
