@@ -5,6 +5,14 @@ import WebKit
 private struct SandboxHTMLWebView: UIViewRepresentable {
     let html: String
 
+    final class Coordinator {
+        var lastLoadedHTML: String?
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeUIView(context: Context) -> WKWebView {
         let cfg = WKWebViewConfiguration()
         cfg.defaultWebpagePreferences.allowsContentJavaScript = true
@@ -15,7 +23,10 @@ private struct SandboxHTMLWebView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        uiView.loadHTMLString(html, baseURL: nil)
+        if context.coordinator.lastLoadedHTML != html {
+            context.coordinator.lastLoadedHTML = html
+            uiView.loadHTMLString(html, baseURL: nil)
+        }
     }
 }
 

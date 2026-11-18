@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from bridge.utils import atomic_write_text
+
 VERSION = "0.9.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = Path(os.environ.get("PLUGIN_DATA") or (PROJECT_ROOT / "data"))
@@ -191,9 +193,7 @@ class BridgeConfig(BaseModel):
     cloudflared_token: str = ""
     public_url: str = ""
     rendezvous_gist_id: str = ""
-    tailscale_urls: list[str] = Field(
-        default_factory=lambda: ["https://dsh-pc.tail1e24af.ts.net", "http://100.88.121.40:8765"]
-    )
+    tailscale_urls: list[str] = Field(default_factory=list)
 
     # v0.8.0 extensions
     active_profile_id: str = ""
@@ -201,6 +201,12 @@ class BridgeConfig(BaseModel):
     search_config: dict[str, Any] = Field(default_factory=default_search_config)
     appearance_config: dict[str, Any] = Field(default_factory=default_appearance_config)
     dsh_profile_dir: str = ""
+
+    # v0.9.0 extensions (persisted when updated via /api/settings or services)
+    browser_policy: dict[str, Any] = Field(default_factory=dict)
+    wallet_rules: dict[str, Any] = Field(default_factory=dict)
+    wallet_config: dict[str, Any] = Field(default_factory=dict)
+    model_pricing: dict[str, Any] = Field(default_factory=dict)
 
     def ensure_v8_defaults(self) -> bool:
         changed = False
@@ -295,14 +301,30 @@ class BridgeConfig(BaseModel):
             base_url = prof_base or global_base
         prof_key = str(prof.get("api_key") or "").strip()
 
-        # Fall back to global deepseek_api_key when using DeepSeek endpoints and profile has no override
+        # Fall back to global deepseek_api_key only for DeepSeek profiles/endpoints
         global_key = self.deepseek_api_key.strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        prof_id_lower = str(prof.get("id") or "").lower()
+        is_deepseek_target = (
+            "deepseek" in base_url.lower()
+            or "deepseek" in model.lower()
+            or prof_id_lower.startswith("deepseek")
+            or not prof_id_lower
+        )
         if prof_key:
             api_key = prof_key
-        elif "deepseek" in base_url.lower() or "deepseek" in model.lower() or not prof.get("id"):
+        elif is_deepseek_target:
             api_key = global_key
         else:
-            api_key = os.environ.get(f"{provider.upper()}_API_KEY", "").strip() or global_key
+            env_candidates: list[str] = [f"{provider.upper()}_API_KEY"]
+            if provider == "anthropic" or "anthropic" in base_url.lower():
+                env_candidates.insert(0, "ANTHROPIC_API_KEY")
+            elif "openai.com" in base_url.lower():
+                env_candidates.insert(0, "OPENAI_API_KEY")
+            elif "openrouter.ai" in base_url.lower():
+                env_candidates.insert(0, "OPENROUTER_API_KEY")
+            elif "siliconflow" in base_url.lower():
+                env_candidates.insert(0, "SILICONFLOW_API_KEY")
+            api_key = next((os.environ.get(k, "").strip() for k in env_candidates if os.environ.get(k, "").strip()), "")
 
         return {
             "profile_id": str(prof.get("id") or self.active_profile_id),
@@ -333,6 +355,10 @@ class BridgeConfig(BaseModel):
     def effective_active_workspace(self) -> str:
         if self.active_workspace and Path(self.active_workspace).exists():
             return str(Path(self.active_workspace).resolve())
+        for ws in self.workspaces:
+            p = Path(ws)
+            if p.exists():
+                return str(p.resolve())
         if self.workspaces:
             return str(Path(self.workspaces[0]).resolve())
         return str(PROJECT_ROOT.resolve())
@@ -430,7 +456,12 @@ class ConfigStore:
         if env_host := os.environ.get("AGY_MOBILE_HOST", "").strip():
             cfg.host = env_host
         if env_port := os.environ.get("AGY_MOBILE_PORT", "").strip():
-            cfg.port = int(env_port)
+            try:
+                parsed_port = int(env_port)
+                if 1 <= parsed_port <= 65535:
+                    cfg.port = parsed_port
+            except ValueError:
+                pass
         if env_token := os.environ.get("AGY_MOBILE_TOKEN", "").strip():
             cfg.auth_token = env_token
 
@@ -472,10 +503,8 @@ class ConfigStore:
                 self.config = cfg
             self.config.ensure_v8_defaults()
             self.data_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self.config_path.with_suffix(f".json.tmp-{os.getpid()}-{threading.get_ident()}")
-            tmp.write_text(
+            atomic_write_text(
+                self.config_path,
                 json.dumps(self.config.model_dump(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
-            os.replace(tmp, self.config_path)
             return self.config

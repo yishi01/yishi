@@ -395,6 +395,7 @@ struct GitSettingsView: View {
                 }
                 .pickerStyle(.segmented)
                 .onChange(of: client.approvalMode) { _ in
+                    guard !client.isApplyingSettingsFromServer else { return }
                     Task { try? await client.saveSettings(apiKey: "") }
                 }
             }
@@ -765,6 +766,7 @@ struct GitSettingsView: View {
             }
             .pickerStyle(.segmented)
             .onChange(of: client.aiAccessMode) { _ in
+                guard !client.isApplyingSettingsFromServer else { return }
                 Task { try? await client.saveSettings(apiKey: "") }
             }
 
@@ -888,6 +890,10 @@ struct GitSettingsView: View {
                     Button(copiedTunnelURL ? "已复制" : "复制") {
                         UIPasteboard.general.string = client.savedPublicURL
                         copiedTunnelURL = true
+                        Task {
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                            copiedTunnelURL = false
+                        }
                     }
                     .font(.system(size: 11.5, weight: .semibold))
                 }
@@ -1074,8 +1080,12 @@ private struct ModelProfileEditorView: View {
                     Section {
                         Button("删除该模型配置", role: .destructive) {
                             Task {
-                                try? await onDelete(profile.id)
-                                dismiss()
+                                do {
+                                    try await onDelete(profile.id)
+                                    dismiss()
+                                } catch {
+                                    errText = error.localizedDescription
+                                }
                             }
                         }
                     }

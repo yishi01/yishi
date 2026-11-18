@@ -35,7 +35,6 @@ struct FilesView: View {
     @State private var createNameInput: String = ""
 
     @State private var showFileImporter: Bool = false
-    @State private var isUploadingOrDownloading: Bool = false
     @State private var statusBanner: String?
     @State private var downloadedShareItem: ShareSheetItem?
 
@@ -140,14 +139,12 @@ struct FilesView: View {
         ) { result in
             if case .success(let urls) = result, let firstURL = urls.first {
                 Task {
-                    isUploadingOrDownloading = true
                     do {
                         let res = try await client.uploadLocalFileToPC(fileURL: firstURL, targetDir: client.currentDir)
                         showToast("已上传至电脑: \(res.name)")
                     } catch {
                         client.fileError = "上传失败: \(error.localizedDescription)"
                     }
-                    isUploadingOrDownloading = false
                 }
             }
         }
@@ -729,12 +726,18 @@ struct FilesView: View {
                     }
 
                     Button(isSaving ? "保存中..." : "保存") {
+                        guard !isSaving else { return }
                         Haptics.medium()
                         Task {
                             isSaving = true
-                            try? await client.writePCFile(file.path, content: editorContent)
+                            do {
+                                try await client.writePCFile(file.path, content: editorContent)
+                                showToast("已保存修改: \(file.name)")
+                            } catch {
+                                client.fileError = "保存失败: \(error.localizedDescription)"
+                                showToast("保存失败: \(error.localizedDescription)")
+                            }
                             isSaving = false
-                            showToast("已保存修改: \(file.name)")
                         }
                     }
                     .fontWeight(.semibold)
@@ -778,14 +781,12 @@ struct FilesView: View {
 
     private func downloadFileToPhone(_ item: FileEntryItem) {
         Task {
-            isUploadingOrDownloading = true
             do {
                 let url = try await client.downloadPCFileToLocalTemp(pcPath: item.path, filename: item.name)
                 downloadedShareItem = ShareSheetItem(url: url)
             } catch {
                 client.fileError = "下载失败: \(error.localizedDescription)"
             }
-            isUploadingOrDownloading = false
         }
     }
 

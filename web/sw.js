@@ -23,6 +23,14 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(
-    fetch(event.request).catch(() => caches.match(event.request))
+    fetch(event.request)
+      .then((resp) => {
+        if (event.request.method === "GET" && resp && resp.ok && url.origin === self.location.origin) {
+          const clone = resp.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone)).catch(() => {});
+        }
+        return resp;
+      })
+      .catch(() => caches.match(event.request))
   );
 });

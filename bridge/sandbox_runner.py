@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from typing import Any
@@ -71,7 +72,7 @@ SECRET_PATH_PATTERNS = (
     r"AppData",
 )
 
-REGEX_RULES: list[tuple[str, str, str, str, tuple[str, ...]]] = [
+REGEX_RULES: list[tuple[str, str, str, tuple[str, ...], tuple[str, ...]]] = [
     ("critical", "远端脚本执行", "检测到直接从网络拉取并在本地执行命令 (curl/iwr | sh/iex)", ("powershell", "bash", "sh"),
      (r"(curl|wget|Invoke-WebRequest|iwr)\b.*\|.*(sh|bash|iex|Invoke-Expression)",)),
     ("critical", "破坏性删除", "检测到高危递归强制删除指令 (rm -rf / Remove-Item -Recurse)", ("powershell", "bash", "sh"),

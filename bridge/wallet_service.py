@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 import copy
 from datetime import datetime, timedelta
@@ -11,8 +12,11 @@ from pathlib import Path
 import threading
 import time
 from typing import Any
+from weakref import WeakKeyDictionary
 
 import httpx
+
+from bridge.utils import atomic_write_text
 
 DEFAULT_MODEL_PRICING: dict[str, dict[str, Any]] = {
     "deepseek-chat": {
@@ -88,6 +92,7 @@ class WalletService:
         self.usage_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.usage_dir / "wallet_state.json"
         self._state = self._load_state()
+        self._fetch_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
 
     # ------------------------------------------------------------------
     # State Persistence
@@ -100,6 +105,7 @@ class WalletService:
             "downgrade_triggered_at": "",
             "cached_balance": None,
             "cached_balance_ts": 0.0,
+            "manual_balance_baseline_cost": 0.0,
             "pricing": {},
             "rules": {},
         }
@@ -119,12 +125,10 @@ class WalletService:
     def _save_state(self) -> None:
         with self._lock:
             self.usage_dir.mkdir(parents=True, exist_ok=True)
-            tmp = self.state_path.with_suffix(f".json.tmp-{os.getpid()}-{threading.get_ident()}")
-            tmp.write_text(
+            atomic_write_text(
+                self.state_path,
                 json.dumps(self._state, indent=2, ensure_ascii=False),
-                encoding="utf-8",
             )
-            os.replace(tmp, self.state_path)
 
     # ------------------------------------------------------------------
     # Pricing & Rules Management
@@ -249,7 +253,14 @@ class WalletService:
         with self._lock:
             rules = self.get_rules()
             if isinstance(rules_updates, dict):
+                source = rules_updates.get("rules") if isinstance(rules_updates.get("rules"), dict) else rules_updates
                 self._apply_rules_dict(rules, rules_updates)
+                if isinstance(source, dict) and "manual_balance" in source:
+                    if rules.get("manual_balance") is not None:
+                        # Anchor baseline so historical spend before setting manual_balance isn't deducted twice
+                        self._state["manual_balance_baseline_cost"] = self._get_all_time_cost()
+                    else:
+                        self._state["manual_balance_baseline_cost"] = 0.0
             self._state["rules"] = copy.deepcopy(rules)
             # Reset sticky downgrade flag when user updates rules
             self._state["downgrade_active"] = False
@@ -473,8 +484,9 @@ class WalletService:
         currency = str(rules.get("currency") or "CNY")
         manual_bal = rules.get("manual_balance")
         if manual_bal is not None:
-            total_cost = self._get_all_time_cost()
-            est_balance = round(float(manual_bal) - total_cost, 4)
+            baseline = float(self._state.get("manual_balance_baseline_cost") or 0.0)
+            cost_since = max(0.0, self._get_all_time_cost() - baseline)
+            est_balance = round(float(manual_bal) - cost_since, 4)
             return {
                 "available": True,
                 "is_available": est_balance > 0,
@@ -520,6 +532,16 @@ class WalletService:
         return self._compute_fallback_balance(rules)
 
     async def fetch_balance(self, *, force: bool = False) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        fetch_lock = self._fetch_locks.get(loop)
+        if fetch_lock is None:
+            fetch_lock = asyncio.Lock()
+            self._fetch_locks[loop] = fetch_lock
+
+        async with fetch_lock:
+            return await self._fetch_balance_locked(force=force)
+
+    async def _fetch_balance_locked(self, *, force: bool = False) -> dict[str, Any]:
         rules = self.get_rules()
         now_ts = time.time()
 
@@ -601,12 +623,12 @@ class WalletService:
                             with self._lock:
                                 self._state["cached_balance"] = copy.deepcopy(bal_result)
                                 self._state["cached_balance_ts"] = time.time()
-                                self._save_state()
+                            await asyncio.to_thread(self._save_state)
                             return bal_result
                 except Exception:
                     continue
 
-        return self._compute_fallback_balance(rules)
+        return await asyncio.to_thread(self._compute_fallback_balance, rules)
 
     # ------------------------------------------------------------------
     # Auto-Downgrade Evaluation

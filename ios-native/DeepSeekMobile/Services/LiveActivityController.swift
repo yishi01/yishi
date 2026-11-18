@@ -3,6 +3,31 @@ import AVFoundation
 import Foundation
 import UIKit
 
+private final class BgTaskHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var taskId: UIBackgroundTaskIdentifier = .invalid
+
+    var current: UIBackgroundTaskIdentifier {
+        lock.lock()
+        defer { lock.unlock() }
+        return taskId
+    }
+
+    func set(_ id: UIBackgroundTaskIdentifier) {
+        lock.lock()
+        taskId = id
+        lock.unlock()
+    }
+
+    func take() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        let out = taskId
+        taskId = .invalid
+        lock.unlock()
+        return out
+    }
+}
+
 /// Doubao-style Dynamic Island Controller for Unjailbroken iOS + Pending Approval Review Banner.
 @MainActor
 final class LiveActivityController: ObservableObject {
@@ -10,8 +35,9 @@ final class LiveActivityController: ObservableObject {
 
     private var currentActivity: Activity<DeepSeekIslandAttributes>?
     private var retractTask: Task<Void, Never>?
-    private var bgTaskId: UIBackgroundTaskIdentifier = .invalid
+    private let bgTaskHolder = BgTaskHolder()
     private var audioEngine: AVAudioEngine?
+    private var interruptionObserver: NSObjectProtocol?
 
     private(set) var isInBackground: Bool = false
     private(set) var isTurnActive: Bool = false
@@ -32,7 +58,25 @@ final class LiveActivityController: ObservableObject {
         return true
     }
 
-    private init() {}
+    private init() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] note in
+            let typeRaw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let type = typeRaw.flatMap(AVAudioSession.InterruptionType.init(rawValue:))
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if type == .began {
+                    self.audioEngine?.stop()
+                    self.audioEngine = nil
+                } else if type == .ended, self.isInBackground, (self.isTurnActive || !self.pendingApprovalId.isEmpty) {
+                    self.startBackgroundKeepAlive()
+                }
+            }
+        }
+    }
 
     func setSceneBackground(_ inBackground: Bool) {
         isInBackground = inBackground
@@ -170,16 +214,15 @@ final class LiveActivityController: ObservableObject {
     }
 
     private func startBackgroundKeepAlive() {
-        if bgTaskId == .invalid {
-            bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "DeepSeekBridgeKeepAlive") { [weak self] in
-                Task { @MainActor in
-                    guard let self = self else { return }
-                    if self.bgTaskId != .invalid {
-                        UIApplication.shared.endBackgroundTask(self.bgTaskId)
-                        self.bgTaskId = .invalid
-                    }
+        if bgTaskHolder.current == .invalid {
+            let holder = bgTaskHolder
+            let newId = UIApplication.shared.beginBackgroundTask(withName: "DeepSeekBridgeKeepAlive") {
+                let expired = holder.take()
+                if expired != .invalid {
+                    UIApplication.shared.endBackgroundTask(expired)
                 }
             }
+            holder.set(newId)
         }
 
         guard audioEngine == nil else { return }
@@ -214,9 +257,9 @@ final class LiveActivityController: ObservableObject {
         audioEngine?.stop()
         audioEngine = nil
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        if bgTaskId != .invalid {
-            UIApplication.shared.endBackgroundTask(bgTaskId)
-            bgTaskId = .invalid
+        let activeId = bgTaskHolder.take()
+        if activeId != .invalid {
+            UIApplication.shared.endBackgroundTask(activeId)
         }
     }
 }

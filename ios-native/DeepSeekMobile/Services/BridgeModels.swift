@@ -214,12 +214,16 @@ struct FileEntryItem: Identifiable, Hashable {
     var formattedCtime: String { Self.formatTimestamp(ctime) }
     var formattedAtime: String { Self.formatTimestamp(atime) }
 
+    private static let timestampFormatter: DateFormatter = {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return fmt
+    }()
+
     static func formatTimestamp(_ ts: Double) -> String {
         guard ts > 0 else { return "-" }
         let d = Date(timeIntervalSince1970: ts)
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return fmt.string(from: d)
+        return timestampFormatter.string(from: d)
     }
 }
 

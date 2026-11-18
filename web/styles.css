@@ -1926,14 +1926,16 @@ select:focus {
   color: var(--accent);
 }
 
-.agent-status-badge.completed,
-.agent-status-badge.done {
+.agent-status-badge.waiting_input {
+  background: var(--amber-soft);
+  color: #92400e;
+}
+
+.agent-status-badge.idle {
   background: var(--green-soft);
   color: var(--green);
 }
 
-.agent-status-badge.failed,
-.agent-status-badge.cancelled,
 .agent-status-badge.error {
   background: var(--red-soft);
   color: var(--red);

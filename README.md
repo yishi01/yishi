@@ -1,6 +1,6 @@
-# DeepSeek Mobile Bridge v0.3.0 (iOS PWA)
+# DeepSeek Mobile Bridge v0.9.0 (iOS App & PWA)
 
-面向 **iOS（iPhone Safari / 主屏幕 PWA）** 与 **Windows 本地工作区** 的移动 AI 编程工作台，原生适配 **DeepSeek**（`deepseek-chat` / `deepseek-reasoner` 及任何 OpenAI 兼容接口）。
+面向 **iOS 原生客户端（SwiftUI + 灵动岛 + WKWebView）/ Safari PWA** 与 **Windows 本地工作区** 的移动 AI 编程工作台，原生适配 **DeepSeek**（`deepseek-chat` / `deepseek-reasoner` 及任何 OpenAI / 多模态兼容接口）。
 
 ## 架构与环境说明（免 Node.js）
 
@@ -8,8 +8,8 @@
 - **前端零构建**：`web/` 目录采用原生 ES Modules（`index.html`、`app.js`、`styles.css`、`sw.js`、`manifest.webmanifest`），**无需安装 Node.js 或 npm**。
 - **统一监听端口与健康检查**：
   - 默认监听：`http://127.0.0.1:8765`（配置位于 `data/config.json`，单实例 PID 记录于 `data/bridge.pid`，运行与崩溃日志落盘于 `data/bridge.log`）。
-  - 健康检查接口：`http://127.0.0.1:8765/health` 与 `http://127.0.0.1:8765/api/health`（返回 `{"status":"ok","version":"0.3.0","host":"127.0.0.1","port":8765}`）。
-  - Tailscale 转发：`100.88.121.40:80`（PID 7112 `tailscaled.exe`）会将 `http://dsh-pc/` 与 `http://dsh-pc.tail1e24af.ts.net/` 的请求代理至本机 `127.0.0.1:8765`（注意：Tailscale Serve 依据 `Host` 头路由，直接请求 `http://127.0.0.1:80/` 不会命中 Tailscale 虚拟主机，本地自检请访问 `http://127.0.0.1:8765/api/health` 或 `http://dsh-pc/api/health`）。
+  - 健康检查接口：`http://127.0.0.1:8765/health` 与 `http://127.0.0.1:8765/api/health`（返回 `{"status":"ok","version":"0.9.0","host":"127.0.0.1","port":8765}`）。
+  - 支持 Tailscale Serve 与 Cloudflare Tunnel / Gist 加密路由解析，本地自检请访问 `http://127.0.0.1:8765/api/health`。
 - **Git Diff 前置条件**：工作区需包含 `.git` 仓库（如 `git init`）才可展示分支与 Diff；若当前工作区非 Git 仓库，后端返回 `{"is_git_repo": false, "reason": "not_a_repo"}`，前端展示友好提示。
 
 ## 核心能力

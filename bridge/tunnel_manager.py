@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from bridge.config import PROJECT_ROOT, ConfigStore
 from bridge.rendezvous import publish_route_to_gist
@@ -35,6 +36,8 @@ class TunnelManager:
     def __init__(self, config_store: ConfigStore):
         self.config_store = config_store
         self._lock = threading.RLock()
+        self._publish_lock = threading.Lock()
+        self._op_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
         self.proc: subprocess.Popen[bytes] | None = None
         self.reader_thread: threading.Thread | None = None
         self.supervisor_task: asyncio.Task[None] | None = None
@@ -47,6 +50,14 @@ class TunnelManager:
         self.rendezvous_status: str = "idle"
         self.rendezvous_last_error: str = ""
         self.rendezvous_updated_at: int = 0
+
+    def _get_op_lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        lock = self._op_locks.get(loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._op_locks[loop] = lock
+        return lock
 
     def _find_binary(self) -> Path | None:
         local_bin = PROJECT_ROOT / "tools" / ("cloudflared.exe" if os.name == "nt" else "cloudflared")
@@ -78,23 +89,24 @@ class TunnelManager:
             self.status = "disabled_in_test"
             return
 
-        cfg = self.config_store.config
-        if cfg.rendezvous_gist_id.strip():
-            threading.Thread(target=self.publish_rendezvous_sync, daemon=True).start()
-        if not cfg.enable_tunnel:
-            self.status = "disabled"
-            return
+        async with self._get_op_lock():
+            cfg = self.config_store.config
+            if cfg.rendezvous_gist_id.strip():
+                threading.Thread(target=self.publish_rendezvous_sync, daemon=True).start()
+            if not cfg.enable_tunnel:
+                self.status = "disabled"
+                return
 
-        if not self._find_binary():
-            self.status = "missing_binary"
-            self.last_error = f"未找到 {PROJECT_ROOT / 'tools' / 'cloudflared.exe'}"
-            return
+            if not self._find_binary():
+                self.status = "missing_binary"
+                self.last_error = f"未找到 {PROJECT_ROOT / 'tools' / 'cloudflared.exe'}"
+                return
 
-        await self.stop()
-        self._stop_requested = False
-        self.restarts = 0
-        await asyncio.to_thread(self._spawn_process_sync)
-        self.supervisor_task = asyncio.create_task(self._supervisor_loop())
+            await self._stop_unlocked()
+            self._stop_requested = False
+            self.restarts = 0
+            await asyncio.to_thread(self._spawn_process_sync)
+            self.supervisor_task = asyncio.create_task(self._supervisor_loop())
 
     def _spawn_process_sync(self) -> None:
         binary = self._find_binary()
@@ -130,6 +142,7 @@ class TunnelManager:
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         with self._lock:
             self.status = "starting"
+            self.live_url = ""
             self.last_error = ""
             self.recent_logs.clear()
         try:
@@ -155,12 +168,15 @@ class TunnelManager:
             return
         try:
             for raw_line in iter(proc.stdout.readline, b""):
-                if self._stop_requested:
-                    break
+                with self._lock:
+                    if self._stop_requested or proc is not self.proc:
+                        break
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
                     continue
                 with self._lock:
+                    if proc is not self.proc:
+                        break
                     self.recent_logs.append(line)
                     if len(self.recent_logs) > 40:
                         self.recent_logs = self.recent_logs[-25:]
@@ -170,7 +186,7 @@ class TunnelManager:
                     url = m.group(0)
                     changed = False
                     with self._lock:
-                        if url != self.live_url:
+                        if proc is self.proc and url != self.live_url:
                             self.live_url = url
                             self.status = "connected"
                             changed = True
@@ -181,25 +197,46 @@ class TunnelManager:
 
                 if "Registered tunnel connection" in line:
                     with self._lock:
-                        self.status = "connected"
-                        if self.config_store.config.public_url and not self.live_url:
-                            self.live_url = self.config_store.config.public_url
+                        if proc is self.proc:
+                            self.status = "connected"
+                            if self.config_store.config.public_url and not self.live_url:
+                                self.live_url = self.config_store.config.public_url
 
                 if "ERR" in line and "trycloudflare" not in line.lower():
                     with self._lock:
-                        self.last_error = line[-200:]
+                        if proc is self.proc:
+                            self.last_error = line[-200:]
 
             rc = proc.wait()
             with self._lock:
-                if not self._stop_requested and self.status not in ("stopping", "stopped"):
+                if proc is self.proc and not self._stop_requested and self.status not in ("stopping", "stopped"):
                     self.status = "restarting"
                     if not self.last_error:
                         self.last_error = f"cloudflared exited with code {rc}"
         except Exception as exc:
             with self._lock:
-                if not self._stop_requested:
+                if proc is self.proc and not self._stop_requested:
                     self.status = "restarting"
                     self.last_error = str(exc)
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _terminate_proc_sync(proc: subprocess.Popen[bytes]) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=3.0)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=2.0)
+            except Exception:
+                pass
 
     async def _supervisor_loop(self) -> None:
         """Keep cloudflared alive automatically across transient network drops, boot delays, or crashes."""
@@ -212,28 +249,30 @@ class TunnelManager:
             cfg = self.config_store.config
             if not cfg.enable_tunnel:
                 break
-            proc = self.proc
+            with self._lock:
+                proc = self.proc
+                status_snap = self.status
+                live_snap = self.live_url
+                err_snap = self.last_error
             stalled_at_boot = (
-                self.status == "starting"
-                and not self.live_url
+                status_snap == "starting"
+                and not live_snap
                 and (time.time() - starting_since) > 45.0
             )
             if proc is None or proc.poll() is not None or stalled_at_boot:
-                reason = "boot/network handshake timeout" if stalled_at_boot else (self.last_error or "process exited")
+                reason = "boot/network handshake timeout" if stalled_at_boot else (err_snap or "process exited")
                 logger.warning("Cloudflare Tunnel restarting (%s) in %.1fs...", reason, backoff)
                 if proc is not None and proc.poll() is None:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
+                    await asyncio.to_thread(self._terminate_proc_sync, proc)
                 await asyncio.sleep(backoff)
                 if self._stop_requested:
                     break
-                self.restarts += 1
+                with self._lock:
+                    self.restarts += 1
                 backoff = min(30.0, backoff * 1.6)
                 starting_since = time.time()
                 await asyncio.to_thread(self._spawn_process_sync)
-            elif self.status == "connected":
+            elif status_snap == "connected":
                 backoff = 2.0
                 starting_since = time.time()
 
@@ -270,6 +309,10 @@ class TunnelManager:
     def publish_rendezvous_sync(self, url: str | None = None) -> dict[str, Any]:
         if os.environ.get("PYTEST_CURRENT_TEST"):
             return {"ok": False, "skipped": "pytest"}
+        with self._publish_lock:
+            return self._publish_rendezvous_unlocked(url)
+
+    def _publish_rendezvous_unlocked(self, url: str | None = None) -> dict[str, Any]:
         try:
             cfg = self.config_store.config
             target_url = (url or self.live_url or cfg.public_url or "").strip().rstrip("/")
@@ -338,9 +381,14 @@ class TunnelManager:
             pass
 
     async def stop(self) -> None:
+        async with self._get_op_lock():
+            await self._stop_unlocked()
+
+    async def _stop_unlocked(self) -> None:
         self._stop_requested = True
         with self._lock:
             self.status = "stopping"
+            self.live_url = ""
         if self.supervisor_task and not self.supervisor_task.done():
             self.supervisor_task.cancel()
             try:
@@ -351,16 +399,8 @@ class TunnelManager:
 
         proc = self.proc
         if proc is not None and proc.poll() is None:
-            def _kill_sync() -> None:
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=4.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-            await asyncio.to_thread(_kill_sync)
+            await asyncio.to_thread(self._terminate_proc_sync, proc)
         with self._lock:
             self.proc = None
+            self.live_url = ""
             self.status = "stopped"

@@ -16,6 +16,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from bridge.utils import atomic_write_text, normalize_windows_drive_path
+
 SKIP_DIRS = {
     ".git",
     ".venv",
@@ -41,7 +43,7 @@ def _is_within_any_workspace(target: Path, allowed_workspaces: list[str]) -> boo
     try:
         resolved = target.resolve()
     except OSError:
-        resolved = target
+        return False
     for ws in allowed_workspaces:
         try:
             ws_root = Path(ws).resolve()
@@ -85,7 +87,11 @@ def resolve_ai_path(
         return root
 
     p = Path(clean)
-    if p.is_absolute() or (len(clean) >= 2 and clean[1] == ":"):
+    if len(clean) >= 2 and clean[0].isalpha() and clean[1] == ":":
+        if len(clean) == 2 or clean[2] not in ("\\", "/"):
+            raise WorkspaceSecurityError("Drive-relative paths like 'C:file' are not allowed; use full path or workspace-relative path.")
+        target = Path(clean).resolve()
+    elif p.is_absolute():
         target = p.resolve()
     else:
         target = (root / clean.replace("\\", "/")).resolve()
@@ -226,15 +232,16 @@ def get_pc_entry_metadata(
     is_dir = target.is_dir()
     ext = "" if is_dir else target.suffix.lower()
     mime, _ = mimetypes.guess_type(target.name)
-    in_ws = _is_within_any_workspace(target, allowed_workspaces)
+    resolved = target.resolve()
+    in_ws = _is_within_any_workspace(resolved, allowed_workspaces)
     ai_can_read = in_ws or ai_access_mode in ("workspace_read_all", "full_access")
     ai_can_write = in_ws or ai_access_mode == "full_access"
     is_readonly = not os.access(target, os.W_OK)
 
     return {
         "name": target.name or str(target),
-        "path": str(target.resolve()),
-        "parent_path": str(target.resolve().parent) if target.resolve().parent != target.resolve() else "",
+        "path": str(resolved),
+        "parent_path": str(resolved.parent) if resolved.parent != resolved else "",
         "is_dir": is_dir,
         "size": 0 if is_dir else st.st_size,
         "mtime": st.st_mtime,
@@ -258,12 +265,10 @@ def list_pc_directory(
     show_hidden: bool = False,
 ) -> dict[str, Any]:
     """List any directory on the PC (C:\\, D:\\, E:\\, etc.) with full metadata."""
-    clean = (path_str or "").strip()
+    clean = normalize_windows_drive_path(path_str)
     if not clean:
         target = Path(allowed_workspaces[0]).resolve() if allowed_workspaces else Path("C:\\" if os.name == "nt" else "/")
     else:
-        if len(clean) == 2 and clean[1] == ":":
-            clean = clean + "\\"
         target = Path(clean).resolve()
 
     if not target.exists():
@@ -307,9 +312,7 @@ def stat_pc_entry(
     ai_access_mode: str = "workspace_only",
 ) -> dict[str, Any]:
     """Return detailed properties for any file or folder on the PC."""
-    clean = path_str.strip()
-    if len(clean) == 2 and clean[1] == ":":
-        clean += "\\"
+    clean = normalize_windows_drive_path(path_str)
     target = Path(clean).resolve()
     if not target.exists():
         raise FileNotFoundError(f"文件或目录不存在: {path_str}")
@@ -328,7 +331,7 @@ def stat_pc_entry(
 
 def read_pc_file(path_str: str, *, max_bytes: int = 2_000_000) -> dict[str, Any]:
     """Read any text file on the PC for the mobile user."""
-    target = Path(path_str.strip()).resolve()
+    target = Path(normalize_windows_drive_path(path_str)).resolve()
     if not target.exists():
         raise FileNotFoundError(f"文件不存在: {path_str}")
     if target.is_dir():
@@ -360,7 +363,7 @@ def read_pc_file(path_str: str, *, max_bytes: int = 2_000_000) -> dict[str, Any]
             "content": "",
         }
 
-    for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
         try:
             text = raw.decode(enc)
             return {
@@ -369,7 +372,7 @@ def read_pc_file(path_str: str, *, max_bytes: int = 2_000_000) -> dict[str, Any]
                 "ext": target.suffix.lower(),
                 "size": st.st_size,
                 "mtime": st.st_mtime,
-                "encoding": enc,
+                "encoding": "utf-8" if enc == "utf-8-sig" else enc,
                 "is_binary": False,
                 "too_large": False,
                 "content": text,
@@ -391,11 +394,10 @@ def read_pc_file(path_str: str, *, max_bytes: int = 2_000_000) -> dict[str, Any]
 
 def write_pc_file(path_str: str, content: str) -> dict[str, Any]:
     """Write text content to any file on the PC on behalf of the authenticated mobile user."""
-    target = Path(path_str.strip()).resolve()
+    target = Path(normalize_windows_drive_path(path_str)).resolve()
     if target.exists() and target.is_dir():
         raise IsADirectoryError(f"该路径是目录: {path_str}")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    atomic_write_text(target, content)
     st = target.stat()
     return {
         "path": str(target),
@@ -406,14 +408,13 @@ def write_pc_file(path_str: str, content: str) -> dict[str, Any]:
 
 
 def create_pc_entry(path_str: str, *, is_dir: bool = False, content: str = "") -> dict[str, Any]:
-    target = Path(path_str.strip()).resolve()
+    target = Path(normalize_windows_drive_path(path_str)).resolve()
     if target.exists():
         raise FileExistsError(f"已存在同名文件或目录: {target.name}")
     if is_dir:
         target.mkdir(parents=True, exist_ok=True)
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        atomic_write_text(target, content)
     st = target.stat()
     return {
         "path": str(target),
@@ -425,26 +426,28 @@ def create_pc_entry(path_str: str, *, is_dir: bool = False, content: str = "") -
 
 
 def rename_or_move_pc_entry(src_path: str, dst_path: str, *, overwrite: bool = False) -> dict[str, Any]:
-    src = Path(src_path.strip()).resolve()
-    dst = Path(dst_path.strip()).resolve()
+    src = Path(normalize_windows_drive_path(src_path)).resolve()
+    dst = Path(normalize_windows_drive_path(dst_path)).resolve()
     if not src.exists():
         raise FileNotFoundError(f"源路径不存在: {src}")
     if src.parent == src:
         raise PermissionError("不能移动磁盘根目录")
-    if dst.exists() and dst.is_dir() and dst != src.parent:
-        # If destination is an existing directory and doesn't include the filename yet
-        if dst.name != src.name or dst.parent != src.parent:
-            pass
-    if dst.exists() and not overwrite:
-        raise FileExistsError(f"目标已存在: {dst}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(src), str(dst))
-    return {"path": str(dst), "name": dst.name}
+    if dst.exists() and dst.is_dir() and dst != src:
+        final_dst = dst / src.name
+    else:
+        final_dst = dst
+    if final_dst == src:
+        return {"path": str(src), "name": src.name}
+    if final_dst.exists() and not overwrite:
+        raise FileExistsError(f"目标已存在: {final_dst}")
+    final_dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(final_dst))
+    return {"path": str(final_dst), "name": final_dst.name}
 
 
 def copy_pc_entry(src_path: str, dst_path: str, *, overwrite: bool = False) -> dict[str, Any]:
-    src = Path(src_path.strip()).resolve()
-    dst = Path(dst_path.strip()).resolve()
+    src = Path(normalize_windows_drive_path(src_path)).resolve()
+    dst = Path(normalize_windows_drive_path(dst_path)).resolve()
     if not src.exists():
         raise FileNotFoundError(f"源路径不存在: {src}")
 
@@ -467,7 +470,7 @@ def copy_pc_entry(src_path: str, dst_path: str, *, overwrite: bool = False) -> d
 
 
 def delete_pc_entry(path_str: str) -> dict[str, Any]:
-    target = Path(path_str.strip()).resolve()
+    target = Path(normalize_windows_drive_path(path_str)).resolve()
     if not target.exists():
         raise FileNotFoundError(f"路径不存在: {target}")
     if target.parent == target:
@@ -586,25 +589,25 @@ def read_file_content(
             "content": "",
         }
 
-    try:
-        text = raw.decode("utf-8")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
+    for enc in ("utf-8-sig", "utf-8", "gbk"):
         try:
-            text = raw.decode("gbk")
-            encoding = "gbk"
+            text = raw.decode(enc)
+            encoding = "utf-8" if enc == "utf-8-sig" else enc
+            break
         except UnicodeDecodeError:
-            return {
-                "path": rel,
-                "abs_path": str(target),
-                "name": target.name,
-                "ext": target.suffix.lower(),
-                "size": stat.st_size,
-                "mtime": stat.st_mtime,
-                "is_binary": True,
-                "too_large": False,
-                "content": "",
-            }
+            continue
+    else:
+        return {
+            "path": rel,
+            "abs_path": str(target),
+            "name": target.name,
+            "ext": target.suffix.lower(),
+            "size": stat.st_size,
+            "mtime": stat.st_mtime,
+            "is_binary": True,
+            "too_large": False,
+            "content": "",
+        }
 
     return {
         "path": rel,
@@ -650,8 +653,7 @@ def write_file_content(
                 f"File '{rel_path}' was modified externally since it was opened."
             )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
+    atomic_write_text(target, content)
     stat = target.stat()
     return {
         "path": to_rel_posix(workspace_root, target),
@@ -679,8 +681,7 @@ def create_entry(
     if is_dir:
         target.mkdir(parents=True, exist_ok=True)
     else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        atomic_write_text(target, content)
     stat = target.stat()
     return {
         "path": to_rel_posix(workspace_root, target),
@@ -733,12 +734,21 @@ def search_workspace(
         return {"matches": []}
 
     matches: list[dict[str, Any]] = []
+    visited_dirs: set[tuple[int, int]] = set()
 
     def _walk(directory: Path) -> None:
         if len(matches) >= max_results:
             return
         try:
-            items = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            dir_resolved = directory.resolve()
+            if dir_resolved != root and not dir_resolved.is_relative_to(root):
+                return
+            st_dir = dir_resolved.stat()
+            inode_key = (st_dir.st_dev, st_dir.st_ino)
+            if st_dir.st_ino and inode_key in visited_dirs:
+                return
+            visited_dirs.add(inode_key)
+            items = sorted(dir_resolved.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         except OSError:
             return
         for item in items:
@@ -746,9 +756,15 @@ def search_workspace(
                 return
             if item.name in SKIP_DIRS:
                 continue
-            rel = to_rel_posix(root, item)
-            if item.is_dir():
-                _walk(item)
+            try:
+                item_resolved = item.resolve()
+            except OSError:
+                continue
+            if item_resolved != root and not item_resolved.is_relative_to(root):
+                continue
+            rel = to_rel_posix(root, item_resolved)
+            if item_resolved.is_dir():
+                _walk(item_resolved)
                 continue
 
             if needle in rel.lower():
@@ -757,12 +773,15 @@ def search_workspace(
                     return
 
             try:
-                if item.stat().st_size > 512_000:
+                if item_resolved.stat().st_size > 512_000:
                     continue
-                raw = item.read_bytes()
+                raw = item_resolved.read_bytes()
                 if b"\x00" in raw[:4096]:
                     continue
-                text = raw.decode("utf-8", errors="ignore")
+                try:
+                    text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    text = raw.decode("gbk", errors="ignore")
             except OSError:
                 continue
 
@@ -825,17 +844,20 @@ async def git_status_and_diff(
                 fpath = fpath.split(" -> ", 1)[1]
             files.append({"status": code.strip() or "?", "path": fpath})
 
-        diff_args = ["diff", "HEAD"]
+        diff_rel: str | None = None
         if rel_path:
             safe = resolve_workspace_path(workspace_root, rel_path)
-            diff_args.extend(["--", to_rel_posix(workspace_root, safe)])
+            diff_rel = to_rel_posix(workspace_root, safe)
+
+        diff_args = ["diff", "HEAD"]
+        if diff_rel:
+            diff_args.extend(["--", diff_rel])
 
         rc_diff, diff_out, _ = _run_git(workspace_root, diff_args)
         if rc_diff != 0:
             fallback_args = ["diff"]
-            if rel_path:
-                safe = resolve_workspace_path(workspace_root, rel_path)
-                fallback_args.extend(["--", to_rel_posix(workspace_root, safe)])
+            if diff_rel:
+                fallback_args.extend(["--", diff_rel])
             _, diff_out, _ = _run_git(workspace_root, fallback_args)
 
         return {

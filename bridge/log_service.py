@@ -45,12 +45,15 @@ class RingBufferLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = self.format(record) if self.formatter else record.getMessage()
-            if record.exc_info and not msg.endswith("\n"):
-                import traceback
+            if self.formatter:
+                msg = self.format(record)
+            else:
+                msg = record.getMessage()
+                if record.exc_info:
+                    import traceback
 
-                tb = "".join(traceback.format_exception(*record.exc_info))
-                msg = f"{msg}\n{tb.rstrip()}"
+                    tb = "".join(traceback.format_exception(*record.exc_info))
+                    msg = f"{msg}\n{tb.rstrip()}"
             # Truncate pathological log lines to keep mobile log payloads snappy
             if len(msg) > 2000:
                 msg = msg[:2000] + " ...[truncated]"
@@ -68,20 +71,6 @@ class RingBufferLogHandler(logging.Handler):
                 )
         except Exception:
             pass
-
-    def push(self, level: str, logger_name: str, message: str, source: str = "pc") -> dict[str, Any]:
-        with self._lock:
-            self._seq += 1
-            entry = LogEntry(
-                seq=self._seq,
-                ts=_utc_iso(),
-                level=level.upper(),
-                logger=logger_name,
-                message=message[:2000],
-                source=source,
-            )
-            self._entries.append(entry)
-            return entry.to_dict()
 
     def query(
         self,
@@ -240,9 +229,14 @@ def install_log_capture() -> RingBufferLogHandler:
         fmt = logging.Formatter("%(message)s")
         _LOG_HANDLER.setFormatter(fmt)
         _LOG_HANDLER.setLevel(logging.INFO)
-        for name in ("", "bridge", "uvicorn.error", "uvicorn.access"):
+        root_lg = logging.getLogger("")
+        if _LOG_HANDLER not in root_lg.handlers:
+            root_lg.addHandler(_LOG_HANDLER)
+        if root_lg.level == logging.NOTSET or root_lg.level > logging.INFO:
+            root_lg.setLevel(logging.INFO)
+        for name in ("bridge", "uvicorn.error", "uvicorn.access"):
             lg = logging.getLogger(name)
-            if _LOG_HANDLER not in lg.handlers:
+            if not lg.propagate and _LOG_HANDLER not in lg.handlers:
                 lg.addHandler(_LOG_HANDLER)
             if lg.level == logging.NOTSET or lg.level > logging.INFO:
                 lg.setLevel(logging.INFO)
@@ -297,7 +291,11 @@ def collect_pc_diagnostics(
             "provider": active_prof.get("provider", "openai_compatible"),
             "model": getattr(cfg, "model", ""),
             "base_url": getattr(cfg, "deepseek_base_url", ""),
-            "api_key_configured": bool(getattr(cfg, "deepseek_api_key", "")),
+            "api_key_configured": bool(
+                cfg.effective_api_key()
+                if hasattr(cfg, "effective_api_key")
+                else getattr(cfg, "deepseek_api_key", "")
+            ),
             "profiles_count": len(getattr(cfg, "model_profiles", []) or []),
         },
         "search": {
@@ -346,7 +344,11 @@ async def run_pc_self_check(
     # 2. Active Model API Key
     t0 = time.perf_counter()
     active_prof = cfg.get_active_profile() if hasattr(cfg, "get_active_profile") else {}
-    api_key = active_prof.get("api_key") or getattr(cfg, "deepseek_api_key", "")
+    api_key = (
+        cfg.effective_api_key()
+        if hasattr(cfg, "effective_api_key")
+        else (active_prof.get("api_key") or getattr(cfg, "deepseek_api_key", ""))
+    )
     if api_key:
         add_check(
             "model_key",
@@ -386,7 +388,7 @@ async def run_pc_self_check(
     # 5. DSH Plugins Service
     t0 = time.perf_counter()
     try:
-        ps = plugin_service.summary()
+        ps = await asyncio.to_thread(plugin_service.summary)
         add_check(
             "plugins",
             "DSH 插件运行时",

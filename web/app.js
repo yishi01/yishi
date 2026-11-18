@@ -173,8 +173,8 @@ function renderInlineMarkdown(escapedLine, inlineCodes) {
   });
 
   out = out.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+    /\[([^\]]+)\]\((https?:\/\/[^\s)"'<>]+)\)/g,
+    (_m, label, url) => `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`
   );
 
   out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -479,15 +479,9 @@ $("workspace-profile-select")?.addEventListener("change", async (e) => {
 async function activateWorkspaceProfile(profileId) {
   state.activeWorkspaceProfileId = profileId;
   localStorage.setItem(ACTIVE_WS_PROFILE_KEY, profileId);
-  try {
-    await api(`/api/workspace-profiles/${encodeURIComponent(profileId)}/activate`, {
-      method: "POST",
-    });
-  } catch {
-    // Fallback if server uses PUT /api/workspace-profiles/{id} or settings
-  }
+  closeEditorPane(true);
   const prof = state.workspaceProfiles.find((p) => p.id === profileId);
-  const rootDir = prof?.root_dir || prof?.workspace || "";
+  const rootDir = (Array.isArray(prof?.root_paths) && prof.root_paths[0]) || prof?.root_dir || prof?.workspace || "";
   if (rootDir) {
     state.workspace = rootDir;
     localStorage.setItem(ACTIVE_WS_KEY, rootDir);
@@ -500,6 +494,10 @@ async function activateWorkspaceProfile(profileId) {
       }
       $("workspace-select").value = rootDir;
     }
+    api("/api/settings", {
+      method: "PUT",
+      body: JSON.stringify({ active_workspace: rootDir }),
+    }).catch(() => {});
     await loadDirectory("").catch(() => {});
     await refreshGitStatus().catch(() => {});
   }
@@ -540,7 +538,8 @@ function populateWsModalFields(profileId) {
   }
   const p = state.workspaceProfiles.find((item) => item.id === profileId);
   $("ws-modal-name").value = p?.name || "";
-  $("ws-modal-root").value = p?.root_dir || p?.workspace || state.workspace || "";
+  $("ws-modal-root").value =
+    (Array.isArray(p?.root_paths) && p.root_paths[0]) || p?.root_dir || p?.workspace || state.workspace || "";
   $("ws-modal-notes").value = p?.shared_notes || "";
   $("ws-modal-cross-read").checked = p?.cross_session_read !== false;
   $("ws-modal-delete-btn").disabled = profileId === "ws_default" || state.workspaceProfiles.length <= 1;
@@ -557,10 +556,10 @@ $("ws-modal-new-btn")?.addEventListener("click", () => {
 
 $("ws-modal-save-btn")?.addEventListener("click", async () => {
   const selId = $("ws-modal-select").value;
+  const rootVal = $("ws-modal-root").value.trim() || state.workspace;
   const payload = {
     name: $("ws-modal-name").value.trim() || "未命名工作区",
-    root_dir: $("ws-modal-root").value.trim() || state.workspace,
-    workspace: $("ws-modal-root").value.trim() || state.workspace,
+    root_paths: rootVal ? [rootVal] : [],
     shared_notes: $("ws-modal-notes").value,
     cross_session_read: $("ws-modal-cross-read").checked,
   };
@@ -699,8 +698,12 @@ function renderSessionList() {
     del.addEventListener("click", async (e) => {
       e.stopPropagation();
       if (!confirm(`删除会话 "${s.title}"？`)) return;
-      await api(`/api/sessions/${s.session_id}`, { method: "DELETE" });
-      await loadSessions();
+      try {
+        await api(`/api/sessions/${s.session_id}`, { method: "DELETE" });
+        await loadSessions();
+      } catch (err) {
+        showToast(err.message);
+      }
     });
 
     actions.append(ren, del);
@@ -740,6 +743,7 @@ $("header-session-title")?.addEventListener("click", () => {
 
 async function selectSession(sessionId) {
   state.activeSessionId = sessionId;
+  state.activeBrowserId = null;
   localStorage.setItem(ACTIVE_SESSION_KEY, sessionId);
   state.lastSeq = 0;
   state.currentTurn = null;
@@ -1260,7 +1264,16 @@ function renderEvent(ev) {
 
   // Module C WebSocket events
   if (ev.type === "session_updated") {
-    updateSessionMeta(d.session || d);
+    if (!d.session) updateSessionMeta(d);
+    return;
+  }
+
+  if (ev.type === "queue_updated") {
+    const qCount = Number(d.queued_count ?? d.queued_messages?.length ?? 0);
+    const pill = $("agent-state-pill");
+    if (pill && qCount > 0) {
+      pill.textContent = `DeepSeek 运行中 (队列 ${qCount})...`;
+    }
     return;
   }
 
@@ -1290,7 +1303,7 @@ function renderEvent(ev) {
     banner.className = "model-switch-banner";
     if (turnId) banner.dataset.turnId = turnId;
     const fromModel = d.from_model || d.from_profile_id || "原模型";
-    const toModel = d.model || d.profile_id || "deepseek-flash";
+    const toModel = d.to_model || d.model || d.profile_id || "deepseek-flash";
     const reason = d.reason || "触发额度/余额降级规则";
     banner.innerHTML = `<span>⚡ <strong>自动降级已生效</strong>: ${escapeHtml(fromModel)} → <strong>${escapeHtml(toModel)}</strong> (${escapeHtml(reason)})</span>`;
     box.appendChild(banner);
@@ -1445,17 +1458,6 @@ function renderEvent(ev) {
           : JSON.stringify(d.result, null, 2);
     }
     turn.toolsBadge.textContent = `已收纳 · ${turn.toolCount} 次 (${turn.lastToolName || d.name || "完成"})`;
-
-    // If tool_result returned a screenshot attachment or browser state, render it inline
-    const resObj = typeof d.result === "object" && d.result ? d.result : null;
-    if (resObj?.att_id || resObj?.attachment?.att_id) {
-      ensureAssistantBubble(turn);
-      const grid = renderTurnAttachmentsGrid([resObj.attachment || resObj]);
-      if (grid) turn.assistantEl.insertBefore(grid, turn.assistantFooterEl);
-    }
-    if (resObj?.browser_id && (resObj?.frame_b64 || resObj?.last_frame_b64 || resObj?.url)) {
-      renderOrUpdateBrowserCard(resObj, turnId);
-    }
   } else if (ev.type === "text_delta") {
     if (state.wsSynced) setDynamicIslandState("answering");
     const turn = ensureCurrentTurn(turnId);
@@ -1507,6 +1509,7 @@ function renderEvent(ev) {
       }
     }
     state.currentTurn = null;
+    state.activeTurnId = "";
     state.resolvingIds.clear();
     $("agent-state-pill").textContent = "空闲";
     $("send-btn").classList.remove("hidden");
@@ -1516,6 +1519,7 @@ function renderEvent(ev) {
     if (state.wsSynced) setDynamicIslandState("idle");
     finalizeTurnDrawers(state.currentTurn);
     state.currentTurn = null;
+    state.activeTurnId = "";
     state.resolvingIds.clear();
     const div = document.createElement("div");
     div.className = "msg error";
@@ -1742,15 +1746,15 @@ function renderOrUpdateBrowserCard(snap, turnId = "") {
       }
     });
 
-    card.querySelector('[data-bact="back"]').addEventListener("click", () => sendBrowserInput(browserId, { action: "back", actor: "human" }));
-    card.querySelector('[data-bact="forward"]').addEventListener("click", () => sendBrowserInput(browserId, { action: "forward", actor: "human" }));
-    card.querySelector('[data-bact="reload"]').addEventListener("click", () => sendBrowserInput(browserId, { action: "reload", actor: "human" }));
+    card.querySelector('[data-bact="back"]').addEventListener("click", () => sendBrowserNavAction(browserId, "back"));
+    card.querySelector('[data-bact="forward"]').addEventListener("click", () => sendBrowserNavAction(browserId, "forward"));
+    card.querySelector('[data-bact="reload"]').addEventListener("click", () => sendBrowserNavAction(browserId, "reload"));
     card.querySelector('[data-bact="scroll-up"]').addEventListener("click", () => sendBrowserInput(browserId, { action: "scroll", delta_y: -360, actor: "human" }));
     card.querySelector('[data-bact="scroll-down"]').addEventListener("click", () => sendBrowserInput(browserId, { action: "scroll", delta_y: 360, actor: "human" }));
 
     card.querySelector('[data-bact="zoom"]').addEventListener("click", () => {
       const vpImg = card.querySelector(".browser-viewport-img");
-      if (vpImg?.src) openLightbox(vpImg.src, `${snap.title || "协同浏览器"} (${snap.url || ""})`);
+      if (vpImg?.src) openLightbox(vpImg.src, `${card.dataset.title || "协同浏览器"} (${card.dataset.url || ""})`);
     });
 
     card.querySelector('[data-bact="control"]').addEventListener("click", async () => {
@@ -1785,6 +1789,8 @@ function renderOrUpdateBrowserCard(snap, turnId = "") {
 
   // Update state in card
   card.dataset.controlOwner = snap.control_owner || "agent";
+  card.dataset.title = snap.title || "";
+  card.dataset.url = snap.url || "";
   const urlInput = card.querySelector(".browser-url-input");
   if (urlInput && document.activeElement !== urlInput) {
     urlInput.value = snap.url || "about:blank";
@@ -1829,7 +1835,7 @@ function renderOrUpdateBrowserCard(snap, turnId = "") {
         chip.type = "button";
         chip.className = "browser-el-chip";
         const isInput = ["input", "textarea", "select"].includes(String(el.tag || "").toLowerCase()) && !["submit", "button"].includes(String(el.type || "").toLowerCase());
-        chip.innerHTML = `<strong>[${el.id}]</strong> ${escapeHtml((isInput ? "⌨️ " : "") + (el.text || el.placeholder || el.value || el.tag || ""))}`;
+        chip.innerHTML = `<strong>[${escapeHtml(el.id)}]</strong> ${escapeHtml((isInput ? "⌨️ " : "") + (el.text || el.placeholder || el.value || el.tag || ""))}`;
         chip.addEventListener("click", () => {
           if (isInput) {
             const val = prompt(`向元素 [${el.id}] (${el.text || el.placeholder || "输入框"}) 输入文本：`, el.value || "");
@@ -1861,6 +1867,17 @@ async function sendBrowserInput(browserId, payload) {
     const res = await api(`/api/browser/sessions/${encodeURIComponent(browserId)}/input`, {
       method: "POST",
       body: JSON.stringify(payload),
+    });
+    renderOrUpdateBrowserCard(res.browser || res);
+  } catch (err) {
+    showToast(err.message);
+  }
+}
+
+async function sendBrowserNavAction(browserId, action) {
+  try {
+    const res = await api(`/api/browser/sessions/${encodeURIComponent(browserId)}/${action}`, {
+      method: "POST",
     });
     renderOrUpdateBrowserCard(res.browser || res);
   } catch (err) {
@@ -1905,9 +1922,11 @@ function renderOrUpdateAgentTeamCard(data, turnId = "") {
   for (const ag of agents) {
     const row = document.createElement("div");
     row.className = "agent-member-row";
-    const status = ag.status || "running";
-    const costStr = ag.cost !== undefined ? ` · ¥${Number(ag.cost || 0).toFixed(4)}` : "";
+    const status = ag.status || "idle";
+    const costVal = ag.usage?.cost !== undefined ? ag.usage.cost : ag.cost;
+    const costStr = costVal !== undefined ? ` · ¥${Number(costVal || 0).toFixed(4)}` : "";
     const roundsStr = ag.rounds !== undefined ? ` · ${ag.rounds} 轮` : "";
+    const detailText = ag.task || ag.summary_text || "";
     row.innerHTML = `
       <div class="agent-member-info">
         <div class="agent-member-title">
@@ -1916,7 +1935,7 @@ function renderOrUpdateAgentTeamCard(data, turnId = "") {
         </div>
         <div class="agent-member-sub">
           模型: ${escapeHtml(ag.model || "deepseek-chat")}${escapeHtml(roundsStr)}${escapeHtml(costStr)}
-          ${ag.task ? ` · 任务: ${escapeHtml(String(ag.task).slice(0, 60))}` : ""}
+          ${detailText ? ` · ${escapeHtml(String(detailText).slice(0, 60))}` : ""}
         </div>
       </div>`;
 
@@ -1951,10 +1970,8 @@ function renderOrUpdateAgentTeamCard(data, turnId = "") {
 
 async function refreshWalletSummary(forceBalance = false) {
   try {
-    if (forceBalance) {
-      await api("/api/wallet/balance?force=true").catch(() => {});
-    }
-    const summary = await api("/api/wallet/summary");
+    const qs = forceBalance ? "?force_balance=true" : "";
+    const summary = await api(`/api/wallet/summary${qs}`);
     state.walletSummary = summary;
     renderWalletSummaryUI(summary);
   } catch (err) {
@@ -2263,6 +2280,7 @@ async function sendPrompt() {
       }),
     });
     if (res.session) updateSessionMeta(res.session);
+    if (res.queued) showToast("已加入队列，当前回合完成后自动执行");
   } catch (err) {
     input.value = rawPrompt;
     autoGrow(input);
@@ -2285,24 +2303,32 @@ $("chat-input").addEventListener("keydown", (e) => {
 $("chat-input").addEventListener("input", () => autoGrow($("chat-input")));
 
 $("cancel-btn").addEventListener("click", async () => {
-  const res = await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: "POST" });
-  if (res.session) updateSessionMeta(res.session);
-  showToast("已请求停止");
+  try {
+    const res = await api(`/api/sessions/${state.activeSessionId}/cancel`, { method: "POST" });
+    if (res.session) updateSessionMeta(res.session);
+    showToast("已请求停止");
+  } catch (err) {
+    showToast(err.message);
+  }
 });
 
 $("new-session-btn").addEventListener("click", async () => {
-  const created = await api("/api/sessions", {
-    method: "POST",
-    body: JSON.stringify({
-      workspace: state.workspace,
-      workspace_profile_id: state.activeWorkspaceProfileId,
-      title: "New Session",
-      model: $("quick-model-select").value,
-    }),
-  });
-  state.sessions.unshift(created);
-  await selectSession(created.session_id);
-  switchTab("chat");
+  try {
+    const created = await api("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace: state.workspace,
+        workspace_profile_id: state.activeWorkspaceProfileId,
+        title: "New Session",
+        model: $("quick-model-select").value,
+      }),
+    });
+    state.sessions.unshift(created);
+    await selectSession(created.session_id);
+    switchTab("chat");
+  } catch (err) {
+    showToast(err.message);
+  }
 });
 
 $("session-drawer-btn").addEventListener("click", () => $("session-drawer").classList.remove("hidden"));
@@ -2321,10 +2347,14 @@ function autoGrow(el) {
 
 async function loadDirectory(relPath) {
   state.currentDir = relPath;
-  const qs = new URLSearchParams({ workspace: state.workspace, path: relPath });
-  const data = await api(`/api/files/tree?${qs}`);
-  renderBreadcrumbs(relPath);
-  renderEntries(data.entries || []);
+  try {
+    const qs = new URLSearchParams({ workspace: state.workspace, path: relPath });
+    const data = await api(`/api/files/tree?${qs}`);
+    renderBreadcrumbs(relPath);
+    renderEntries(data.entries || []);
+  } catch (err) {
+    showToast(err.message);
+  }
 }
 
 function renderBreadcrumbs(relPath) {
@@ -2388,16 +2418,20 @@ function renderEntries(entries) {
     renameBtn.addEventListener("click", async () => {
       const next = prompt("重命名/移动为（相对工作区路径）：", entry.path);
       if (!next || next.trim() === entry.path) return;
-      await api("/api/files/rename", {
-        method: "POST",
-        body: JSON.stringify({
-          workspace: state.workspace,
-          old_path: entry.path,
-          new_path: next.trim(),
-        }),
-      });
-      await loadDirectory(state.currentDir);
-      showToast("已重命名");
+      try {
+        await api("/api/files/rename", {
+          method: "POST",
+          body: JSON.stringify({
+            workspace: state.workspace,
+            old_path: entry.path,
+            new_path: next.trim(),
+          }),
+        });
+        await loadDirectory(state.currentDir);
+        showToast("已重命名");
+      } catch (err) {
+        showToast(err.message);
+      }
     });
 
     const delBtn = document.createElement("button");
@@ -2405,10 +2439,14 @@ function renderEntries(entries) {
     delBtn.textContent = "删";
     delBtn.addEventListener("click", async () => {
       if (!confirm(`确认删除 ${entry.path} ?`)) return;
-      const qs = new URLSearchParams({ workspace: state.workspace, path: entry.path });
-      await api(`/api/files/delete?${qs}`, { method: "DELETE" });
-      await loadDirectory(state.currentDir);
-      showToast("已删除");
+      try {
+        const qs = new URLSearchParams({ workspace: state.workspace, path: entry.path });
+        await api(`/api/files/delete?${qs}`, { method: "DELETE" });
+        await loadDirectory(state.currentDir);
+        showToast("已删除");
+      } catch (err) {
+        showToast(err.message);
+      }
     });
 
     row.append(main, renameBtn, delBtn);
@@ -2417,33 +2455,40 @@ function renderEntries(entries) {
 }
 
 let searchTimer = null;
+let searchSeq = 0;
 $("file-search-input").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
+  const mySeq = ++searchSeq;
   const q = e.target.value.trim();
   if (!q) {
     loadDirectory(state.currentDir);
     return;
   }
   searchTimer = setTimeout(async () => {
-    const qs = new URLSearchParams({ workspace: state.workspace, q });
-    const data = await api(`/api/files/search?${qs}`);
-    const list = $("files-list");
-    list.innerHTML = "";
-    for (const m of data.matches || []) {
-      const row = document.createElement("div");
-      row.className = "file-row";
-      const main = document.createElement("div");
-      main.className = "file-row-main";
-      main.innerHTML = `<span>🔍</span>
-        <div style="min-width:0;flex:1">
-          <div class="file-name"></div>
-          <div class="file-meta"></div>
-        </div>`;
-      main.querySelector(".file-name").textContent = m.line ? `${m.path}:${m.line}` : m.path;
-      main.querySelector(".file-meta").textContent = m.preview || "";
-      main.addEventListener("click", () => openFileInEditor(m.path));
-      row.appendChild(main);
-      list.appendChild(row);
+    try {
+      const qs = new URLSearchParams({ workspace: state.workspace, q });
+      const data = await api(`/api/files/search?${qs}`);
+      if (mySeq !== searchSeq) return;
+      const list = $("files-list");
+      list.innerHTML = "";
+      for (const m of data.matches || []) {
+        const row = document.createElement("div");
+        row.className = "file-row";
+        const main = document.createElement("div");
+        main.className = "file-row-main";
+        main.innerHTML = `<span>🔍</span>
+          <div style="min-width:0;flex:1">
+            <div class="file-name"></div>
+            <div class="file-meta"></div>
+          </div>`;
+        main.querySelector(".file-name").textContent = m.line ? `${m.path}:${m.line}` : m.path;
+        main.querySelector(".file-meta").textContent = m.preview || "";
+        main.addEventListener("click", () => openFileInEditor(m.path));
+        row.appendChild(main);
+        list.appendChild(row);
+      }
+    } catch (err) {
+      if (mySeq === searchSeq) showToast(err.message);
     }
   }, 280);
 });
@@ -2452,23 +2497,31 @@ $("new-file-btn").addEventListener("click", async () => {
   const name = prompt("输入新文件名（相对当前目录）：");
   if (!name) return;
   const rel = state.currentDir ? `${state.currentDir}/${name}` : name;
-  await api("/api/files/create", {
-    method: "POST",
-    body: JSON.stringify({ workspace: state.workspace, path: rel, is_dir: false, content: "" }),
-  });
-  await loadDirectory(state.currentDir);
-  await openFileInEditor(rel);
+  try {
+    await api("/api/files/create", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.workspace, path: rel, is_dir: false, content: "" }),
+    });
+    await loadDirectory(state.currentDir);
+    await openFileInEditor(rel);
+  } catch (err) {
+    showToast(err.message);
+  }
 });
 
 $("new-dir-btn").addEventListener("click", async () => {
   const name = prompt("输入新目录名：");
   if (!name) return;
   const rel = state.currentDir ? `${state.currentDir}/${name}` : name;
-  await api("/api/files/create", {
-    method: "POST",
-    body: JSON.stringify({ workspace: state.workspace, path: rel, is_dir: true }),
-  });
-  await loadDirectory(state.currentDir);
+  try {
+    await api("/api/files/create", {
+      method: "POST",
+      body: JSON.stringify({ workspace: state.workspace, path: rel, is_dir: true }),
+    });
+    await loadDirectory(state.currentDir);
+  } catch (err) {
+    showToast(err.message);
+  }
 });
 
 async function loadCodeMirrorModules() {
@@ -2632,6 +2685,7 @@ function closeEditorPane(skipPrompt = false) {
   state.openFile = null;
   $("file-editor-pane").classList.add("hidden");
   $("files-browser-pane").classList.remove("hidden");
+  $("mention-open-file-btn")?.classList.add("hidden");
 }
 
 $("editor-back-btn").addEventListener("click", () => closeEditorPane(false));
@@ -2756,7 +2810,9 @@ function escapeHtml(str) {
   return String(str)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 boot();

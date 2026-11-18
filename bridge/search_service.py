@@ -3,7 +3,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 import time
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
@@ -16,41 +16,60 @@ class _DuckDuckGoHTMLParser(HTMLParser):
         self.limit = limit
         self.results: list[dict[str, str]] = []
         self._in_title = False
-        self._in_snippet = False
+        self._snippet_tag: str = ""
+        self._snippet_depth: int = 0
         self._cur_title: list[str] = []
         self._cur_href: str = ""
         self._cur_snippet: list[str] = []
+
+    def _flush_current(self) -> None:
+        title = " ".join("".join(self._cur_title).split()).strip()
+        snippet = " ".join("".join(self._cur_snippet).split()).strip()
+        href = _clean_ddg_href(self._cur_href)
+        if title and href and len(self.results) < self.limit:
+            self.results.append({"title": title, "url": href, "snippet": snippet})
+        self._cur_title = []
+        self._cur_href = ""
+        self._cur_snippet = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr_map = dict(attrs)
         cls = attr_map.get("class") or ""
         if tag == "a" and "result__a" in cls:
+            if self._cur_title and self._cur_href:
+                self._flush_current()
             self._in_title = True
             self._cur_title = []
             self._cur_href = attr_map.get("href") or ""
             self._cur_snippet = []
+            self._snippet_tag = ""
+            self._snippet_depth = 0
+        elif self._snippet_depth > 0:
+            if tag == self._snippet_tag:
+                self._snippet_depth += 1
         elif tag in ("a", "div", "span") and "result__snippet" in cls:
-            self._in_snippet = True
+            self._snippet_tag = tag
+            self._snippet_depth = 1
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "a" and self._in_title:
             self._in_title = False
-        elif tag in ("a", "div", "span") and self._in_snippet:
-            self._in_snippet = False
-            title = " ".join("".join(self._cur_title).split()).strip()
-            snippet = " ".join("".join(self._cur_snippet).split()).strip()
-            href = _clean_ddg_href(self._cur_href)
-            if title and href and len(self.results) < self.limit:
-                self.results.append({"title": title, "url": href, "snippet": snippet})
-            self._cur_title = []
-            self._cur_href = ""
-            self._cur_snippet = []
+        elif self._snippet_depth > 0 and tag == self._snippet_tag:
+            self._snippet_depth -= 1
+            if self._snippet_depth == 0:
+                self._snippet_tag = ""
+                self._flush_current()
 
     def handle_data(self, data: str) -> None:
         if self._in_title:
             self._cur_title.append(data)
-        elif self._in_snippet:
+        elif self._snippet_depth > 0:
             self._cur_snippet.append(data)
+
+    def close(self) -> None:
+        super().close()
+        if self._cur_title and self._cur_href:
+            self._flush_current()
 
 
 def _clean_ddg_href(raw_href: str) -> str:
@@ -205,7 +224,7 @@ async def _search_custom(
         headers["Authorization"] = f"Bearer {api_key}"
     async with httpx.AsyncClient(timeout=timeout_sec) as client:
         if "{query}" in url:
-            resp = await client.get(url.replace("{query}", query), headers=headers)
+            resp = await client.get(url.replace("{query}", quote_plus(query)), headers=headers)
         else:
             resp = await client.post(
                 url,

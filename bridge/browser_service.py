@@ -18,12 +18,10 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 import inspect
 import io
+import ipaddress
 import os
 from pathlib import Path
 import re
-import shutil
-import subprocess
-import tempfile
 import threading
 import time
 from typing import Any, Awaitable, Callable, Literal
@@ -345,8 +343,6 @@ class _PageHTMLParser(HTMLParser):
         )
         el_id = len(self.elements) + 1
         href = info.get("href", "")
-        if t == "button" and not href and info.get("type") == "submit" and info.get("form_action"):
-            href = ""
 
         el: dict[str, Any] = {
             "id": el_id,
@@ -660,7 +656,6 @@ class BrowserSession:
     focused_element_id: int | None = None
     raw_html: str = field(default="", repr=False)
     last_frame_bytes: bytes = field(default=b"", repr=False)
-    engine: str = "fast"
     mode: str = "fast"  # "fast" | "mobile_wkwebview"
     mobile_can_go_back: bool = False
     mobile_can_go_forward: bool = False
@@ -692,7 +687,21 @@ class BrowserService:
         self.http_fetcher = http_fetcher
         self._sessions: dict[str, BrowserSession] = {}
         self._mobile_executors: dict[str, list[Callable[[dict[str, Any]], None]]] = {}
+        self._session_aliases: dict[str, str] = {}
         self._pending_rpcs: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+    def alias_mobile_executor(self, child_session_id: str, parent_session_id: str) -> None:
+        if child_session_id and parent_session_id and child_session_id != parent_session_id:
+            with self._lock:
+                self._session_aliases[child_session_id] = parent_session_id
+
+    def _resolve_mobile_session_id(self, session_id: str) -> str:
+        cur = session_id
+        seen: set[str] = set()
+        while cur in self._session_aliases and cur not in seen:
+            seen.add(cur)
+            cur = self._session_aliases[cur]
+        return cur
 
     def add_mobile_executor(self, session_id: str, dispatch_fn: Callable[[dict[str, Any]], None]) -> None:
         if not session_id:
@@ -715,7 +724,8 @@ class BrowserService:
 
     def has_mobile_executor(self, session_id: str) -> bool:
         with self._lock:
-            return bool(self._mobile_executors.get(session_id))
+            resolved_sid = self._resolve_mobile_session_id(session_id)
+            return bool(self._mobile_executors.get(session_id) or self._mobile_executors.get(resolved_sid))
 
     def apply_mobile_state(self, browser_id: str, state: dict[str, Any]) -> dict[str, Any]:
         sess = self.create_or_get_session(
@@ -738,7 +748,10 @@ class BrowserService:
             if "can_go_forward" in state:
                 sess.mobile_can_go_forward = bool(state["can_go_forward"])
             if "scroll_y" in state and state["scroll_y"] is not None:
-                sess.scroll_y = int(state["scroll_y"])
+                try:
+                    sess.scroll_y = int(state["scroll_y"])
+                except (TypeError, ValueError):
+                    pass
             if "human_required" in state:
                 sess.human_required = bool(state["human_required"])
                 if sess.human_required:
@@ -773,6 +786,9 @@ class BrowserService:
     ) -> dict[str, Any]:
         with self._lock:
             execs = list(self._mobile_executors.get(sess.session_id) or [])
+            if not execs:
+                resolved_sid = self._resolve_mobile_session_id(sess.session_id)
+                execs = list(self._mobile_executors.get(resolved_sid) or [])
         if not execs:
             raise RuntimeError("No active mobile executor for session")
         dispatch_fn = execs[-1]
@@ -858,6 +874,23 @@ class BrowserService:
         if policy.get("enabled") is False:
             return UrlPolicyResult(False, "内置浏览器已在策略中禁用")
 
+        if scheme != "about" and not policy.get("allow_local_network", False):
+            if host in ("localhost", "localhost.localdomain") or host.endswith((".local", ".internal")):
+                return UrlPolicyResult(False, f"安全策略禁止访问内网或本机地址: {host}")
+            try:
+                ip_obj = ipaddress.ip_address(host.strip("[]"))
+                if (
+                    ip_obj.is_loopback
+                    or ip_obj.is_private
+                    or ip_obj.is_link_local
+                    or ip_obj.is_reserved
+                    or ip_obj.is_multicast
+                    or ip_obj.is_unspecified
+                ):
+                    return UrlPolicyResult(False, f"安全策略禁止访问内网或回环 IP: {host}")
+            except ValueError:
+                pass
+
         blocked_domains = [
             str(d).lower().strip(".")
             for d in (policy.get("blocked_domains") or policy.get("blocklist") or [])
@@ -893,15 +926,7 @@ class BrowserService:
     ) -> tuple[bool, str]:
         return _check_security_gate(url, title, html, elements)
 
-    def _render_viewport_jpeg(self, session: BrowserSession, *, engine: str | None = None) -> bytes:
-        use_engine = (engine or session.engine or "fast").lower()
-        if use_engine == "edge" and session.url.startswith(("http://", "https://")):
-            edge_bytes = self._try_render_edge_headless(session.url, session.viewport_width, session.viewport_height)
-            if edge_bytes:
-                session.last_frame_bytes = edge_bytes
-                session.last_frame_b64 = base64.b64encode(edge_bytes).decode("ascii")
-                return edge_bytes
-
+    def _render_viewport_jpeg(self, session: BrowserSession) -> bytes:
         w = session.viewport_width or VIEWPORT_WIDTH
         h = session.viewport_height or VIEWPORT_HEIGHT
         img = Image.new("RGB", (w, h), (248, 250, 252))
@@ -1086,44 +1111,6 @@ class BrowserService:
         session.last_frame_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
         return jpeg_bytes
 
-    def _try_render_edge_headless(self, url: str, width: int, height: int) -> bytes | None:
-        edge_candidates = [
-            shutil.which("msedge"),
-            shutil.which("msedge.exe"),
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        ]
-        edge_bin = next((c for c in edge_candidates if c and os.path.exists(c)), None)
-        if not edge_bin:
-            return None
-
-        tmp_png = Path(tempfile.gettempdir()) / f"dsh_edge_{uuid.uuid4().hex[:8]}.png"
-        try:
-            cmd = [
-                edge_bin,
-                "--headless=new",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                f"--window-size={width},{height}",
-                f"--screenshot={tmp_png}",
-                url,
-            ]
-            subprocess.run(cmd, capture_output=True, timeout=8, check=False)
-            if tmp_png.exists() and tmp_png.stat().st_size > 0:
-                with Image.open(tmp_png) as im:
-                    rgb = im.convert("RGB").resize((width, height))
-                    out = io.BytesIO()
-                    rgb.save(out, format="JPEG", quality=80)
-                    return out.getvalue()
-        except Exception:
-            return None
-        finally:
-            try:
-                tmp_png.unlink(missing_ok=True)
-            except Exception:
-                pass
-        return None
-
     async def _fetch_page(self, url: str) -> tuple[int, str, str]:
         if self.http_fetcher is not None:
             result = self.http_fetcher(url)
@@ -1141,8 +1128,21 @@ class BrowserService:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0, headers=headers) as client:
-            resp = await client.get(url)
+        cur_url = url
+        async with httpx.AsyncClient(follow_redirects=False, timeout=15.0, headers=headers) as client:
+            for _ in range(5):
+                resp = await client.get(cur_url)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location", "").strip()
+                    if not location:
+                        break
+                    next_url = urljoin(str(resp.url), location)
+                    hop_check = self.check_url_allowed(next_url)
+                    if not hop_check.allowed:
+                        raise PermissionError(hop_check.reason)
+                    cur_url = next_url
+                    continue
+                return resp.status_code, str(resp.url), resp.text
             return resp.status_code, str(resp.url), resp.text
 
     # ------------------------------------------------------------------
@@ -1245,6 +1245,25 @@ class BrowserService:
             sess.subscribers.clear()
             return True
 
+    def close_sessions_for_chat(self, session_id: str) -> int:
+        if not session_id:
+            return 0
+        removed = 0
+        with self._lock:
+            targets = [
+                bid
+                for bid, sess in self._sessions.items()
+                if sess.session_id == session_id or sess.session_id.startswith(f"{session_id}_")
+            ]
+            for bid in targets:
+                sess = self._sessions.pop(bid, None)
+                if sess is not None:
+                    sess.subscribers.clear()
+                    removed += 1
+            for alias_k in [k for k, v in self._session_aliases.items() if k == session_id or v == session_id or k.startswith(f"{session_id}_")]:
+                self._session_aliases.pop(alias_k, None)
+        return removed
+
     # ------------------------------------------------------------------
     # Control Handoff & Actor Gate
     # ------------------------------------------------------------------
@@ -1282,7 +1301,8 @@ class BrowserService:
             if not sess.human_reason:
                 sess.human_reason = "真人点击/操作自动接管浏览器"
             sess.updated_at = _utc_now_iso()
-            self._render_viewport_jpeg(sess)
+            if sess.mode != "mobile_wkwebview":
+                self._render_viewport_jpeg(sess)
             self._broadcast(
                 sess,
                 "control_changed",
@@ -1319,7 +1339,6 @@ class BrowserService:
         url: str,
         *,
         actor: Literal["agent", "human"] = "agent",
-        engine: str | None = None,
         record_history: bool = True,
     ) -> dict[str, Any]:
         sess = self.create_or_get_session(browser_id=browser_id)
@@ -1328,8 +1347,6 @@ class BrowserService:
             return blocked
 
         raw_url = (url or "").strip() or "about:blank"
-        if engine:
-            sess.engine = engine
 
         # First check raw scheme before normalizing
         pre_check = self.check_url_allowed(raw_url)
@@ -1370,7 +1387,7 @@ class BrowserService:
             if sess.control_owner == "agent":
                 sess.human_reason = ""
             sess.updated_at = _utc_now_iso()
-            self._render_viewport_jpeg(sess)
+            await asyncio.to_thread(self._render_viewport_jpeg, sess)
             self._broadcast(sess, "frame")
             return {"ok": True, **self.snapshot(sess.browser_id, include_frame=True)}
 
@@ -1379,7 +1396,7 @@ class BrowserService:
         except Exception as exc:
             sess.last_status_code = 599
             sess.updated_at = _utc_now_iso()
-            self._render_viewport_jpeg(sess)
+            await asyncio.to_thread(self._render_viewport_jpeg, sess)
             return {
                 "ok": False,
                 "error": f"页面加载失败: {exc}",
@@ -1395,7 +1412,7 @@ class BrowserService:
                 **self.snapshot(sess.browser_id, include_frame=True),
             }
 
-        parsed = self._parse_html_page(final_url, html)
+        parsed = await asyncio.to_thread(self._parse_html_page, final_url, html)
         sess.url = final_url
         sess.title = parsed["title"]
         sess.elements = parsed["elements"]
@@ -1425,7 +1442,7 @@ class BrowserService:
                 sess.human_reason = ""
 
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        await asyncio.to_thread(self._render_viewport_jpeg, sess)
         if gate_hit:
             self._broadcast(
                 sess,
@@ -1509,7 +1526,7 @@ class BrowserService:
             return await self.navigate(browser_id, sess.url, actor=actor, record_history=False)
 
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        await asyncio.to_thread(self._render_viewport_jpeg, sess)
         self._broadcast(sess, "frame")
         return {"ok": True, **self.snapshot(sess.browser_id, include_frame=True)}
 
@@ -1522,9 +1539,16 @@ class BrowserService:
         y: int | None = None,
     ) -> dict[str, Any] | None:
         if element_id is not None:
+            try:
+                target_eid = int(element_id)
+            except (TypeError, ValueError):
+                return None
             for el in sess.elements:
-                if int(el.get("id", -1)) == int(element_id):
-                    return el
+                try:
+                    if int(el.get("id", -1)) == target_eid:
+                        return el
+                except (TypeError, ValueError):
+                    continue
             return None
 
         if x is not None and y is not None:
@@ -1578,7 +1602,7 @@ class BrowserService:
                 }
             # Coordinate click on non-element canvas area (still valid, e.g. human takeover click)
             sess.updated_at = _utc_now_iso()
-            self._render_viewport_jpeg(sess)
+            await asyncio.to_thread(self._render_viewport_jpeg, sess)
             self._broadcast(sess, "frame")
             return {
                 "ok": True,
@@ -1587,7 +1611,10 @@ class BrowserService:
                 **self.snapshot(sess.browser_id, include_frame=True),
             }
 
-        sess.focused_element_id = int(target["id"])
+        try:
+            sess.focused_element_id = int(target["id"])
+        except (TypeError, ValueError, KeyError):
+            sess.focused_element_id = None
         clicked_copy = copy.deepcopy(target)
         href = str(target.get("href") or "").strip()
 
@@ -1614,7 +1641,7 @@ class BrowserService:
             target["value"] = "" if target.get("value") == "checked" else "checked"
 
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        await asyncio.to_thread(self._render_viewport_jpeg, sess)
         self._broadcast(sess, "frame")
         return {
             "ok": True,
@@ -1665,9 +1692,12 @@ class BrowserService:
 
         if target is not None:
             target["value"] = str(text)
-            sess.focused_element_id = int(target["id"])
+            try:
+                sess.focused_element_id = int(target["id"])
+            except (TypeError, ValueError, KeyError):
+                sess.focused_element_id = None
             # Update markdown line preview if applicable
-            if f"[{target['id']}]" in sess.text_markdown and target.get("type") != "password":
+            if "id" in target and f"[{target['id']}]" in sess.text_markdown and target.get("type") != "password":
                 sess.text_markdown += f"\n\n> 输入 [{target['id']}]: {text}"
 
         if submit and target is not None:
@@ -1686,7 +1716,7 @@ class BrowserService:
                 return nav_res
 
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        await asyncio.to_thread(self._render_viewport_jpeg, sess)
         self._broadcast(sess, "frame")
         return {
             "ok": True,
@@ -1706,13 +1736,18 @@ class BrowserService:
         if blocked is not None:
             return blocked
 
+        try:
+            step_y = int(delta_y)
+        except (TypeError, ValueError):
+            step_y = 360
+
         if actor == "agent" and self.has_mobile_executor(sess.session_id):
-            return await self._execute_via_mobile(sess, "scroll", {"delta_y": int(delta_y)})
+            return await self._execute_via_mobile(sess, "scroll", {"delta_y": step_y})
 
         max_scroll = max(2400, sess.content_height - sess.viewport_height + 240)
-        sess.scroll_y = max(0, min(sess.scroll_y + int(delta_y), max_scroll))
+        sess.scroll_y = max(0, min(sess.scroll_y + step_y, max_scroll))
         sess.updated_at = _utc_now_iso()
-        self._render_viewport_jpeg(sess)
+        await asyncio.to_thread(self._render_viewport_jpeg, sess)
         self._broadcast(sess, "frame")
         return {"ok": True, **self.snapshot(sess.browser_id, include_frame=True)}
 
@@ -1741,7 +1776,7 @@ class BrowserService:
                 except Exception:
                     pass
             return res
-        return self.save_frame_as_attachment(browser_id, attachment_service)
+        return await asyncio.to_thread(self.save_frame_as_attachment, browser_id, attachment_service)
 
     def snapshot(self, browser_id: str, *, include_frame: bool = True) -> dict[str, Any]:
         sess = self.create_or_get_session(browser_id=browser_id)
@@ -1772,7 +1807,6 @@ class BrowserService:
         }
         if include_frame and sess.mode != "mobile_wkwebview":
             data["frame_b64"] = sess.last_frame_b64
-            data["last_frame_b64"] = sess.last_frame_b64
         return data
 
     def save_frame_as_attachment(
@@ -1786,31 +1820,15 @@ class BrowserService:
         svc = attachment_service or self.attachment_service
 
         if svc is not None and hasattr(svc, "save_image_bytes"):
-            fn = svc.save_image_bytes
-            try:
-                sig = inspect.signature(fn)
-                kwargs: dict[str, Any] = {}
-                if "filename" in sig.parameters:
-                    kwargs["filename"] = filename
-                if "mime_type" in sig.parameters:
-                    kwargs["mime_type"] = "image/jpeg"
-                if "session_id" in sig.parameters:
-                    kwargs["session_id"] = sess.session_id
-                if "source" in sig.parameters:
-                    kwargs["source"] = "browser"
-                res = fn(frame_bytes, **kwargs)
-                if isinstance(res, dict):
-                    return {"ok": True, "browser_id": sess.browser_id, **res}
-                if hasattr(res, "model_dump"):
-                    return {"ok": True, "browser_id": sess.browser_id, **res.model_dump()}
-                if hasattr(res, "to_dict"):
-                    return {"ok": True, "browser_id": sess.browser_id, **res.to_dict()}
-                return {"ok": True, "browser_id": sess.browser_id, "attachment": res}
-            except TypeError:
-                res = fn(frame_bytes)
-                if isinstance(res, dict):
-                    return {"ok": True, "browser_id": sess.browser_id, **res}
-                return {"ok": True, "browser_id": sess.browser_id, "attachment": res}
+            res = svc.save_image_bytes(
+                frame_bytes,
+                filename=filename,
+                session_id=sess.session_id,
+                source="browser",
+            )
+            if isinstance(res, dict):
+                return {"ok": True, "browser_id": sess.browser_id, **res}
+            return {"ok": True, "browser_id": sess.browser_id, "attachment": res}
 
         # Fallback local disk persistence if no attachment_service is wired
         att_id = "att_" + uuid.uuid4().hex[:12]

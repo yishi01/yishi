@@ -17,7 +17,8 @@ final class BrowserTabController: NSObject, ObservableObject, WKNavigationDelega
     @Published var isLoading: Bool = false
     @Published var estimatedProgress: Double = 0.0
 
-    var isExecutingAgentRPC: Bool = false
+    var rpcDepth: Int = 0
+    var isExecutingAgentRPC: Bool { rpcDepth > 0 }
     var onHumanNavigationSettled: ((BrowserTabController) -> Void)?
 
     private var urlObs: NSKeyValueObservation?
@@ -82,6 +83,25 @@ final class BrowserTabController: NSObject, ObservableObject, WKNavigationDelega
                 self?.estimatedProgress = v
             }
         }
+    }
+
+    func teardown() {
+        urlObs?.invalidate()
+        titleObs?.invalidate()
+        backObs?.invalidate()
+        fwdObs?.invalidate()
+        loadObs?.invalidate()
+        progObs?.invalidate()
+        urlObs = nil
+        titleObs = nil
+        backObs = nil
+        fwdObs = nil
+        loadObs = nil
+        progObs = nil
+        onHumanNavigationSettled = nil
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
     }
 
     // MARK: - WKNavigationDelegate & WKUIDelegate
@@ -333,7 +353,22 @@ final class MobileBrowserManager: ObservableObject {
     }
 
     func removeTab(_ browserId: String) {
-        tabs.removeValue(forKey: browserId)
+        if let tab = tabs.removeValue(forKey: browserId) {
+            tab.teardown()
+        }
+    }
+
+    func removeTabs(matching ids: [String]) {
+        for id in ids {
+            removeTab(id)
+        }
+    }
+
+    func clearAllTabs() {
+        for (_, tab) in tabs {
+            tab.teardown()
+        }
+        tabs.removeAll()
     }
 
     func executeRPC(
@@ -343,8 +378,8 @@ final class MobileBrowserManager: ObservableObject {
         uploadScreenshot: ((Data, String) async -> ChatAttachmentItem?)? = nil
     ) async -> [String: Any] {
         let controller = tab(for: browserId)
-        controller.isExecutingAgentRPC = true
-        defer { controller.isExecutingAgentRPC = false }
+        controller.rpcDepth += 1
+        defer { controller.rpcDepth = max(0, controller.rpcDepth - 1) }
 
         switch action.lowercased() {
         case "navigate", "open":

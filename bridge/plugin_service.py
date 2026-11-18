@@ -16,9 +16,12 @@ from typing import Any
 
 import yaml
 
+from bridge.utils import atomic_write_text
 
-DSH_RUNTIME_NODE = Path(r"E:\新建文件夹\resources\runtime\bin\node.cmd")
-DSH_RUNTIME_PNPM = Path(r"E:\新建文件夹\resources\runtime\pnpm\bin\pnpm.cjs")
+_ENV_NODE = os.environ.get("DSH_RUNTIME_NODE", "").strip()
+_ENV_PNPM = os.environ.get("DSH_RUNTIME_PNPM", "").strip()
+DSH_RUNTIME_NODE = Path(_ENV_NODE) if _ENV_NODE else Path(r"E:\新建文件夹\resources\runtime\bin\node.cmd")
+DSH_RUNTIME_PNPM = Path(_ENV_PNPM) if _ENV_PNPM else Path(r"E:\新建文件夹\resources\runtime\pnpm\bin\pnpm.cjs")
 
 
 def _slugify(name: str) -> str:
@@ -27,10 +30,7 @@ def _slugify(name: str) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}-{threading.get_ident()}")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    atomic_write_text(path, text)
 
 
 class PluginService:
@@ -55,6 +55,16 @@ class PluginService:
         default_dsh = Path.home() / ".dsh" / "profiles" / "desktop"
         self.dsh_profile_dir = Path(dsh_profile_dir) if dsh_profile_dir is not None else default_dsh
         self._state = self._load_state()
+
+    def _resolve_plugin_dir(self, plugin_id: str) -> Path:
+        pid = (plugin_id or "").strip()
+        if not pid or pid in (".", "..") or "/" in pid or "\\" in pid or pid.startswith("."):
+            raise ValueError(f"非法的插件 ID: {plugin_id}")
+        root = self.plugins_dir.resolve()
+        dest = (root / pid).resolve()
+        if dest.parent != root or not dest.exists() or not dest.is_dir():
+            raise FileNotFoundError(f"插件不存在: {plugin_id}")
+        return dest
 
     def set_paths(self, *, plugins_dir: Path | None = None, dsh_profile_dir: Path | None = None) -> None:
         with self._lock:
@@ -138,12 +148,22 @@ class PluginService:
                     if f.is_file() and f.suffix.lower() in allowed_exts:
                         tools.append({"name": f.stem, "rel_path": f"{sub_name}/{f.name}", "ext": f.suffix.lower()})
         main_entry = str(manifest.get("main") or "").strip()
-        if main_entry and (plugin_dir / main_entry).is_file():
-            rel_main = main_entry.replace("\\", "/")
-            if not any(t["rel_path"] == rel_main for t in tools):
-                tools.append(
-                    {"name": Path(main_entry).stem, "rel_path": rel_main, "ext": Path(main_entry).suffix.lower()}
-                )
+        if main_entry:
+            try:
+                main_resolved = (plugin_dir / main_entry).resolve()
+                dir_resolved = plugin_dir.resolve()
+                if main_resolved.is_relative_to(dir_resolved) and main_resolved.is_file():
+                    rel_main = main_resolved.relative_to(dir_resolved).as_posix()
+                    if not any(t["rel_path"] == rel_main for t in tools):
+                        tools.append(
+                            {
+                                "name": Path(main_entry).stem,
+                                "rel_path": rel_main,
+                                "ext": main_resolved.suffix.lower(),
+                            }
+                        )
+            except OSError:
+                pass
 
         # MCP servers if defined
         mcp_servers: list[str] = []
@@ -213,10 +233,12 @@ class PluginService:
                 continue
             seen.add(bname)
             pkg_meta: dict[str, Any] = {}
-            mod_pkg = pdir / "node_modules" / Path(*bname.split("/")) / "package.json"
-            if mod_pkg.exists():
+            nm_root = (pdir / "node_modules").resolve()
+            if ".." not in bname.split("/") and "\\" not in bname:
                 try:
-                    pkg_meta = json.loads(mod_pkg.read_text(encoding="utf-8", errors="replace"))
+                    mod_pkg = (nm_root / Path(*bname.split("/")) / "package.json").resolve()
+                    if mod_pkg.is_relative_to(nm_root) and mod_pkg.exists():
+                        pkg_meta = json.loads(mod_pkg.read_text(encoding="utf-8", errors="replace"))
                 except Exception:
                     pass
             bundles.append(
@@ -332,6 +354,8 @@ class PluginService:
         plugin_id = _slugify(name or src.stem)
         dest = self.plugins_dir / plugin_id
         with self._lock:
+            if src == dest or src.is_relative_to(dest):
+                raise ValueError("源路径不能位于目标插件目录内部")
             if dest.exists():
                 shutil.rmtree(dest)
             if src.is_dir():
@@ -348,12 +372,22 @@ class PluginService:
         if ext == ".zip":
             tmp_zip = dest / "__upload.zip"
             tmp_zip.write_bytes(data)
+            dest_resolved = dest.resolve()
             try:
                 with zipfile.ZipFile(tmp_zip, "r") as zf:
                     for member in zf.infolist():
-                        # Prevent zip slip
-                        member_path = Path(member.filename)
-                        if member_path.is_absolute() or ".." in member_path.parts:
+                        # Prevent zip slip, drive-relative paths, and symlink members
+                        raw_fn = member.filename.replace("\\", "/")
+                        member_path = Path(raw_fn)
+                        if (
+                            member_path.is_absolute()
+                            or ".." in member_path.parts
+                            or (len(raw_fn) >= 2 and raw_fn[1] == ":")
+                            or ((member.external_attr >> 16) & 0o170000) == 0o120000
+                        ):
+                            raise ValueError(f"不安全的压缩包路径: {member.filename}")
+                        resolved_target = (dest_resolved / member_path).resolve()
+                        if resolved_target != dest_resolved and not resolved_target.is_relative_to(dest_resolved):
                             raise ValueError(f"不安全的压缩包路径: {member.filename}")
                     zf.extractall(dest)
             finally:
@@ -362,9 +396,11 @@ class PluginService:
             children = [p for p in dest.iterdir()]
             if len(children) == 1 and children[0].is_dir():
                 inner = children[0]
-                for sub in inner.iterdir():
+                stage = dest / f"__flatten_{int(time.time() * 1000)}"
+                inner.rename(stage)
+                for sub in stage.iterdir():
                     shutil.move(str(sub), str(dest / sub.name))
-                inner.rmdir()
+                stage.rmdir()
         elif ext in (".py", ".js", ".mjs", ".ps1"):
             tools_dir = dest / "tools"
             tools_dir.mkdir(parents=True, exist_ok=True)
@@ -428,18 +464,26 @@ class PluginService:
         repo_stem = Path(url.rstrip("/").split("/")[-1]).stem
         plugin_id = _slugify(name or repo_stem)
         dest = self.plugins_dir / plugin_id
+        staging_dir = self.plugins_dir / f".staging-{plugin_id}-{int(time.time() * 1000)}"
         cmd = ["git", "clone", "--depth", "1"]
         if branch.strip():
             cmd.extend(["-b", branch.strip()])
-        cmd.extend([url, str(dest)])
+        cmd.extend([url, str(staging_dir)])
+
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired as exc:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise RuntimeError("git clone 超时 (60s)") from exc
+
+        if proc.returncode != 0:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise RuntimeError(f"git clone 失败: {(proc.stderr or proc.stdout).strip()}")
 
         with self._lock:
             if dest.exists():
                 shutil.rmtree(dest)
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if proc.returncode != 0:
-                shutil.rmtree(dest, ignore_errors=True)
-                raise RuntimeError(f"git clone 失败: {(proc.stderr or proc.stdout).strip()}")
+            shutil.move(str(staging_dir), str(dest))
             self._register_state(plugin_id, source=f"git:{url}", enabled=True, config=config)
             return self._inspect_plugin_dir(dest)
 
@@ -457,6 +501,8 @@ class PluginService:
         plugin_id = _slugify(name)
         dest = self.plugins_dir / plugin_id
         with self._lock:
+            if dest.exists():
+                shutil.rmtree(dest)
             dest.mkdir(parents=True, exist_ok=True)
             manifest = {
                 "name": name.strip() or plugin_id,
@@ -477,9 +523,7 @@ class PluginService:
             return self._inspect_plugin_dir(dest)
 
     def toggle_plugin(self, plugin_id: str, enabled: bool) -> dict[str, Any]:
-        dest = self.plugins_dir / plugin_id
-        if not dest.exists():
-            raise FileNotFoundError(f"插件不存在: {plugin_id}")
+        dest = self._resolve_plugin_dir(plugin_id)
         with self._lock:
             entry = self._state.setdefault(plugin_id, {})
             entry["enabled"] = bool(enabled)
@@ -494,9 +538,7 @@ class PluginService:
         env: dict[str, str] | None = None,
         enabled: bool | None = None,
     ) -> dict[str, Any]:
-        dest = self.plugins_dir / plugin_id
-        if not dest.exists():
-            raise FileNotFoundError(f"插件不存在: {plugin_id}")
+        dest = self._resolve_plugin_dir(plugin_id)
         with self._lock:
             entry = self._state.setdefault(plugin_id, {})
             if config is not None:
@@ -509,9 +551,7 @@ class PluginService:
             return self._inspect_plugin_dir(dest)
 
     def uninstall_plugin(self, plugin_id: str) -> None:
-        dest = (self.plugins_dir / plugin_id).resolve()
-        if dest.parent != self.plugins_dir or not dest.exists():
-            raise FileNotFoundError(f"插件不存在: {plugin_id}")
+        dest = self._resolve_plugin_dir(plugin_id)
         with self._lock:
             shutil.rmtree(dest)
             self._state.pop(plugin_id, None)
@@ -527,9 +567,7 @@ class PluginService:
         workspace_cwd: str = "",
         timeout_sec: int = 20,
     ) -> dict[str, Any]:
-        dest = self.plugins_dir / plugin_id
-        if not dest.exists():
-            raise FileNotFoundError(f"插件不存在: {plugin_id}")
+        dest = self._resolve_plugin_dir(plugin_id)
         info = self._inspect_plugin_dir(dest)
         if not info["enabled"]:
             raise RuntimeError(f"插件 {plugin_id} 当前已禁用，请先启用。")
@@ -547,6 +585,8 @@ class PluginService:
             selected = tools[0]
 
         script_path = (dest / selected["rel_path"]).resolve()
+        if not script_path.is_relative_to(dest.resolve()) or not script_path.is_file():
+            raise ValueError(f"非法的插件脚本路径: {selected['rel_path']}")
         ext = script_path.suffix.lower()
         if ext == ".py":
             cmd = [sys.executable, str(script_path), *(args or [])]
@@ -576,17 +616,31 @@ class PluginService:
 
         cwd = workspace_cwd if (workspace_cwd and Path(workspace_cwd).is_dir()) else str(dest)
         started = time.perf_counter()
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            env=env,
-            input=stdin_text,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=max(2, min(int(timeout_sec), 60)),
-        )
+        eff_timeout = max(2, min(int(timeout_sec), 60))
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=eff_timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            out_raw = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            err_raw = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            return {
+                "ok": False,
+                "plugin_id": plugin_id,
+                "tool": selected["name"],
+                "exit_code": -1,
+                "stdout": out_raw[:65536],
+                "stderr": (err_raw + f"\n[插件执行超时 ({eff_timeout}s)]").strip()[:16384],
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+            }
         return {
             "ok": proc.returncode == 0,
             "plugin_id": plugin_id,
@@ -691,15 +745,18 @@ class PluginService:
                 raise RuntimeError("未在 PC 找到 DSH pnpm 运行时或全局 pnpm")
             cmd = [pnpm_bin, "add", cleaned]
 
-        proc = subprocess.run(
-            cmd,
-            cwd=str(pdir),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=120,
-        )
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(pdir),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("DSH 插件安装超时 (120s)") from exc
         if proc.returncode != 0:
             raise RuntimeError(f"DSH 插件安装失败:\n{(proc.stderr or proc.stdout).strip()[:1200]}")
 
@@ -723,7 +780,11 @@ class PluginService:
     # ------------------------------------------------------------------
     def get_agent_prompt_appendix(self) -> str:
         with self._lock:
-            enabled = [self._inspect_plugin_dir(p) for p in sorted(self.plugins_dir.iterdir()) if p.is_dir()]
+            enabled = [
+                self._inspect_plugin_dir(p)
+                for p in sorted(self.plugins_dir.iterdir())
+                if p.is_dir() and not p.name.startswith(".")
+            ]
         enabled = [p for p in enabled if p["enabled"]]
         if not enabled:
             return ""

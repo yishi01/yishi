@@ -75,16 +75,21 @@ def _get_git_github_token() -> str:
     if env_tok:
         return env_tok
     try:
-        proc = subprocess.run(
-            ["git", "credential", "fill"],
-            input="protocol=https\nhost=github.com\n\n",
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("password="):
-                return line.split("=", 1)[1].strip()
+        kwargs: dict[str, Any] = {
+            "input": "protocol=https\nhost=github.com\n\n",
+            "capture_output": True,
+            "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
+            "timeout": 5,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.run(["git", "credential", "fill"], **kwargs)
+        if proc.returncode == 0:
+            for line in (proc.stdout or "").splitlines():
+                if line.startswith("password="):
+                    return line.split("=", 1)[1].strip()
     except Exception:
         pass
     return ""

@@ -4,6 +4,7 @@ struct ApprovalReviewSheet: View {
     @EnvironmentObject var client: BridgeClient
     @Environment(\.dismiss) private var dismiss
     let item: PendingApprovalItem
+    @State private var isSubmitting = false
 
     var body: some View {
         NavigationStack {
@@ -61,26 +62,33 @@ struct ApprovalReviewSheet: View {
                         // Action Confirmation Buttons
                         VStack(spacing: 10) {
                             Button {
+                                guard !isSubmitting else { return }
+                                isSubmitting = true
                                 Haptics.success()
                                 Task {
-                                    await client.resolveApproval(requestId: item.id, allow: true)
-                                    dismiss()
+                                    let ok = await client.resolveApproval(requestId: item.id, allow: true)
+                                    isSubmitting = false
+                                    if ok { dismiss() }
                                 }
                             } label: {
-                                Label("✓ 允许本次执行", systemImage: "checkmark.shield.fill")
+                                Label(isSubmitting ? "提交中..." : "✓ 允许本次执行", systemImage: "checkmark.shield.fill")
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(.white)
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 13)
                                     .background(Capsule().fill(Color.dsPrimary))
                             }
+                            .disabled(isSubmitting)
                             .glassPressable(scale: 0.96)
 
                             Button {
+                                guard !isSubmitting else { return }
+                                isSubmitting = true
                                 Haptics.medium()
                                 Task {
-                                    await client.resolveApproval(requestId: item.id, allow: true, setAutoMode: true)
-                                    dismiss()
+                                    let ok = await client.resolveApproval(requestId: item.id, allow: true, setAutoMode: true)
+                                    isSubmitting = false
+                                    if ok { dismiss() }
                                 }
                             } label: {
                                 Label("允许并切换本会话为「自动放行」", systemImage: "bolt.shield.fill")
@@ -90,13 +98,17 @@ struct ApprovalReviewSheet: View {
                                     .padding(.vertical, 12)
                                     .cleanWhiteCard(cornerRadius: 999)
                             }
+                            .disabled(isSubmitting)
                             .glassPressable(scale: 0.96)
 
                             Button(role: .destructive) {
+                                guard !isSubmitting else { return }
+                                isSubmitting = true
                                 Haptics.warning()
                                 Task {
-                                    await client.resolveApproval(requestId: item.id, allow: false)
-                                    dismiss()
+                                    let ok = await client.resolveApproval(requestId: item.id, allow: false)
+                                    isSubmitting = false
+                                    if ok { dismiss() }
                                 }
                             } label: {
                                 Label("✕ 拒绝该操作", systemImage: "xmark.shield.fill")
@@ -106,6 +118,7 @@ struct ApprovalReviewSheet: View {
                                     .padding(.vertical, 12)
                                     .cleanWhiteCard(cornerRadius: 999)
                             }
+                            .disabled(isSubmitting)
                             .glassPressable(scale: 0.96)
                         }
                         .padding(.top, 4)

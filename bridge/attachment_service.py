@@ -18,6 +18,8 @@ from uuid import uuid4
 
 from PIL import Image, ImageDraw, ImageGrab, ImageOps
 
+from bridge.utils import atomic_write_bytes, atomic_write_text
+
 MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024  # 15 MB
 MAX_IMAGE_DIMENSION = 2048
 THUMB_MAX_DIMENSION = 360
@@ -156,16 +158,12 @@ class AttachmentService:
     def _save_index(self) -> None:
         with self._lock:
             self.attachments_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.index_path.with_suffix(f".tmp.{uuid4().hex[:8]}")
             payload = json.dumps(self._index, ensure_ascii=False, indent=2)
-            tmp_path.write_text(payload, encoding="utf-8")
-            os.replace(tmp_path, self.index_path)
+            atomic_write_text(self.index_path, payload)
 
     def _atomic_write_bytes(self, target_path: Path, data: bytes) -> None:
         self.attachments_dir.mkdir(parents=True, exist_ok=True)
-        tmp_path = target_path.with_suffix(f"{target_path.suffix}.tmp.{uuid4().hex[:8]}")
-        tmp_path.write_bytes(data)
-        os.replace(tmp_path, target_path)
+        atomic_write_bytes(target_path, data)
 
     def save_image_bytes(
         self,
@@ -295,6 +293,35 @@ class AttachmentService:
             ]
         items.sort(key=lambda item: item.get("created_at", ""))
         return items
+
+    def delete_session_attachments(self, session_id: str) -> int:
+        """Delete attachments belonging to session_id (and any child subagent prefix)."""
+        target = (session_id or "").strip()
+        if not target or target == "global":
+            return 0
+        removed = 0
+        with self._lock:
+            victim_ids = [
+                att_id
+                for att_id, meta in self._index.items()
+                if str(meta.get("session_id") or "") == target
+                or str(meta.get("session_id") or "").startswith(f"{target}_")
+            ]
+            for att_id in victim_ids:
+                meta = self._index.pop(att_id, None) or {}
+                ext = str(meta.get("ext") or ".jpg")
+                for fp in (
+                    self.attachments_dir / f"{att_id}{ext}",
+                    self.attachments_dir / f"{att_id}_thumb.jpg",
+                ):
+                    try:
+                        fp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                removed += 1
+            if removed:
+                self._save_index()
+        return removed
 
     def get_file_path(self, att_id: str, *, thumb: bool = False) -> tuple[Path, str]:
         meta = self.get_metadata(att_id)

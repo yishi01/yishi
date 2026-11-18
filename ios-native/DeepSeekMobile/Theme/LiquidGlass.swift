@@ -388,8 +388,5 @@ extension Color {
         let raw = UserDefaults.standard.string(forKey: "ds_theme_accent") ?? "blue"
         return (AccentThemeOption(rawValue: raw) ?? .blue).color
     }
-    static let dsSurface = Color.white.opacity(0.46)
-    static let dsSurface2 = Color.white.opacity(0.62)
-    static let dsBorder = Color.white.opacity(0.75)
     static let dsPrimary = Color(red: 0.07, green: 0.09, blue: 0.14)
 }

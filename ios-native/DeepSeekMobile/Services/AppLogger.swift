@@ -7,10 +7,14 @@ struct ClientLogEntry: Identifiable, Hashable {
     let category: String
     let message: String
 
-    var formattedTime: String {
+    private static let timeFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss.SSS"
-        return fmt.string(from: timestamp)
+        return fmt
+    }()
+
+    var formattedTime: String {
+        Self.timeFormatter.string(from: timestamp)
     }
 }
 
@@ -24,7 +28,7 @@ final class AppLogger: ObservableObject {
     private init() {
         let info = Bundle.main.infoDictionary
         let ver = (info?["CFBundleShortVersionString"] as? String) ?? "0.9.0"
-        let build = (info?["CFBundleVersion"] as? String) ?? "16"
+        let build = (info?["CFBundleVersion"] as? String) ?? "18"
         log("INFO", category: "Lifecycle", "DeepSeek Go v\(ver) (Build \(build)) initialized")
     }
 

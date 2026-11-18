@@ -190,21 +190,24 @@ struct RootView: View {
     private var mainAuthenticatedView: some View {
         ZStack(alignment: .bottom) {
             // Content extends full height behind the floating Liquid Glass tab bar for real optical refraction
+            // Keep tab views mounted to preserve scroll position, draft state, and subview state across tab switches
             ZStack {
-                switch activeTab {
-                case .chat:
-                    ChatView(showSessionDrawer: $showSessionDrawer)
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                case .files:
-                    FilesView(activeTab: $activeTab)
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                case .plugins:
-                    PluginsSimulatorView()
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                case .settings:
-                    GitSettingsView(activeTab: $activeTab)
-                        .transition(.opacity.combined(with: .scale(scale: 0.985)))
-                }
+                ChatView(showSessionDrawer: $showSessionDrawer)
+                    .opacity(activeTab == .chat ? 1 : 0)
+                    .allowsHitTesting(activeTab == .chat)
+                    .accessibilityHidden(activeTab != .chat)
+                FilesView(activeTab: $activeTab)
+                    .opacity(activeTab == .files ? 1 : 0)
+                    .allowsHitTesting(activeTab == .files)
+                    .accessibilityHidden(activeTab != .files)
+                PluginsSimulatorView()
+                    .opacity(activeTab == .plugins ? 1 : 0)
+                    .allowsHitTesting(activeTab == .plugins)
+                    .accessibilityHidden(activeTab != .plugins)
+                GitSettingsView(activeTab: $activeTab)
+                    .opacity(activeTab == .settings ? 1 : 0)
+                    .allowsHitTesting(activeTab == .settings)
+                    .accessibilityHidden(activeTab != .settings)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .animation(AppleMotion.smooth, value: activeTab)

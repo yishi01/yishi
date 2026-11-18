@@ -12,7 +12,8 @@ import threading
 from typing import Any, Callable
 import uuid
 
-from bridge.config import PROJECT_ROOT
+from bridge.config import PROJECT_ROOT, VERSION
+from bridge.utils import atomic_write_text, cleanup_subagent_files
 
 VALID_APPROVAL_MODES = {"ask_commands", "ask_writes", "auto"}
 DEFAULT_PROFILE_ID = "ws_default"
@@ -258,17 +259,13 @@ class WorkspaceService:
         with self._lock:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             payload = {
-                "version": "0.9.0",
+                "version": VERSION,
                 "profiles": list(self._profiles.values()),
             }
-            tmp = self.storage_path.with_suffix(
-                f".json.tmp-{os.getpid()}-{threading.get_ident()}"
-            )
-            tmp.write_text(
+            atomic_write_text(
+                self.storage_path,
                 json.dumps(payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
             )
-            os.replace(tmp, self.storage_path)
 
     # ------------------------------------------------------------------
     # Session Manager & Profile Resolution Helpers
@@ -544,11 +541,14 @@ class WorkspaceService:
                             except Exception:
                                 pass
                         storage_p = getattr(s, "storage_path", None)
-                        if isinstance(storage_p, Path) and storage_p.exists():
-                            try:
-                                storage_p.unlink()
-                            except OSError:
-                                pass
+                        if isinstance(storage_p, Path):
+                            if storage_p.exists():
+                                try:
+                                    storage_p.unlink()
+                                except OSError:
+                                    pass
+                            if sid:
+                                cleanup_subagent_files(storage_p.parent, sid)
                         if sid:
                             deleted_sessions.append(sid)
                     else:
